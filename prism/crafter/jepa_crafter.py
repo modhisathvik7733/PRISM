@@ -142,8 +142,12 @@ class CrafterJepaWorldModel(nn.Module):
         z_t   = self.online_encoder(obs_t, state_t)       # (B, E)
         z_pred = self.dynamics(z_t, action_t)             # (B, E)
 
+        # Target state: use state_tp1 if provided; fall back to state_t.
+        # Most transitions are movements where state_t ≈ state_tp1; the few
+        # collection steps get slightly noisy targets, which is acceptable.
+        _state_tgt = state_tp1 if state_tp1 is not None else state_t
         with torch.no_grad():
-            z_target = self.target_encoder(obs_tp1, state_tp1)  # (B, E)
+            z_target = self.target_encoder(obs_tp1, _state_tgt)  # (B, E)
 
         # L2-normalise both before InfoNCE (cosine similarity matrix).
         q = F.normalize(z_pred,   dim=-1)        # (B, E)

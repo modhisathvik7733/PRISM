@@ -50,6 +50,8 @@ class CrafterCNN(nn.Module):
     def forward(self, obs: torch.Tensor, state_vec: Optional[torch.Tensor] = None) -> torch.Tensor:
         """obs: (B, 3, 64, 64), state_vec: (B, state_dim) optional → (B, embed_dim)"""
         h = self.conv(obs).flatten(1)   # (B, flat)
-        if self.state_dim > 0 and state_vec is not None:
+        if self.state_dim > 0:
+            if state_vec is None:
+                state_vec = h.new_zeros(h.shape[0], self.state_dim)
             h = torch.cat([h, state_vec], dim=-1)   # (B, flat + state_dim)
         return F.relu(self.head(h))     # (B, embed_dim)
