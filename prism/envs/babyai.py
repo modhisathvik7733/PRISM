@@ -23,6 +23,13 @@ import minigrid  # noqa: F401  (registers BabyAI-* envs)
 import numpy as np
 from gymnasium import spaces
 
+# Suppress minigrid's noisy "Sampling rejected: unreachable object at (X, Y)"
+# stdout lines emitted during BabyAI level resets. These can be 20-30 lines
+# per cohort eval and bury our actual logs. Idempotent — installing twice
+# is a no-op. See prism/utils/log_filter.py for details.
+from prism.utils.log_filter import install_minigrid_noise_filter
+install_minigrid_noise_filter()
+
 
 # Per-channel max values for MiniGrid's symbolic image obs.
 # ch0: object type — wall/floor/door/key/ball/box/goal/lava/agent → up to 10.
