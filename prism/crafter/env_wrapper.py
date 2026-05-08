@@ -19,6 +19,8 @@ from typing import Any
 import gymnasium as gym
 import numpy as np
 
+STATE_DIM = 12  # dims in get_game_state() output
+
 # Crafter exposes 22 named achievements. Keeping them here so the eval
 # script doesn't need to import crafter just for the names.
 CRAFTER_ACHIEVEMENTS: tuple[str, ...] = (
@@ -98,6 +100,34 @@ class CrafterPrismEnv:
                 self._unlocked.add(name)
         info["achievements_unlocked"] = set(self._unlocked)
         return _encode_rgb(obs), float(reward), bool(terminated), bool(truncated), info
+
+    def get_game_state(self) -> np.ndarray:
+        """Extract 12-dim structured game state as float32 numpy array.
+
+        dims 0-5:  inventory wood/stone/coal/iron/diamond/sapling ÷ 9.0
+        dims 6-9:  health/food/drink/energy ÷ 9.0
+        dims 10-11: facing dx, dy each in {-1,0,1} → (x+1)/2
+        """
+        try:
+            p = self._env._player
+            inv = p.inventory
+            out = np.zeros(12, dtype=np.float32)
+            out[0] = inv.get("wood",    0) / 9.0
+            out[1] = inv.get("stone",   0) / 9.0
+            out[2] = inv.get("coal",    0) / 9.0
+            out[3] = inv.get("iron",    0) / 9.0
+            out[4] = inv.get("diamond", 0) / 9.0
+            out[5] = inv.get("sapling", 0) / 9.0
+            out[6] = p.health / 9.0
+            out[7] = p.food   / 9.0
+            out[8] = p.drink  / 9.0
+            out[9] = p.energy / 9.0
+            dx, dy  = p.facing
+            out[10] = (dx + 1) / 2.0
+            out[11] = (dy + 1) / 2.0
+            return out
+        except Exception:
+            return np.zeros(12, dtype=np.float32)
 
     def close(self):
         if hasattr(self._env, "close"):

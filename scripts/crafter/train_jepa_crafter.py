@@ -32,12 +32,13 @@ from prism.utils.seed import set_global_seed
 
 
 class _RolloutDataset(data_utils.Dataset):
-    """Loads the uint8 npz into RAM and serves (obs_t, action, obs_tp1) triples.
+    """Loads the uint8 npz into RAM and serves (obs_t, action, obs_tp1, state_t) 4-tuples.
 
     Shapes served per item:
       obs_t:   (3, 64, 64) float32 [0, 1]
       action:  ()          int64
       obs_tp1: (3, 64, 64) float32 [0, 1]
+      state_t: (state_dim,) float32  — zeros if not in npz
     """
 
     def __init__(self, npz_path: str):
@@ -46,7 +47,10 @@ class _RolloutDataset(data_utils.Dataset):
         self.obs_t   = d["obs_t"]    # (N, 3, 64, 64) uint8
         self.actions = d["actions"]  # (N,)            uint8
         self.obs_tp1 = d["obs_tp1"]  # (N, 3, 64, 64) uint8
-        print(f"[dataset] loaded {len(self.obs_t):,} transitions from {npz_path}")
+        self.game_states_t = d["game_states_t"] if "game_states_t" in d else None
+        has_state = self.game_states_t is not None
+        print(f"[dataset] loaded {len(self.obs_t):,} transitions from {npz_path}"
+              f"  game_states={'yes' if has_state else 'no'}")
 
     def __len__(self) -> int:
         return len(self.obs_t)
@@ -55,7 +59,11 @@ class _RolloutDataset(data_utils.Dataset):
         obs_t   = torch.from_numpy(self.obs_t[idx].astype(np.float32)) / 255.0
         action  = torch.tensor(int(self.actions[idx]), dtype=torch.long)
         obs_tp1 = torch.from_numpy(self.obs_tp1[idx].astype(np.float32)) / 255.0
-        return obs_t, action, obs_tp1
+        if self.game_states_t is not None:
+            state_t = torch.from_numpy(self.game_states_t[idx].copy())
+        else:
+            state_t = torch.zeros(0, dtype=torch.float32)
+        return obs_t, action, obs_tp1, state_t
 
 
 def parse_args():
@@ -72,6 +80,8 @@ def parse_args():
     p.add_argument("--num-workers", type=int,  default=4)
     p.add_argument("--seed",        type=int,  default=42)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--state-dim",   type=int,  default=-1,
+                   help="Game-state dim. -1 = auto-detect from data (12 if present, else 0).")
     return p.parse_args()
 
 
@@ -90,10 +100,17 @@ def main() -> int:
         drop_last=True,
     )
 
+    # Auto-detect state_dim from data if not specified.
+    if args.state_dim == -1:
+        state_dim = 12 if dataset.game_states_t is not None else 0
+    else:
+        state_dim = args.state_dim
+
     cfg = CrafterJepaConfig(
         embed_dim=args.embed_dim,
         ema_decay=args.ema_decay,
         temperature=args.temperature,
+        state_dim=state_dim,
     )
     model = CrafterJepaWorldModel(cfg).to(device)
     n_enc = sum(p.numel() for p in model.online_encoder.parameters())
@@ -115,15 +132,17 @@ def main() -> int:
 
     global_step = 0
     for epoch in range(1, args.epochs + 1):
-        for batch_idx, (obs_t, action, obs_tp1) in enumerate(loader, 1):
+        for batch_idx, (obs_t, action, obs_tp1, state_t) in enumerate(loader, 1):
             # obs_t:   (B, 3, 64, 64) float32
             # action:  (B,)           int64
             # obs_tp1: (B, 3, 64, 64) float32
+            # state_t: (B, state_dim) float32  (or zeros if no game states in npz)
             obs_t   = obs_t.to(device)
             action  = action.to(device)
             obs_tp1 = obs_tp1.to(device)
+            st = state_t.to(device) if state_dim > 0 else None
 
-            losses = model.loss(obs_t, action, obs_tp1)
+            losses = model.loss(obs_t, action, obs_tp1, state_t=st)
             opt.zero_grad(set_to_none=True)
             losses["loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -145,9 +164,9 @@ def main() -> int:
     final_path = out_dir / "jepa_final.pt"
     torch.save(
         {
-            "online_encoder_state": model.online_encoder.state_dict(),
-            "dynamics_state": model.dynamics.state_dict(),
-            "cfg": cfg,
+            "online_encoder_state":  model.online_encoder.state_dict(),
+            "dynamics_state":        model.dynamics.state_dict(),
+            "cfg":                   cfg,
         },
         final_path,
     )

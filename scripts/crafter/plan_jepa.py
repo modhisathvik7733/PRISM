@@ -37,6 +37,31 @@ from prism.crafter.policy_jepa import CrafterPolicyJepa
 from prism.utils.seed import set_global_seed
 
 
+# Action index that fires each achievement (action 5 = "do").
+ACHIEVEMENT_ACTIONS: dict[str, int] = {
+    "collect_wood":        5,
+    "collect_stone":       5,
+    "collect_coal":        5,
+    "collect_iron":        5,
+    "collect_diamond":     5,
+    "collect_drink":       5,
+    "eat_cow":             5,
+    "eat_plant":           5,
+    "defeat_zombie":       5,
+    "defeat_skeleton":     5,
+    "place_table":         8,
+    "place_stone":         7,
+    "place_furnace":       9,
+    "place_plant":        10,
+    "make_wood_pickaxe":  11,
+    "make_stone_pickaxe": 12,
+    "make_iron_pickaxe":  13,
+    "make_wood_sword":    14,
+    "make_stone_sword":   15,
+    "make_iron_sword":    16,
+}
+
+
 # ── checkpoint helpers ────────────────────────────────────────────────────────
 
 def load_memory_from_npz(
@@ -75,7 +100,8 @@ def load_jepa(path: str, device: torch.device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     cfg: CrafterJepaConfig = ckpt["cfg"]
 
-    encoder = CrafterCNN(embed_dim=cfg.embed_dim).to(device)
+    state_dim = getattr(cfg, "state_dim", 0)
+    encoder = CrafterCNN(embed_dim=cfg.embed_dim, state_dim=state_dim).to(device)
     encoder.load_state_dict(ckpt["online_encoder_state"])
     for p in encoder.parameters():
         p.requires_grad_(False)
@@ -98,8 +124,12 @@ def collect_goal_obs(
     max_episodes: int = 100,
     seed: int = 42,
     device: torch.device = torch.device("cpu"),
-) -> Optional[np.ndarray]:
-    """Roll out a policy until trigger_achievement fires; return that obs.
+) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    """Roll out a policy until trigger_achievement fires; return (pre_obs, pre_state).
+
+    Returns the PRE-achievement observation (player facing the target object,
+    before the achievement action is executed) so the planner can navigate
+    toward this common precondition state rather than the rare post-obs.
 
     If ppo_checkpoint exists, uses the trained PPO policy.
     Otherwise falls back to a random policy (more episodes needed).
@@ -126,7 +156,9 @@ def collect_goal_obs(
     episodes = 0
 
     while episodes < max_episodes:
+        # Capture pre-step obs and game state BEFORE the action fires.
         obs_np     = worker.obs.copy()
+        pre_state  = worker.env.get_game_state()
         ach_before = set(worker.achievements)
 
         if use_ppo:
@@ -143,12 +175,14 @@ def collect_goal_obs(
         if not done:
             new_ach = worker.achievements - ach_before
             if trigger_achievement in new_ach:
-                print(f"[goal] '{trigger_achievement}' fired (ep {episodes}, non-terminal)")
-                return worker.obs.copy()
+                print(f"[goal] '{trigger_achievement}' fired (ep {episodes}, non-terminal) "
+                      f"— returning PRE-achievement obs")
+                return obs_np, pre_state
         else:
             if trigger_achievement in info.get("achievements", set()):
-                print(f"[goal] '{trigger_achievement}' fired (ep {episodes}, terminal)")
-                return obs_np
+                print(f"[goal] '{trigger_achievement}' fired (ep {episodes}, terminal) "
+                      f"— returning PRE-achievement obs")
+                return obs_np, pre_state
             episodes += 1
             if use_ppo:
                 h           = policy.init_hidden(1, device)
@@ -458,6 +492,185 @@ def run_chain_experiment(
     print(f"[chain] achievements across all trials: {sorted(all_ach)}")
 
 
+def run_precondition_experiment(
+    planner: LatentPlanner,
+    goal_obs: np.ndarray,           # pre-achievement obs (player facing tree, etc.)
+    trigger_achievement: str,
+    n_trials: int = 5,
+    n_subgoals: int = 3,
+    explore_steps: int = 100,
+    plan_steps: int = 400,
+    max_memory: int = 2000,
+    horizon: int = 15,
+    beam_k: int = 10,
+    exec_steps: int = 5,
+    switch_threshold: float = 0.20,
+    execute_threshold: float = 0.15,  # cos_dist below which to try the achievement action
+    execute_burst: int = 20,          # how many times to try the action per close encounter
+    seed: int = 42,
+    device: torch.device = torch.device("cpu"),
+    z_memory_seed: Optional[torch.Tensor] = None,
+) -> None:
+    """Two-phase precondition planning + execution burst experiment.
+
+    Phase 1: curiosity exploration builds z_memory.
+    Phase 2: subgoal chain navigates toward the PRE-achievement obs (player
+             facing the target). When cos_dist < execute_threshold, fire the
+             achievement action in a burst and check if the achievement fires.
+    """
+    z_goal   = planner.encode_obs(goal_obs)      # (E,)
+    z_goal_n = F.normalize(z_goal, dim=-1)
+    E        = int(z_goal.shape[0])
+    ach_action = ACHIEVEMENT_ACTIONS.get(trigger_achievement, 5)
+
+    print("\n" + "=" * 60)
+    print("EXPERIMENT D: Precondition planning + execution burst")
+    print(f"  trigger={trigger_achievement}  ach_action={ach_action}")
+    print(f"  n_subgoals={n_subgoals}  explore={explore_steps}  plan={plan_steps}")
+    print(f"  execute_threshold={execute_threshold}  execute_burst={execute_burst}")
+    print("=" * 60)
+
+    all_final_dists:  list[float]    = []
+    all_achievements: list[set[str]] = []
+    all_fired:        list[bool]     = []
+
+    for trial in range(n_trials):
+        base_seed = seed + trial * 1_000_003
+        worker    = CrafterEnvWorker(base_seed, worker_id=0, reward_mode="reward")
+        z_memory  = z_memory_seed.clone() if z_memory_seed is not None else torch.zeros(0, E, device=device)
+        trial_achievements: set[str] = set()
+        achievement_fired = False
+
+        # ── Phase 1: curiosity exploration ───────────────────────────────────
+        step = 0
+        while step < explore_steps:
+            z_cur   = planner.encode_obs(worker.obs)
+            actions = planner.novelty_plan(z_cur, z_memory, horizon=horizon, beam_k=beam_k)
+            for a in actions[:exec_steps]:
+                if step >= explore_steps:
+                    break
+                obs_visited = worker.obs.copy()
+                _, _, done, info = worker.step(a)
+                step += 1
+                if info:
+                    trial_achievements |= info.get("achievements", set())
+                    if trigger_achievement in trial_achievements:
+                        achievement_fired = True
+                if len(z_memory) < max_memory:
+                    z_memory = torch.cat(
+                        [z_memory, planner.encode_obs(obs_visited).unsqueeze(0)], dim=0
+                    )
+                if done:
+                    break
+
+        # ── Build subgoal chain ───────────────────────────────────────────────
+        z_cur  = planner.encode_obs(worker.obs)
+        chain  = planner.find_subgoal_chain(z_cur, z_goal, z_memory, n_subgoals)
+        n_chain = len(chain)
+
+        chain_dists = [
+            1.0 - float(F.normalize(z_sg, dim=-1) @ z_goal_n) for z_sg in chain
+        ]
+        print(f"\n[trial {trial+1}/{n_trials}] memory={len(z_memory)}"
+              f"  chain_len={n_chain}  chain_dists={[f'{d:.3f}' for d in chain_dists]}")
+
+        # ── Phase 2: chain-guided planning with execution bursts ──────────────
+        sg_idx      = 0
+        step        = 0
+        sg_patience = 0
+        patience_limit = 10
+        dist_trace: list[float] = []
+
+        def _rebuild_chain() -> list:
+            z_c = planner.encode_obs(worker.obs)
+            return planner.find_subgoal_chain(z_c, z_goal, z_memory, n_subgoals)
+
+        while step < plan_steps and not achievement_fired:
+            z_cur    = planner.encode_obs(worker.obs)
+            z_cur_n  = F.normalize(z_cur, dim=-1)
+            dist_to_goal = float(1.0 - z_cur_n @ z_goal_n)
+            dist_trace.append(dist_to_goal)
+
+            # Check if we're close enough to attempt the achievement action.
+            if dist_to_goal < execute_threshold:
+                for _ in range(execute_burst):
+                    if step >= plan_steps:
+                        break
+                    _, _, done, info = worker.step(ach_action)
+                    step += 1
+                    if info:
+                        trial_achievements |= info.get("achievements", set())
+                        if trigger_achievement in trial_achievements:
+                            achievement_fired = True
+                    if done or achievement_fired:
+                        break
+                if achievement_fired:
+                    break
+                if done:
+                    chain       = _rebuild_chain()
+                    n_chain     = len(chain)
+                    sg_idx      = 0
+                    sg_patience = 0
+                continue
+
+            z_target = chain[sg_idx]
+            z_tgt_n  = F.normalize(z_target, dim=-1)
+            dist_to_sg = float(1.0 - z_cur_n @ z_tgt_n)
+
+            if dist_to_sg < switch_threshold and sg_idx < n_chain - 1:
+                sg_idx     += 1
+                sg_patience = 0
+                z_target    = chain[sg_idx]
+            else:
+                sg_patience += 1
+                if sg_patience >= patience_limit and sg_idx < n_chain - 1:
+                    sg_idx     += 1
+                    sg_patience = 0
+                    z_target    = chain[sg_idx]
+
+            actions = planner.beam_search(z_cur, z_target, horizon=horizon, beam_k=beam_k)
+
+            episode_done = False
+            for a in actions[:exec_steps]:
+                if step >= plan_steps:
+                    break
+                _, _, done, info = worker.step(a)
+                step += 1
+                if info:
+                    trial_achievements |= info.get("achievements", set())
+                    if trigger_achievement in trial_achievements:
+                        achievement_fired = True
+                if done:
+                    episode_done = True
+                    break
+
+            if episode_done:
+                chain       = _rebuild_chain()
+                n_chain     = len(chain)
+                sg_idx      = 0
+                sg_patience = 0
+
+        z_final_n  = F.normalize(planner.encode_obs(worker.obs), dim=-1)
+        final_dist = float(1.0 - z_final_n @ z_goal_n)
+        all_final_dists.append(final_dist)
+        all_achievements.append(trial_achievements)
+        all_fired.append(achievement_fired)
+
+        trace_str = "  ".join(f"{d:.3f}" for d in dist_trace[:8])
+        print(f"[trial {trial+1}/{n_trials}]"
+              f"  chain={[f'{d:.3f}' for d in chain_dists]}"
+              f"  dist_trace=[{trace_str}{'...' if len(dist_trace) > 8 else ''}]"
+              f"  achievement_fired={achievement_fired}"
+              f"  final_dist={final_dist:.3f}"
+              f"  ach={sorted(trial_achievements)}")
+
+    fired_count = sum(all_fired)
+    print(f"\n[precondition] achievement_fired={fired_count}/{n_trials} trials")
+    print(f"[precondition] mean final_dist={np.mean(all_final_dists):.3f}")
+    all_ach = set().union(*all_achievements)
+    print(f"[precondition] achievements across all trials: {sorted(all_ach)}")
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def parse_args():
@@ -465,7 +678,7 @@ def parse_args():
     p.add_argument("--jepa-checkpoint",     default="runs/crafter_jepa/jepa_final.pt")
     p.add_argument("--ppo-checkpoint",      default="runs/crafter_ppo_jepa/policy_final.pt")
     p.add_argument("--experiment",          default="both",
-                   choices=["goal", "curiosity", "both", "chain"])
+                   choices=["goal", "curiosity", "both", "chain", "precondition"])
     p.add_argument("--trigger-achievement", default="place_table")
     p.add_argument("--horizon",             type=int,   default=15)
     p.add_argument("--beam-k",              type=int,   default=10)
@@ -474,7 +687,7 @@ def parse_args():
     p.add_argument("--max-steps",           type=int,   default=200)
     p.add_argument("--max-memory",          type=int,   default=500)
     p.add_argument("--seed",                type=int,   default=42)
-    # chain-specific
+    # chain / precondition shared args
     p.add_argument("--n-subgoals",          type=int,   default=3)
     p.add_argument("--explore-steps",       type=int,   default=300)
     p.add_argument("--plan-steps",          type=int,   default=300)
@@ -484,6 +697,11 @@ def parse_args():
                         "to pre-populate z_memory before curiosity exploration")
     p.add_argument("--memory-npz-n",        type=int,   default=2000,
                    help="number of observations to sample from --memory-npz")
+    # precondition-specific args
+    p.add_argument("--execute-threshold",   type=float, default=0.15,
+                   help="cos_dist below which to fire the achievement action burst")
+    p.add_argument("--execute-burst",       type=int,   default=20,
+                   help="how many times to try the achievement action per close encounter")
     p.add_argument("--device",
                    default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
@@ -498,16 +716,17 @@ def main() -> int:
     planner = LatentPlanner(encoder, dynamics, n_actions=cfg.n_actions, device=device)
 
     if args.experiment in ("goal", "both"):
-        goal_obs = collect_goal_obs(
+        result = collect_goal_obs(
             args.jepa_checkpoint,
             args.ppo_checkpoint,
             trigger_achievement=args.trigger_achievement,
             seed=args.seed,
             device=device,
         )
-        if goal_obs is None:
+        if result is None:
             print("[goal] could not collect goal obs — skipping")
         else:
+            goal_obs, _goal_state = result
             run_goal_experiment(
                 planner, goal_obs,
                 n_trials=args.trials,
@@ -531,16 +750,17 @@ def main() -> int:
         )
 
     if args.experiment == "chain":
-        goal_obs = collect_goal_obs(
+        result = collect_goal_obs(
             args.jepa_checkpoint,
             args.ppo_checkpoint,
             trigger_achievement=args.trigger_achievement,
             seed=args.seed,
             device=device,
         )
-        if goal_obs is None:
+        if result is None:
             print("[chain] could not collect goal obs — aborting")
         else:
+            goal_obs, _goal_state = result
             z_mem_seed: Optional[torch.Tensor] = None
             if args.memory_npz is not None and Path(args.memory_npz).exists():
                 z_mem_seed = load_memory_from_npz(
@@ -565,6 +785,47 @@ def main() -> int:
                 seed=args.seed + 3,
                 device=device,
                 z_memory_seed=z_mem_seed,
+            )
+
+    if args.experiment == "precondition":
+        result = collect_goal_obs(
+            args.jepa_checkpoint,
+            args.ppo_checkpoint,
+            trigger_achievement=args.trigger_achievement,
+            seed=args.seed,
+            device=device,
+        )
+        if result is None:
+            print("[precondition] could not collect goal obs — aborting")
+        else:
+            goal_obs, _goal_state = result
+            z_mem_seed2: Optional[torch.Tensor] = None
+            if args.memory_npz is not None and Path(args.memory_npz).exists():
+                z_mem_seed2 = load_memory_from_npz(
+                    args.memory_npz, encoder,
+                    n_samples=args.memory_npz_n,
+                    device=device, seed=args.seed,
+                )
+            elif args.memory_npz is not None:
+                print(f"[precondition] WARNING: --memory-npz {args.memory_npz} not found, "
+                      f"starting with empty memory")
+            run_precondition_experiment(
+                planner, goal_obs,
+                trigger_achievement=args.trigger_achievement,
+                n_trials=args.trials,
+                n_subgoals=args.n_subgoals,
+                explore_steps=args.explore_steps,
+                plan_steps=args.plan_steps,
+                max_memory=args.max_memory,
+                horizon=args.horizon,
+                beam_k=args.beam_k,
+                exec_steps=args.exec_steps,
+                switch_threshold=args.switch_threshold,
+                execute_threshold=args.execute_threshold,
+                execute_burst=args.execute_burst,
+                seed=args.seed + 4,
+                device=device,
+                z_memory_seed=z_mem_seed2,
             )
 
     return 0

@@ -17,14 +17,18 @@ the from-scratch baseline policy (encoder learned end-to-end with PPO).
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class CrafterCNN(nn.Module):
-    def __init__(self, embed_dim: int = 256, in_channels: int = 3):
+    def __init__(self, embed_dim: int = 256, in_channels: int = 3, state_dim: int = 0):
         super().__init__()
         self.embed_dim = embed_dim
+        self.state_dim = state_dim
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels, 32, kernel_size=4, stride=2),
             nn.ReLU(),
@@ -35,17 +39,17 @@ class CrafterCNN(nn.Module):
             nn.Conv2d(128, 256, kernel_size=4, stride=2),
             nn.ReLU(),
         )
-        # Compute flatten dim once with a dummy forward pass.
+        # Compute conv flatten dim once with a dummy forward pass.
         with torch.no_grad():
             dummy = torch.zeros(1, in_channels, 64, 64)
             flat = self.conv(dummy).flatten(1).shape[1]
-        self.fc = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(flat, embed_dim),
-            nn.ReLU(),
-        )
+        self._flat = flat
+        # Head is wider when state_dim > 0 (state vector concatenated before fc).
+        self.head = nn.Linear(flat + state_dim, embed_dim)
 
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        """obs: (B, 3, 64, 64) → (B, embed_dim)"""
-        h = self.conv(obs)
-        return self.fc(h)
+    def forward(self, obs: torch.Tensor, state_vec: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """obs: (B, 3, 64, 64), state_vec: (B, state_dim) optional → (B, embed_dim)"""
+        h = self.conv(obs).flatten(1)   # (B, flat)
+        if self.state_dim > 0 and state_vec is not None:
+            h = torch.cat([h, state_vec], dim=-1)   # (B, flat + state_dim)
+        return F.relu(self.head(h))     # (B, embed_dim)

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -47,6 +48,7 @@ class CrafterJepaConfig:
     ema_decay: float = 0.996
     temperature: float = 0.07   # InfoNCE temperature; 0.07 matches MoCo v3 / CLIP
     dynamics_hidden: int = 256
+    state_dim: int = 0          # >0 to concat game-state vector to CNN features
 
 
 def _info_nce(
@@ -109,7 +111,7 @@ class CrafterJepaWorldModel(nn.Module):
         super().__init__()
         self.cfg = cfg or CrafterJepaConfig()
         E = self.cfg.embed_dim
-        self.online_encoder = CrafterCNN(embed_dim=E)
+        self.online_encoder = CrafterCNN(embed_dim=E, state_dim=self.cfg.state_dim)
         self.target_encoder = copy.deepcopy(self.online_encoder)
         for p in self.target_encoder.parameters():
             p.requires_grad_(False)
@@ -125,21 +127,23 @@ class CrafterJepaWorldModel(nn.Module):
         ):
             tp.data.mul_(m).add_(op.data, alpha=1.0 - m)
 
-    def encode(self, obs: torch.Tensor) -> torch.Tensor:
-        """obs: (B, 3, 64, 64) -> z: (B, embed_dim)"""
-        return self.online_encoder(obs)
+    def encode(self, obs: torch.Tensor, state_vec: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """obs: (B, 3, 64, 64), state_vec: (B, state_dim) optional -> z: (B, embed_dim)"""
+        return self.online_encoder(obs, state_vec)
 
     def loss(
         self,
         obs_t: torch.Tensor,     # (B, 3, 64, 64) float32 [0, 1]
         action_t: torch.Tensor,  # (B,) int64
         obs_tp1: torch.Tensor,   # (B, 3, 64, 64) float32 [0, 1]
+        state_t:   Optional[torch.Tensor] = None,   # (B, state_dim) float32
+        state_tp1: Optional[torch.Tensor] = None,   # (B, state_dim) float32
     ) -> dict[str, torch.Tensor]:
-        z_t   = self.online_encoder(obs_t)       # (B, E)
-        z_pred = self.dynamics(z_t, action_t)    # (B, E)
+        z_t   = self.online_encoder(obs_t, state_t)       # (B, E)
+        z_pred = self.dynamics(z_t, action_t)             # (B, E)
 
         with torch.no_grad():
-            z_target = self.target_encoder(obs_tp1)  # (B, E)
+            z_target = self.target_encoder(obs_tp1, state_tp1)  # (B, E)
 
         # L2-normalise both before InfoNCE (cosine similarity matrix).
         q = F.normalize(z_pred,   dim=-1)        # (B, E)

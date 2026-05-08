@@ -41,6 +41,8 @@ def parse_args():
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=5_000_000,
                    help="Base seed disjoint from training (2.1M) and eval (4242).")
+    p.add_argument("--state-dim", type=int, default=12,
+                   help="Structured game-state dims to save alongside obs (0 = skip).")
     return p.parse_args()
 
 
@@ -77,6 +79,9 @@ def main() -> int:
     obs_t_buf   = np.empty((N, 3, 64, 64), dtype=np.uint8)
     act_buf     = np.empty((N,),           dtype=np.uint8)
     obs_tp1_buf = np.empty((N, 3, 64, 64), dtype=np.uint8)
+    save_states = args.state_dim > 0
+    if save_states:
+        game_states_t = np.empty((N, args.state_dim), dtype=np.float32)
 
     collected = 0
     steps_taken = 0
@@ -98,6 +103,9 @@ def main() -> int:
             if collected >= N:
                 break
             a = int(actions_list[i])
+            # Capture game state BEFORE the step (pre-transition state).
+            if save_states:
+                pre_state = env.get_game_state()
             obs_tp1, _reward, term, trunc, _info = env.step(a)
             done = term or trunc
             dones[i] = done
@@ -107,6 +115,8 @@ def main() -> int:
                 obs_t_buf[collected]   = (obs_t_np[i] * 255.0).astype(np.uint8)
                 act_buf[collected]     = a
                 obs_tp1_buf[collected] = (obs_tp1 * 255.0).astype(np.uint8)
+                if save_states:
+                    game_states_t[collected] = pre_state
                 collected += 1
                 obs_np[i] = obs_tp1
             else:
@@ -126,10 +136,10 @@ def main() -> int:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"[collect] saving {out_path} ...")
-    np.savez_compressed(out_path,
-                        obs_t=obs_t_buf,
-                        actions=act_buf,
-                        obs_tp1=obs_tp1_buf)
+    save_kwargs = dict(obs_t=obs_t_buf, actions=act_buf, obs_tp1=obs_tp1_buf)
+    if save_states:
+        save_kwargs["game_states_t"] = game_states_t
+    np.savez_compressed(out_path, **save_kwargs)
     size_mb = out_path.stat().st_size / 1e6
     print(f"[collect] done — {N} transitions, {size_mb:.0f} MB  →  {out_path}")
     return 0
