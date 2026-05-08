@@ -67,8 +67,8 @@ def parse_args():
     p.add_argument("--lr",         type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-5)
     p.add_argument("--embed-dim",  type=int,   default=256)
-    p.add_argument("--ema-decay",  type=float, default=0.996)
-    p.add_argument("--reg-weight", type=float, default=1e-3)
+    p.add_argument("--ema-decay",   type=float, default=0.996)
+    p.add_argument("--temperature", type=float, default=0.07)
     p.add_argument("--num-workers", type=int,  default=4)
     p.add_argument("--seed",        type=int,  default=42)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -93,7 +93,7 @@ def main() -> int:
     cfg = CrafterJepaConfig(
         embed_dim=args.embed_dim,
         ema_decay=args.ema_decay,
-        reg_weight=args.reg_weight,
+        temperature=args.temperature,
     )
     model = CrafterJepaWorldModel(cfg).to(device)
     n_enc = sum(p.numel() for p in model.online_encoder.parameters())
@@ -137,8 +137,8 @@ def main() -> int:
                 print(
                     f"[ep {epoch}/{args.epochs}  batch {batch_idx:>5d}/{len(loader)}]"
                     f"  loss={losses['loss'].item():.4f}"
-                    f"  l_pred={losses['loss_pred'].item():.4f}"
-                    f"  l_reg={losses['loss_reg'].item():.4f}"
+                    f"  nce={losses['loss_pred'].item():.4f}"
+                    f"  pos_cos={losses['loss_reg'].item():.4f}"
                     f"  lr={lr_now:.2e}"
                 )
 
