@@ -90,9 +90,12 @@ def eval_single_step(model: JepaWorldModel, trajs, device, batch_size: int = 256
         z_pred = model.predict(z_t, a)
         z_target = model.encode_target(stp1)
 
-        pred_mses.append(((z_pred - z_target) ** 2).mean(dim=-1).cpu().numpy())
-        target_norms.append((z_target ** 2).mean(dim=-1).cpu().numpy())
-        all_targets.append(z_target.cpu().numpy())
+        # Per-sample MSE: flatten any non-batch dims so this works for both
+        # flat (B, D) and spatial (B, C, H, W) latents.
+        err = (z_pred - z_target) ** 2
+        pred_mses.append(err.flatten(1).mean(dim=-1).cpu().numpy())
+        target_norms.append((z_target ** 2).flatten(1).mean(dim=-1).cpu().numpy())
+        all_targets.append(z_target.flatten(1).cpu().numpy())
 
     pred_mse = np.concatenate(pred_mses).mean()
 
@@ -121,11 +124,12 @@ def eval_rollout_drift(
         T = len(act_seq)
         if T < max_h:
             continue
-        # Encode the whole trajectory once
-        obs = torch.from_numpy(obs_seq).to(device)  # (T+1, C, H, W)
-        z_actual = model.encode_target(obs)  # (T+1, D)
-        # Roll latent forward from z_0
-        z = z_actual[0:1]  # (1, D)
+        # Encode the whole trajectory once. Latent may be (T+1, D) for flat
+        # encoders or (T+1, C, H, W) for spatial — either way, indexing the
+        # batch axis works and `.mean()` collapses everything to a scalar.
+        obs = torch.from_numpy(obs_seq).to(device)
+        z_actual = model.encode_target(obs)
+        z = z_actual[0:1]  # batch of 1
         for t in range(max_h):
             a = torch.tensor([act_seq[t]], device=device)
             z = model.predict(z, a)
@@ -146,17 +150,17 @@ def eval_action_sensitivity(model: JepaWorldModel, trajs, device, batch_size: in
 
     for i in range(0, len(states), batch_size):
         s = torch.from_numpy(states[i : i + batch_size]).to(device)
-        z = model.encode(s)  # (B, D)
-        # For each action a, predict next latent
+        z = model.encode(s)  # (B, D) or (B, C, H, W)
+        # For each action a, predict next latent. Flatten non-batch dims so
+        # std-across-actions is well-defined for both flat and spatial latents.
         preds = []
         for a_id in range(n_actions):
             a = torch.full((z.shape[0],), a_id, device=device, dtype=torch.long)
-            preds.append(model.predict(z, a))
-        preds = torch.stack(preds, dim=1)  # (B, n_actions, D)
-        # Std across action axis, averaged over D
+            preds.append(model.predict(z, a).flatten(1))
+        preds = torch.stack(preds, dim=1)  # (B, n_actions, D_flat)
         std = preds.std(dim=1).mean(dim=-1)
         stds.append(std.cpu().numpy())
-        target_stds.append(z.std(dim=0).mean().item())
+        target_stds.append(z.flatten(1).std(dim=0).mean().item())
 
     stds = np.concatenate(stds)
     return {

@@ -62,16 +62,19 @@ class JepaConfig:
     # (turn-action F1 ~0.55 while forward F1 ~0.93 in eval_dynamics_predicates).
     dynamics_hidden_dim: int = 256
     dynamics_layers: int = 2
-    # "mlp"  — concatenate action embedding with z and run an MLP. Action enters
-    #          only through the input layer; the optimizer's local minimum has
-    #          been "predict forward well, average through turns" (verified by
-    #          eval_dynamics_predicates: turn-action F1 ~0.55 unchanged across
-    #          aux-weight 1→3 AND dynamics 256x2 → 512x4 capacity bumps).
-    # "film" — Feature-wise Linear Modulation. Action embedding produces
-    #          (gamma, beta) per layer that modulate hidden activations as
-    #          h * (1 + gamma) + beta. Forces the action to gate the
-    #          transformation at every layer, not just be one input feature.
+    # "mlp"          — concat(z, action_embed) → MLP. Original architecture.
+    # "film"         — flat-latent FiLM: action produces (gamma, beta) per linear
+    #                  block. Falsified for rotation: turn F1 unchanged at ~0.55.
+    # "spatial_film" — convolutional FiLM dynamics over a spatial latent
+    #                  (B, C, H, W). Action gates each conv block channel-wise.
+    #                  Combined with encoder_type="categorical_spatial", this is
+    #                  the LeWorldModel-style architecture: rotations become
+    #                  approximate spatial permutations a CNN can express.
     dynamics_type: str = "mlp"
+    # Channel count for the spatial encoder / spatial dynamics. Only used when
+    # encoder_type="categorical_spatial" / dynamics_type="spatial_film".
+    spatial_channels: int = 64
+    spatial_action_dim: int = 32  # FiLM action-embedding dim for spatial dynamics
 
 
 class GridEncoder(nn.Module):
@@ -174,6 +177,48 @@ class CategoricalGridEncoder(nn.Module):
         return self.head(h)
 
 
+class CategoricalSpatialEncoder(nn.Module):
+    """Categorical-embedding conv encoder that PRESERVES spatial structure.
+
+    Unlike CategoricalGridEncoder (which flattens to a 1-D embed), this
+    returns a (B, C, H, W) feature map. The downstream dynamics can then
+    operate convolutionally so that rotations of the underlying grid show
+    up as approximate spatial permutations — which a CNN can learn — rather
+    than as arbitrary 128-d coordinate remappings (which a flat-latent MLP
+    cannot, as eval_dynamics_predicates demonstrated empirically: turn-action
+    F1 capped at ~0.55 across 4 different flat-latent architectures).
+    """
+
+    def __init__(self, cfg: JepaConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.type_emb = nn.Embedding(cfg.n_types, cfg.type_emb_dim)
+        self.color_emb = nn.Embedding(cfg.n_colors, cfg.color_emb_dim)
+        self.state_emb = nn.Embedding(cfg.n_states, cfg.state_emb_dim)
+        per_cell_dim = cfg.type_emb_dim + cfg.color_emb_dim + cfg.state_emb_dim
+        C = getattr(cfg, "spatial_channels", 64)
+        self.conv = nn.Sequential(
+            nn.Conv2d(per_cell_dim, 64, 3, padding=1), nn.GELU(),
+            nn.Conv2d(64, C, 3, padding=1), nn.GELU(),
+            nn.Conv2d(C, C, 3, padding=1),
+        )
+        self.register_buffer(
+            "_channel_max",
+            torch.tensor(cfg.channel_max, dtype=torch.float32).reshape(1, 3, 1, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        codes = (x * self._channel_max).round().long().clamp(min=0)
+        codes_t = codes[:, 0].clamp(max=self.cfg.n_types - 1)
+        codes_c = codes[:, 1].clamp(max=self.cfg.n_colors - 1)
+        codes_s = codes[:, 2].clamp(max=self.cfg.n_states - 1)
+        e_t = self.type_emb(codes_t)
+        e_c = self.color_emb(codes_c)
+        e_s = self.state_emb(codes_s)
+        feat = torch.cat([e_t, e_c, e_s], dim=-1).permute(0, 3, 1, 2).contiguous()
+        return self.conv(feat)  # (B, C, H, W)
+
+
 def _make_encoder(cfg: JepaConfig) -> nn.Module:
     # Backward compat: checkpoints saved before encoder_type existed unpickle
     # to a JepaConfig instance missing the new fields. Default to "flat" for
@@ -183,9 +228,16 @@ def _make_encoder(cfg: JepaConfig) -> nn.Module:
         return GridEncoder(cfg)
     if encoder_type == "categorical":
         return CategoricalGridEncoder(cfg)
+    if encoder_type == "categorical_spatial":
+        return CategoricalSpatialEncoder(cfg)
     raise ValueError(
-        f"unknown encoder_type {encoder_type!r} (use 'flat' or 'categorical')"
+        f"unknown encoder_type {encoder_type!r} "
+        "(use 'flat', 'categorical', or 'categorical_spatial')"
     )
+
+
+def _is_spatial_encoder(cfg: JepaConfig) -> bool:
+    return getattr(cfg, "encoder_type", "flat") == "categorical_spatial"
 
 
 def upgrade_config(cfg: JepaConfig) -> JepaConfig:
@@ -272,13 +324,82 @@ class FiLMDynamics(nn.Module):
         return self.out_proj(h)
 
 
+class SpatialFiLMBlock(nn.Module):
+    """Conv layer with channel-wise action FiLM modulation.
+
+    h' = (1 + gamma(ae))[:, :, None, None] * gelu(conv(h))
+         + beta(ae)[:, :, None, None]
+
+    The action embedding produces per-channel (gamma, beta) scalars that
+    multiplicatively + additively modulate the GELU-activated conv output.
+    Combined with a residual + zero-init out-projection in SpatialFiLMDynamics,
+    the dynamics starts as identity (z → z) at initialization, so no-op-like
+    actions get the right behavior for free and gradient signal early in
+    training perturbs an already-correct baseline.
+    """
+
+    def __init__(self, channels: int, action_dim: int):
+        super().__init__()
+        self.conv = nn.Conv2d(channels, channels, 3, padding=1)
+        self.to_gamma = nn.Linear(action_dim, channels)
+        self.to_beta = nn.Linear(action_dim, channels)
+        nn.init.zeros_(self.to_gamma.weight); nn.init.zeros_(self.to_gamma.bias)
+        nn.init.zeros_(self.to_beta.weight);  nn.init.zeros_(self.to_beta.bias)
+
+    def forward(self, h: torch.Tensor, ae: torch.Tensor) -> torch.Tensor:
+        gamma = self.to_gamma(ae).unsqueeze(-1).unsqueeze(-1)  # (B, C, 1, 1)
+        beta = self.to_beta(ae).unsqueeze(-1).unsqueeze(-1)
+        return (1.0 + gamma) * F.gelu(self.conv(h)) + beta
+
+
+class SpatialFiLMDynamics(nn.Module):
+    """Convolutional dynamics for spatial latents with action-FiLM at every block.
+
+    Operates on (B, C, H, W). Predicts a residual delta added to the input
+    latent — so at init (zero out_proj), dynamics(z, a) = z, the correct
+    behavior for no-op actions and a stable starting point for learning
+    rotation/translation effects.
+
+    Why this fixes what flat-latent FiLM couldn't: rotations correspond to
+    coherent spatial transformations of the latent feature map. A 3x3 conv
+    naturally expresses local spatial reasoning; stacked convs build up
+    receptive field. A flat-latent MLP cannot — empirically, turn-action F1
+    capped at ~0.55 regardless of capacity or action conditioning.
+    """
+
+    def __init__(self, cfg: JepaConfig):
+        super().__init__()
+        action_dim = getattr(cfg, "spatial_action_dim", 32)
+        self.action_embed = nn.Embedding(cfg.n_actions, action_dim)
+        C = getattr(cfg, "spatial_channels", 64)
+        n_blocks = max(1, getattr(cfg, "dynamics_layers", 2))
+        self.blocks = nn.ModuleList(
+            [SpatialFiLMBlock(C, action_dim) for _ in range(n_blocks)]
+        )
+        self.out_proj = nn.Conv2d(C, C, 1)
+        # Zero-init output projection so dynamics(z, a) = z + 0 = z at init.
+        nn.init.zeros_(self.out_proj.weight); nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, z: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+        ae = self.action_embed(a)
+        h = z
+        for block in self.blocks:
+            h = block(h, ae)
+        return z + self.out_proj(h)
+
+
 def _make_dynamics(cfg: JepaConfig) -> nn.Module:
     dyn_type = getattr(cfg, "dynamics_type", "mlp")
     if dyn_type == "mlp":
         return LatentDynamics(cfg)
     if dyn_type == "film":
         return FiLMDynamics(cfg)
-    raise ValueError(f"unknown dynamics_type {dyn_type!r} (use 'mlp' or 'film')")
+    if dyn_type == "spatial_film":
+        return SpatialFiLMDynamics(cfg)
+    raise ValueError(
+        f"unknown dynamics_type {dyn_type!r} "
+        "(use 'mlp', 'film', or 'spatial_film')"
+    )
 
 
 class JepaWorldModel(nn.Module):
@@ -299,11 +420,25 @@ class JepaWorldModel(nn.Module):
         # Linear by design: if a deeper head is required, the encoder isn't
         # actually preserving the structure, just providing material for the
         # head to reconstruct it.
-        self.aux_predicate_head: nn.Linear | None = None
+        # Aux head input dim depends on encoder output shape:
+        #   flat encoders     → (B, embed_dim)         → Linear(embed_dim, P)
+        #   spatial encoder   → (B, C, H, W) flattened → Linear(C*H*W, P)
+        # We use Sequential([Flatten, Linear]) for the spatial case so calling
+        # `self.aux_predicate_head(z_spatial)` works without callers special-casing.
+        # The flat case stays as a bare Linear so older checkpoints' state_dict
+        # keys (`aux_predicate_head.weight/bias`) still load.
+        self.aux_predicate_head: nn.Module | None = None
         if getattr(self.cfg, "aux_predicate_weight", 0.0) > 0.0:
-            self.aux_predicate_head = nn.Linear(
-                self.cfg.embed_dim, self.cfg.aux_predicate_dim
-            )
+            if _is_spatial_encoder(self.cfg):
+                C = getattr(self.cfg, "spatial_channels", 64)
+                in_dim = C * self.cfg.obs_h * self.cfg.obs_w
+                self.aux_predicate_head = nn.Sequential(
+                    nn.Flatten(), nn.Linear(in_dim, self.cfg.aux_predicate_dim)
+                )
+            else:
+                self.aux_predicate_head = nn.Linear(
+                    self.cfg.embed_dim, self.cfg.aux_predicate_dim
+                )
         self._init_target_from_online()
 
     @torch.no_grad()

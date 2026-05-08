@@ -99,10 +99,14 @@ def main() -> int:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--run-name", default=None)
     parser.add_argument(
-        "--encoder-type", default="categorical", choices=["flat", "categorical"],
-        help="categorical (default) uses per-cell type/color/state embeddings — "
-             "preserves object identity for downstream linear predicate readout. "
-             "flat is the legacy continuous-input encoder kept for backward compat."
+        "--encoder-type", default="categorical",
+        choices=["flat", "categorical", "categorical_spatial"],
+        help="categorical (default) uses per-cell embeddings then flattens to "
+             "embed_dim. categorical_spatial preserves spatial structure — "
+             "encoder outputs (B, C, H, W) so a convolutional dynamics can "
+             "express rotations as approximate spatial permutations. Use with "
+             "--dynamics-type spatial_film for the LeWorldModel-style stack. "
+             "flat is the legacy continuous-input encoder kept for back-compat."
     )
     parser.add_argument(
         "--aux-predicate-weight", type=float, default=0.0,
@@ -139,11 +143,18 @@ def main() -> int:
              "--dynamics-hidden 512."
     )
     parser.add_argument(
-        "--dynamics-type", default="mlp", choices=["mlp", "film"],
-        help="mlp (default) = concat(z, action_embed) → MLP. film = action "
-             "embedding produces (gamma, beta) per layer, modulating hidden "
-             "activations. Use 'film' to test whether weak action conditioning "
-             "is the cause of turn-action F1 ~0.55 in eval_dynamics_predicates."
+        "--dynamics-type", default="mlp", choices=["mlp", "film", "spatial_film"],
+        help="mlp = concat(z, action_embed) → MLP. film = flat-latent FiLM. "
+             "spatial_film = convolutional FiLM dynamics over a spatial latent "
+             "(requires --encoder-type categorical_spatial). Use spatial_film "
+             "to address the rotation-prediction failure that flat-latent "
+             "architectures cannot fix (turn F1 capped at ~0.55)."
+    )
+    parser.add_argument(
+        "--spatial-channels", type=int, default=64,
+        help="Channel count C for the spatial encoder/dynamics latent "
+             "(B, C, H, W). Only used when encoder-type=categorical_spatial. "
+             "Default 64."
     )
     args = parser.parse_args()
 
@@ -161,6 +172,8 @@ def main() -> int:
     )
     if args.dynamics_type != "mlp":
         dyn_tag = f"_{args.dynamics_type}{dyn_tag}"
+    if args.encoder_type == "categorical_spatial":
+        dyn_tag = f"_spat{args.spatial_channels}{dyn_tag}"
     run_name = (
         args.run_name
         or f"jepa_{args.encoder_type}{aux_tag}{mix_tag}{dyn_tag}_{args.env_id}_seed{args.seed}"
@@ -183,6 +196,7 @@ def main() -> int:
         dynamics_hidden_dim=args.dynamics_hidden,
         dynamics_layers=args.dynamics_layers,
         dynamics_type=args.dynamics_type,
+        spatial_channels=args.spatial_channels,
     )
     model = JepaWorldModel(cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
