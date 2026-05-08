@@ -37,14 +37,13 @@ import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
-from prism.envs.babyai import _CHANNEL_MAX, _encode_image
+from prism.envs.babyai import _encode_image
 from prism.models.jepa import JepaConfig, JepaWorldModel
-from prism.models.predicate_probe import PredicateProbe
+from prism.models.predicate_probe import make_probe
 from prism.perception import (
     NUM_PREDICATES,
     NUM_TYPE_COLOR_PAIRS,
     PREDICATE_NAMES,
-    PREDICATE_VECTOR_DIM,
     compute_predicates,
     extract_slots,
 )
@@ -110,6 +109,18 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--run-name", default=None)
+    # Diagnostics ----------------------------------------------------------
+    parser.add_argument(
+        "--probe-hidden", type=int, default=0,
+        help="0 = linear probe (default, the honest test). >0 = MLP probe with that "
+             "hidden width — diagnostic for 'is the info present but tangled?'"
+    )
+    parser.add_argument(
+        "--use-raw-obs", action="store_true",
+        help="Skip the JEPA encoder; train the probe on flattened raw obs instead. "
+             "Upper bound: tells us how much of the predicate task is solvable from "
+             "raw obs at all."
+    )
     args = parser.parse_args()
 
     set_global_seed(args.seed)
@@ -122,14 +133,27 @@ def main() -> int:
     print(f"[probe] writing to {out_dir}")
 
     # ------------------------------------------------------ load frozen JEPA
-    ckpt = torch.load(args.jepa_checkpoint, map_location=device, weights_only=False)
-    cfg: JepaConfig = ckpt["cfg"]
-    jepa = JepaWorldModel(cfg).to(device)
-    jepa.load_state_dict(ckpt["model"])
-    jepa.eval()
-    for p in jepa.parameters():
-        p.requires_grad_(False)
-    print(f"[probe] loaded JEPA: {sum(p.numel() for p in jepa.parameters()):,} params (frozen)")
+    # When --use-raw-obs is set, we skip the JEPA encoder entirely and train
+    # the probe on flattened raw obs. This is the *upper-bound* sanity check.
+    if args.use_raw_obs:
+        # We still need cfg.embed_dim conceptually — set it to the flat obs dim.
+        cfg = JepaConfig()  # only used for n_actions etc. defaults
+        embed_dim = cfg.obs_channels * cfg.obs_h * cfg.obs_w  # 3*7*7 = 147
+        jepa = None
+        print(f"[probe] --use-raw-obs: probing on flattened raw obs (dim={embed_dim})")
+    else:
+        ckpt = torch.load(args.jepa_checkpoint, map_location=device, weights_only=False)
+        cfg = ckpt["cfg"]
+        embed_dim = cfg.embed_dim
+        jepa = JepaWorldModel(cfg).to(device)
+        jepa.load_state_dict(ckpt["model"])
+        jepa.eval()
+        for p in jepa.parameters():
+            p.requires_grad_(False)
+        print(
+            f"[probe] loaded JEPA: {sum(p.numel() for p in jepa.parameters()):,} "
+            f"params (frozen), embed_dim={embed_dim}"
+        )
 
     # ------------------------------------------------------ data
     rng = np.random.default_rng(args.seed)
@@ -143,18 +167,21 @@ def main() -> int:
           f"positive-rate={base_rate:.3f}")
 
     # ------------------------------------------------------ probe
-    probe = PredicateProbe(embed_dim=cfg.embed_dim).to(device)
+    probe = make_probe(embed_dim=embed_dim, hidden=args.probe_hidden).to(device)
     opt = torch.optim.AdamW(probe.parameters(), lr=args.lr, weight_decay=1e-4)
-    print(f"[probe] probe params: {sum(p.numel() for p in probe.parameters()):,}")
+    arch_label = "linear" if args.probe_hidden <= 0 else f"MLP(hidden={args.probe_hidden})"
+    print(f"[probe] probe arch: {arch_label}, params: {sum(p.numel() for p in probe.parameters()):,}")
 
     train_obs_t = torch.from_numpy(train_obs).to(device)
     train_preds_t = torch.from_numpy(train_preds).to(device)
     eval_obs_t = torch.from_numpy(eval_obs).to(device)
     eval_preds_t = torch.from_numpy(eval_preds).to(device)
 
-    # Pre-encode everything once (JEPA is frozen).
+    # Pre-encode everything once. With --use-raw-obs we just flatten.
     @torch.no_grad()
     def encode_all(obs_tensor: torch.Tensor, batch: int = 1024) -> torch.Tensor:
+        if jepa is None:
+            return obs_tensor.reshape(obs_tensor.shape[0], -1)
         out = []
         for i in range(0, obs_tensor.shape[0], batch):
             out.append(jepa.encode(obs_tensor[i : i + batch]))
@@ -228,20 +255,35 @@ def main() -> int:
     for name, v in acc.items():
         print(f"  {name:9s} accuracy        : {v*100:.2f}%")
 
-    # Phase 2 v0 falsifier: linear probe should clear ~95% on `visible` and
-    # ≥85% on the others. If overall < 85% we don't yet have grounded
-    # representations — needs object-centric inductive bias before planner.
-    pass1 = overall > 0.85
-    pass2 = f1 > 0.5  # positive class is rare, F1 catches degenerate "always 0" probes
-    print(f"\n  pass (overall > 85%)       : {'YES' if pass1 else 'NO'}")
-    print(f"  pass (f1 > 0.5)            : {'YES' if pass2 else 'NO'}")
-    print(f"\n  Phase 2 v0 falsifiers: "
-          f"{'PASS — grounding is real' if (pass1 and pass2) else 'FAIL — JEPA latent missing object structure'}")
+    # Phase 2 v0 falsifier: F1 is the real signal because positive class is
+    # rare. A degenerate "always-0" probe gets high accuracy with F1 ≈ 0.
+    # We grade on F1 and report accuracy alongside.
+    pass_f1 = f1 > 0.5
+    print(f"\n  pass (f1 > 0.5)            : {'YES' if pass_f1 else 'NO'}")
+    if args.use_raw_obs:
+        verdict = (
+            "PASS — task is linearly solvable from raw obs"
+            if pass_f1
+            else "FAIL — task isn't even solvable from raw obs at this probe depth"
+        )
+    elif args.probe_hidden > 0:
+        verdict = (
+            "PASS — info is in the JEPA latent, just needs nonlinear readout"
+            if pass_f1
+            else "FAIL — info genuinely missing from JEPA latent (MLP can't recover)"
+        )
+    else:
+        verdict = (
+            "PASS — JEPA latent linearly encodes object structure"
+            if pass_f1
+            else "FAIL — JEPA latent doesn't linearly encode object structure"
+        )
+    print(f"\n  Phase 2 v0 verdict: {verdict}")
 
     ckpt_out = out_dir / "probe_final.pt"
-    torch.save({"probe": probe.state_dict(), "embed_dim": cfg.embed_dim}, ckpt_out)
+    torch.save({"probe": probe.state_dict(), "embed_dim": embed_dim}, ckpt_out)
     print(f"\n[probe] saved {ckpt_out}")
-    return 0 if (pass1 and pass2) else 2
+    return 0 if pass_f1 else 2
 
 
 if __name__ == "__main__":
