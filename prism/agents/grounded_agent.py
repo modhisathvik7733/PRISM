@@ -363,6 +363,34 @@ class GroundedAgent:
             wdx, wdy = -rel_forward, rel_right
         return (self._mem_x + wdx, self._mem_y + wdy)
 
+    @staticmethod
+    def _goal_in_slots(slots_list, weighted_goal) -> bool:
+        """True if the goal (type, color) appears in the current view's slots."""
+        gt, gc = weighted_goal.type_id, weighted_goal.color_id
+        return any(s.type_id == gt and s.color_id == gc for s in slots_list)
+
+    def _slot_rotate_fallback(self, slots_list, weighted_goal,
+                              allowed: tuple[int, ...],
+                              forward_blocked_now: bool) -> int:
+        """When the JEPA's visibility predicate dips below 0.5 while the goal
+        is still in the slot list, rotate using slot-based geometry instead of
+        the noisy 1-step prediction. Slots are perception, not learning — fair
+        to use as a backup so we don't fall through to cache when the target
+        is actually right in view."""
+        FORWARD, TURN_LEFT, TURN_RIGHT = 2, 0, 1
+        ax, ay = AGENT_POS
+        gt, gc = weighted_goal.type_id, weighted_goal.color_id
+        cands = [s for s in slots_list if s.type_id == gt and s.color_id == gc]
+        target = min(cands, key=lambda s: abs(s.x - ax) + abs(s.y - ay))
+        if target.x < ax and TURN_LEFT in allowed:
+            return TURN_LEFT
+        if target.x > ax and TURN_RIGHT in allowed:
+            return TURN_RIGHT
+        # target.x == ax: in front of agent — go forward if not blocked.
+        if FORWARD in allowed and not forward_blocked_now:
+            return FORWARD
+        return TURN_RIGHT if TURN_RIGHT in allowed else allowed[0]
+
     def _navigate_toward(self, target: tuple[int, int], allowed: tuple[int, ...],
                          forward_blocked_now: bool) -> int:
         """Greedy single-step toward a known world-frame target.
@@ -441,15 +469,18 @@ class GroundedAgent:
                 )
                 self._mem_visited.add((self._mem_x, self._mem_y))
 
-        # 1b. Update object-instance cache from the current observation.
-        # Each visible (type, color) gets its world-frame position recorded so
-        # the agent can navigate back if the target leaves view later.
+        # 1b. Extract slots once. We use them for two things:
+        #   (a) update the object-instance cache from currently-visible objects
+        #   (b) gate cache use to "goal is genuinely not in current view" so the
+        #       cache doesn't fire spuriously when the model's visibility
+        #       predicate dips below 0.5 while the slot is still there.
+        slots_list: list = []
         try:
             obs_np = obs.detach().cpu().numpy()
-            for s in extract_slots_from_normalized(obs_np):
+            slots_list = list(extract_slots_from_normalized(obs_np))
+            for s in slots_list:
                 self._mem_objects[(s.type_id, s.color_id)] = self._slot_to_world(s.x, s.y)
         except Exception:
-            # Slot extraction is opportunistic — never crash the agent on it.
             pass
 
         # 2. Read goal predicates from current state.
@@ -506,15 +537,26 @@ class GroundedAgent:
             p_face_right = float(next_probs[1, idx_facing].item())
             action = TURN_LEFT if p_face_left >= p_face_right else TURN_RIGHT
             branch = "rotate_to_face"
-        # 3d. target hidden but cached from a prior observation: navigate back.
-        # All weighted goals share (type_id, color_id), so use the first.
-        elif goal_preds and (goal_preds[0].type_id, goal_preds[0].color_id) in self._mem_objects:
+        # 3d. predicate dipped < 0.5 but the goal is actually in the current
+        # slot extraction — fall back to slot-based rotate so we don't redirect
+        # via cache to a position we're already next to.
+        elif goal_preds and self._goal_in_slots(slots_list, goal_preds[0]):
+            action = self._slot_rotate_fallback(
+                slots_list, goal_preds[0], allowed, forward_blocked_now
+            )
+            branch = "slot_fallback"
+        # 3e. target genuinely hidden but cached from a prior observation:
+        # navigate back to its last-known world-frame position.
+        elif (
+            goal_preds
+            and (goal_preds[0].type_id, goal_preds[0].color_id) in self._mem_objects
+        ):
             target_xy = self._mem_objects[(goal_preds[0].type_id, goal_preds[0].color_id)]
             action = self._navigate_toward(target_xy, allowed, forward_blocked_now)
             branch = "cached_navigate"
             info["cached_target_x"] = float(target_xy[0])
             info["cached_target_y"] = float(target_xy[1])
-        # 3e. target hidden and never seen: frontier exploration.
+        # 3f. target hidden and never seen: frontier exploration.
         else:
             action = self._frontier_action(allowed, forward_blocked_now)
             branch = "frontier"
