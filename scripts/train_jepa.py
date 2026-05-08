@@ -126,6 +126,18 @@ def main() -> int:
              "agent only). Default 0.5 = balanced mix. Ignored if --agent-data-path "
              "is not set."
     )
+    parser.add_argument(
+        "--dynamics-hidden", type=int, default=256,
+        help="LatentDynamics MLP hidden width. Default 256 = original. Use 512 "
+             "to test whether rotation-action prediction (turn_left/turn_right "
+             "F1 ~0.55 in eval_dynamics_predicates) is capacity-bound."
+    )
+    parser.add_argument(
+        "--dynamics-layers", type=int, default=2,
+        help="Number of (Linear+GELU) blocks in LatentDynamics before the "
+             "output projection. Default 2 = original. Try 4 alongside "
+             "--dynamics-hidden 512."
+    )
     args = parser.parse_args()
 
     set_global_seed(args.seed)
@@ -135,9 +147,14 @@ def main() -> int:
     mix_tag = (
         f"_mix{args.agent_data_mix:g}" if args.agent_data_path is not None else ""
     )
+    dyn_tag = (
+        f"_dyn{args.dynamics_layers}x{args.dynamics_hidden}"
+        if (args.dynamics_hidden != 256 or args.dynamics_layers != 2)
+        else ""
+    )
     run_name = (
         args.run_name
-        or f"jepa_{args.encoder_type}{aux_tag}{mix_tag}_{args.env_id}_seed{args.seed}"
+        or f"jepa_{args.encoder_type}{aux_tag}{mix_tag}{dyn_tag}_{args.env_id}_seed{args.seed}"
     )
     out_dir = Path("runs") / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -154,6 +171,8 @@ def main() -> int:
         n_actions=n_actions,
         encoder_type=args.encoder_type,
         aux_predicate_weight=args.aux_predicate_weight,
+        dynamics_hidden_dim=args.dynamics_hidden,
+        dynamics_layers=args.dynamics_layers,
     )
     model = JepaWorldModel(cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)

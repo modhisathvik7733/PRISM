@@ -55,6 +55,13 @@ class JepaConfig:
     # encoder can satisfy next-state prediction without encoding object types).
     aux_predicate_weight: float = 0.0
     aux_predicate_dim: int = 96  # PREDICATE_VECTOR_DIM — keep in sync
+    # LatentDynamics capacity. Defaults reproduce the original 3-linear-layer
+    # MLP (Linear(in,h)-GELU-Linear(h,h)-GELU-Linear(h,out)). dynamics_layers
+    # counts the (Linear+GELU) blocks before the output projection — so 2 = current.
+    # Bumping these is the Fix-A test for the rotation-prediction failure
+    # (turn-action F1 ~0.55 while forward F1 ~0.93 in eval_dynamics_predicates).
+    dynamics_hidden_dim: int = 256
+    dynamics_layers: int = 2
 
 
 class GridEncoder(nn.Module):
@@ -187,13 +194,16 @@ class LatentDynamics(nn.Module):
     def __init__(self, cfg: JepaConfig):
         super().__init__()
         self.action_embed = nn.Embedding(cfg.n_actions, cfg.embed_dim)
-        self.net = nn.Sequential(
-            nn.Linear(cfg.embed_dim * 2, cfg.hidden_dim),
-            nn.GELU(),
-            nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
-            nn.GELU(),
-            nn.Linear(cfg.hidden_dim, cfg.embed_dim),
-        )
+        # getattr with defaults so older checkpoints (no dynamics_* fields)
+        # unpickle with the original architecture.
+        h = getattr(cfg, "dynamics_hidden_dim", cfg.hidden_dim)
+        n_blocks = max(1, getattr(cfg, "dynamics_layers", 2))
+        layers: list[nn.Module] = [nn.Linear(cfg.embed_dim * 2, h), nn.GELU()]
+        for _ in range(n_blocks - 1):
+            layers.append(nn.Linear(h, h))
+            layers.append(nn.GELU())
+        layers.append(nn.Linear(h, cfg.embed_dim))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, z: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
         ae = self.action_embed(a)
