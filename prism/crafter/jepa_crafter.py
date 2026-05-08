@@ -5,14 +5,14 @@ Dynamics: MLP  concat(z_t, a_embed) → z_pred,  all in embed_dim space
 Target:   EMA copy of online encoder, no grad
 
 Losses:
-  L_pred = MSE(z_pred, sg(target(obs_{t+1})))          stop-grad on target
-  L_reg  = mean(mu^2) + mean((var - 1)^2)              Gaussian regularizer
+  L_pred = MSE(norm(z_pred), sg(norm(target(obs_{t+1}))))  cosine-equivalent
+  L_var  = mean(relu(1 - std(z_t, dim=0)))                 VICReg variance floor
 
 Shapes locked:
   obs:     (B, 3, 64, 64)  float32  [0, 1]
   action:  (B,)            int64    [0, 16]
   z:       (B, embed_dim)  float32  (default embed_dim = 256)
-  a_embed: (B, embed_dim)  float32  (same dim — avoids asymmetric concat)
+  a_embed: (B, embed_dim)  float32  (same dim, avoids asymmetric concat)
   z_pred:  (B, embed_dim)  float32
 """
 
@@ -33,7 +33,7 @@ class CrafterJepaConfig:
     embed_dim: int = 256
     n_actions: int = 17
     ema_decay: float = 0.996
-    reg_weight: float = 1e-3
+    reg_weight: float = 1e-2   # weight on VICReg variance floor (was 1e-3 Gaussian reg -- see loss())
     dynamics_hidden: int = 256
 
 
@@ -112,14 +112,21 @@ class CrafterJepaWorldModel(nn.Module):
         with torch.no_grad():
             z_target = self.target_encoder(obs_tp1)  # (B, E)  stop-grad
 
-        l_pred = F.mse_loss(z_pred, z_target)
-        mu = z_t.mean(dim=0)                         # (E,)
-        var = z_t.var(dim=0)                         # (E,)
-        l_reg = mu.pow(2).mean() + (var - 1.0).pow(2).mean()
+        # L2-normalize before MSE: equivalent to cosine distance, immune to
+        # scale drift. Prevents the encoder from minimising l_pred by simply
+        # shrinking or expanding all outputs uniformly.
+        z_pred_n   = F.normalize(z_pred,   dim=-1)  # (B, E) unit-norm
+        z_target_n = F.normalize(z_target, dim=-1)  # (B, E) unit-norm
+        l_pred = F.mse_loss(z_pred_n, z_target_n)   # in [0, 4]
 
-        loss = l_pred + self.cfg.reg_weight * l_reg
+        # VICReg variance floor: push per-dim std >= 1, no penalty above 1.
+        # Anti-collapse only -- unlike (var-1)^2 it cannot overshoot.
+        std = z_t.std(dim=0).clamp(min=1e-4)        # (E,)
+        l_var = F.relu(1.0 - std).mean()            # in [0, 1]
+
+        loss = l_pred + self.cfg.reg_weight * l_var
         return {
             "loss": loss,
             "loss_pred": l_pred.detach(),
-            "loss_reg": l_reg.detach(),
+            "loss_reg": l_var.detach(),
         }
