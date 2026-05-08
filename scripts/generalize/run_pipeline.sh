@@ -17,7 +17,13 @@ set -euo pipefail
 V13_JEPA="${V13_JEPA:-runs/jepa_categorical_spatial_aux3_dist24_mix0.5_spat64_spatial_film_dyn3x256_BabyAI-GoToLocal-v0_seed0/jepa_final.pt}"
 V13_POLICY="${V13_POLICY:-runs/ppo_v6_pathB/policy_iter400.pt}"
 DEVICE="${DEVICE:-cuda}"
-ENVS=(BabyAI-GoToLocal-v0 BabyAI-Pickup-v0 BabyAI-GoTo-v0 BabyAI-Open-v0)
+# Path A scope — go-to family only. Pickup/Open are multi-room and the
+# memory teacher's frontier exploration can't navigate through doors
+# (phase1 confirmed: 2/5300 episodes for Pickup-v0). Use the navigation
+# family where the teacher is competent: GoToLocal (v1.3 baseline, small
+# room), GoTo (single room + distractors), GoToObj (simplest, no
+# distractors). Story: "recipe transfers across the go-to family."
+ENVS=(BabyAI-GoToLocal-v0 BabyAI-GoTo-v0 BabyAI-GoToObj-v0)
 RUN_TAG="${RUN_TAG:-v2}"
 
 phase0_zeroshot() {
@@ -82,10 +88,11 @@ phase3_bc_train() {
 }
 
 phase4_ppo_per_env() {
-    # Per-env PPO from the multi-env BC warmstart. Three runs, one per
-    # target env. Each writes to runs/${RUN_TAG}_ppo_<env-suffix>.
+    # Per-env PPO from the multi-env BC warmstart. Two runs (GoToLocal is
+    # already v1.3 = ppo_v6_pathB, no need to re-train it here). Each
+    # writes to runs/${RUN_TAG}_ppo_<env-suffix>.
     echo "=== phase4: PPO per env from multi-env BC warmstart ==="
-    for env in BabyAI-Pickup-v0 BabyAI-GoTo-v0 BabyAI-Open-v0; do
+    for env in BabyAI-GoTo-v0 BabyAI-GoToObj-v0; do
         suffix="${env#BabyAI-}"; suffix="${suffix%-v0}"
         echo "  --- PPO on $env (out: runs/${RUN_TAG}_ppo_${suffix}) ---"
         python -m scripts.ppo_train \
@@ -119,7 +126,7 @@ phase5_capstone() {
     # multi-env eval so we see both in-domain performance AND cross-env
     # transfer in a single comparable table.
     echo "=== phase5: capstone — eval each policy across all envs ==="
-    for env in BabyAI-Pickup-v0 BabyAI-GoTo-v0 BabyAI-Open-v0; do
+    for env in BabyAI-GoTo-v0 BabyAI-GoToObj-v0; do
         suffix="${env#BabyAI-}"; suffix="${suffix%-v0}"
         ckpt="runs/${RUN_TAG}_ppo_${suffix}/policy_final.pt"
         if [[ -f "$ckpt" ]]; then
@@ -132,6 +139,17 @@ phase5_capstone() {
                 --per-cohort
         fi
     done
+    # Also eval the v1.3 policy (already a "GoToLocal" expert) on the
+    # broader env set so the capstone table has a per-env row for v1.3 too.
+    if [[ -f "$V13_POLICY" ]]; then
+        echo "  --- eval $V13_POLICY (v1.3 baseline) across all envs ---"
+        python -m scripts.generalize.ppo_eval_multi \
+            --jepa-checkpoint "runs/${RUN_TAG}_jepa_universal/jepa_final.pt" \
+            --policy-checkpoint "$V13_POLICY" \
+            --envs "${ENVS[@]}" \
+            --episodes 1000 --max-steps 128 --device "$DEVICE" \
+            --per-cohort
+    fi
     multi_ckpt="runs/${RUN_TAG}_ppo_multienv/policy_final.pt"
     if [[ -f "$multi_ckpt" ]]; then
         echo "  --- eval $multi_ckpt (multi-env) across all envs ---"

@@ -8,10 +8,20 @@ under `prism/` or `scripts/` (other than this directory and
 ## Why a separate fork?
 
 `v1.3-pathB-iter400` hits 98.7% success on GoToLocal, matching the BabyAI
-99% ceiling. Open question: did the recipe transfer or memorize? Three new
-envs answer this — Pickup needs action 3, Open needs action 5, GoTo adds
-distractors. If the same JEPA + memory-augmented policy hits comparable
-numbers on those, the recipe is real.
+99% ceiling. Open question: did the recipe transfer or memorize?
+
+**Initial scope (Pickup + GoTo + Open) was narrowed to the go-to family
+after phase 1 surfaced a teacher limitation:** BabyAI-Pickup-v0 and
+BabyAI-Open-v0 are multi-room envs, and the memory teacher's frontier
+exploration can't navigate through doors (2/5300 episodes succeeded for
+Pickup-v0). A stronger teacher (e.g. BabyAI's BabyAIBot oracle) is the
+right fix for those envs but is out of scope for this iteration.
+
+**Current scope (Path A):** GoToLocal-v0 (small room), GoTo-v0 (single
+larger room with distractors), GoToObj-v0 (single object, no distractors).
+All three share the navigation-only action set and let the memory teacher
+collect clean BC data. Story: "the recipe transfers across the go-to
+family at varying difficulty."
 
 ## What's new
 
