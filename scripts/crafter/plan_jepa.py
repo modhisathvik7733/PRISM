@@ -39,6 +39,37 @@ from prism.utils.seed import set_global_seed
 
 # ── checkpoint helpers ────────────────────────────────────────────────────────
 
+def load_memory_from_npz(
+    npz_path: str,
+    encoder: torch.nn.Module,
+    n_samples: int,
+    device: torch.device,
+    seed: int = 0,
+) -> torch.Tensor:
+    """Encode N randomly-sampled observations from crafter_rollouts.npz → (N, E).
+
+    The rollout file contains obs_t: (Total, 3, 64, 64) uint8.
+    We sample n_samples indices and run them through the frozen encoder in one
+    batched forward pass (no gradient). Returns z_memory: (N, E) float32.
+    """
+    d       = np.load(npz_path)
+    obs_all = d["obs_t"]                                  # (Total, 3, 64, 64) uint8
+    Total   = len(obs_all)
+    rng     = np.random.default_rng(seed)
+    idx     = rng.choice(Total, size=min(n_samples, Total), replace=False)
+    obs_sub = obs_all[idx].astype(np.float32) / 255.0    # (N, 3, 64, 64) float32
+
+    batch_size = 512
+    zs: list[torch.Tensor] = []
+    with torch.no_grad():
+        for start in range(0, len(obs_sub), batch_size):
+            batch = torch.from_numpy(obs_sub[start:start + batch_size]).to(device)
+            zs.append(encoder(batch))                     # (B, E)
+    z_memory = torch.cat(zs, dim=0)                      # (N, E)
+    print(f"[memory] encoded {len(z_memory):,} observations from {npz_path}")
+    return z_memory
+
+
 def load_jepa(path: str, device: torch.device):
     """Load frozen encoder + dynamics from jepa_final.pt."""
     ckpt = torch.load(path, map_location=device, weights_only=False)
@@ -144,7 +175,6 @@ def run_goal_experiment(
     exec_steps: int = 5,
     max_total_steps: int = 200,
     seed: int = 42,
-    device: torch.device = torch.device("cpu"),
 ) -> None:
     """Receding-horizon goal-directed planning. No reward signal."""
     z_goal   = planner.encode_obs(goal_obs)                    # (E,)
@@ -281,6 +311,7 @@ def run_chain_experiment(
     switch_threshold: float = 0.20,
     seed: int = 42,
     device: torch.device = torch.device("cpu"),
+    z_memory_seed: Optional[torch.Tensor] = None,
 ) -> None:
     """Two-phase subgoal-chaining experiment.
 
@@ -312,8 +343,9 @@ def run_chain_experiment(
 
     for trial in range(n_trials):
         base_seed = seed + trial * 1_000_003
-        worker    = CrafterEnvWorker(base_seed, worker_id=0, reward_mode="reward")
-        z_memory  = torch.zeros(0, E, device=device)
+        worker   = CrafterEnvWorker(base_seed, worker_id=0, reward_mode="reward")
+        # Pre-seed memory from rollout data if provided; curiosity exploration adds more.
+        z_memory = z_memory_seed.clone() if z_memory_seed is not None else torch.zeros(0, E, device=device)
         trial_achievements: set[str] = set()
 
         # ── Phase 1: curiosity exploration ───────────────────────────────────
@@ -447,6 +479,11 @@ def parse_args():
     p.add_argument("--explore-steps",       type=int,   default=300)
     p.add_argument("--plan-steps",          type=int,   default=300)
     p.add_argument("--switch-threshold",    type=float, default=0.20)
+    p.add_argument("--memory-npz",          default=None,
+                   help="path to crafter_rollouts.npz; samples --memory-npz-n obs "
+                        "to pre-populate z_memory before curiosity exploration")
+    p.add_argument("--memory-npz-n",        type=int,   default=2000,
+                   help="number of observations to sample from --memory-npz")
     p.add_argument("--device",
                    default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
@@ -478,7 +515,6 @@ def main() -> int:
                 exec_steps=args.exec_steps,
                 max_total_steps=args.max_steps,
                 seed=args.seed + 1,
-                device=device,
             )
 
     if args.experiment in ("curiosity", "both"):
@@ -505,6 +541,16 @@ def main() -> int:
         if goal_obs is None:
             print("[chain] could not collect goal obs — aborting")
         else:
+            z_mem_seed: Optional[torch.Tensor] = None
+            if args.memory_npz is not None and Path(args.memory_npz).exists():
+                z_mem_seed = load_memory_from_npz(
+                    args.memory_npz, encoder,
+                    n_samples=args.memory_npz_n,
+                    device=device, seed=args.seed,
+                )
+            elif args.memory_npz is not None:
+                print(f"[chain] WARNING: --memory-npz {args.memory_npz} not found, "
+                      f"starting with empty memory")
             run_chain_experiment(
                 planner, goal_obs,
                 n_trials=args.trials,
@@ -518,6 +564,7 @@ def main() -> int:
                 switch_threshold=args.switch_threshold,
                 seed=args.seed + 3,
                 device=device,
+                z_memory_seed=z_mem_seed,
             )
 
     return 0
