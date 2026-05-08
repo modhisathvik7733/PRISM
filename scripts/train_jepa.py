@@ -138,6 +138,13 @@ def main() -> int:
              "output projection. Default 2 = original. Try 4 alongside "
              "--dynamics-hidden 512."
     )
+    parser.add_argument(
+        "--dynamics-type", default="mlp", choices=["mlp", "film"],
+        help="mlp (default) = concat(z, action_embed) → MLP. film = action "
+             "embedding produces (gamma, beta) per layer, modulating hidden "
+             "activations. Use 'film' to test whether weak action conditioning "
+             "is the cause of turn-action F1 ~0.55 in eval_dynamics_predicates."
+    )
     args = parser.parse_args()
 
     set_global_seed(args.seed)
@@ -152,6 +159,8 @@ def main() -> int:
         if (args.dynamics_hidden != 256 or args.dynamics_layers != 2)
         else ""
     )
+    if args.dynamics_type != "mlp":
+        dyn_tag = f"_{args.dynamics_type}{dyn_tag}"
     run_name = (
         args.run_name
         or f"jepa_{args.encoder_type}{aux_tag}{mix_tag}{dyn_tag}_{args.env_id}_seed{args.seed}"
@@ -173,6 +182,7 @@ def main() -> int:
         aux_predicate_weight=args.aux_predicate_weight,
         dynamics_hidden_dim=args.dynamics_hidden,
         dynamics_layers=args.dynamics_layers,
+        dynamics_type=args.dynamics_type,
     )
     model = JepaWorldModel(cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)

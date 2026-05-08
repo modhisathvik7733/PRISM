@@ -62,6 +62,16 @@ class JepaConfig:
     # (turn-action F1 ~0.55 while forward F1 ~0.93 in eval_dynamics_predicates).
     dynamics_hidden_dim: int = 256
     dynamics_layers: int = 2
+    # "mlp"  — concatenate action embedding with z and run an MLP. Action enters
+    #          only through the input layer; the optimizer's local minimum has
+    #          been "predict forward well, average through turns" (verified by
+    #          eval_dynamics_predicates: turn-action F1 ~0.55 unchanged across
+    #          aux-weight 1→3 AND dynamics 256x2 → 512x4 capacity bumps).
+    # "film" — Feature-wise Linear Modulation. Action embedding produces
+    #          (gamma, beta) per layer that modulate hidden activations as
+    #          h * (1 + gamma) + beta. Forces the action to gate the
+    #          transformation at every layer, not just be one input feature.
+    dynamics_type: str = "mlp"
 
 
 class GridEncoder(nn.Module):
@@ -210,6 +220,67 @@ class LatentDynamics(nn.Module):
         return self.net(torch.cat([z, ae], dim=-1))
 
 
+class FiLMBlock(nn.Module):
+    """One layer of action-conditioned dynamics.
+
+    h' = (1 + gamma(ae)) * gelu(W h) + beta(ae)
+
+    The (1 + gamma) form initializes near identity-modulation so the block
+    does not destroy signal at init.
+    """
+
+    def __init__(self, hidden: int, action_dim: int):
+        super().__init__()
+        self.linear = nn.Linear(hidden, hidden)
+        self.to_gamma = nn.Linear(action_dim, hidden)
+        self.to_beta = nn.Linear(action_dim, hidden)
+        # Initialize gamma/beta projections to ~zero so blocks start near identity.
+        nn.init.zeros_(self.to_gamma.weight); nn.init.zeros_(self.to_gamma.bias)
+        nn.init.zeros_(self.to_beta.weight);  nn.init.zeros_(self.to_beta.bias)
+
+    def forward(self, h: torch.Tensor, ae: torch.Tensor) -> torch.Tensor:
+        gamma = self.to_gamma(ae)
+        beta = self.to_beta(ae)
+        return (1.0 + gamma) * F.gelu(self.linear(h)) + beta
+
+
+class FiLMDynamics(nn.Module):
+    """Action-conditioned dynamics via FiLM modulation at every layer.
+
+    Unlike LatentDynamics (concat-then-MLP), here z is projected first and
+    then *every* hidden layer is modulated by the action embedding. The action
+    cannot be averaged out across actions because it gates each block's
+    activations multiplicatively and additively.
+    """
+
+    def __init__(self, cfg: JepaConfig):
+        super().__init__()
+        self.action_embed = nn.Embedding(cfg.n_actions, cfg.embed_dim)
+        h = getattr(cfg, "dynamics_hidden_dim", cfg.hidden_dim)
+        n_blocks = max(1, getattr(cfg, "dynamics_layers", 2))
+        self.in_proj = nn.Linear(cfg.embed_dim, h)
+        self.blocks = nn.ModuleList(
+            [FiLMBlock(h, cfg.embed_dim) for _ in range(n_blocks)]
+        )
+        self.out_proj = nn.Linear(h, cfg.embed_dim)
+
+    def forward(self, z: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+        ae = self.action_embed(a)
+        h = F.gelu(self.in_proj(z))
+        for block in self.blocks:
+            h = block(h, ae)
+        return self.out_proj(h)
+
+
+def _make_dynamics(cfg: JepaConfig) -> nn.Module:
+    dyn_type = getattr(cfg, "dynamics_type", "mlp")
+    if dyn_type == "mlp":
+        return LatentDynamics(cfg)
+    if dyn_type == "film":
+        return FiLMDynamics(cfg)
+    raise ValueError(f"unknown dynamics_type {dyn_type!r} (use 'mlp' or 'film')")
+
+
 class JepaWorldModel(nn.Module):
     """Online encoder + EMA target encoder + latent dynamics.
 
@@ -223,7 +294,7 @@ class JepaWorldModel(nn.Module):
         self.cfg = cfg or JepaConfig()
         self.online_encoder = _make_encoder(self.cfg)
         self.target_encoder = _make_encoder(self.cfg)
-        self.dynamics = LatentDynamics(self.cfg)
+        self.dynamics = _make_dynamics(self.cfg)
         # Auxiliary predicate head — only created if the loss weight is > 0.
         # Linear by design: if a deeper head is required, the encoder isn't
         # actually preserving the structure, just providing material for the
