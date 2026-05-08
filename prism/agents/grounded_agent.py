@@ -41,7 +41,11 @@ import torch
 from prism.language.mission_parser import GoalSpec, parse_mission
 from prism.models.jepa import JepaWorldModel
 from prism.perception.predicates import predicate_index, type_color_index
-from prism.perception.slots import COLOR_NAME_TO_IDX
+from prism.perception.slots import (
+    AGENT_POS,
+    COLOR_NAME_TO_IDX,
+    extract_slots_from_normalized,
+)
 
 
 # MiniGrid action ids:
@@ -204,6 +208,10 @@ class GroundedAgent:
         self._mem_blocked: set[tuple[int, int]] = set()
         self._mem_last_action: int | None = None
         self._mem_last_obs: torch.Tensor | None = None
+        # Object-instance memory: (type_id, color_id) → last-seen world (x, y).
+        # Lets the agent navigate back to a target it saw and lost sight of
+        # rather than falling into frontier exploration.
+        self._mem_objects: dict[tuple[int, int], tuple[int, int]] = {}
 
     def reset(self) -> None:
         """Call at the start of each episode so curriculum-mode exploration
@@ -218,6 +226,7 @@ class GroundedAgent:
         self._mem_blocked = set()
         self._mem_last_action = None
         self._mem_last_obs = None
+        self._mem_objects = {}
 
     @torch.no_grad()
     def _curriculum_select(
@@ -333,6 +342,61 @@ class GroundedAgent:
             return x, y - 1
         return x - 1, y  # facing == 3
 
+    def _slot_to_world(self, sx: int, sy: int) -> tuple[int, int]:
+        """Convert agent-frame slot coords (BabyAI partial view at agent pos
+        (3, 6) facing-up) to world-frame coords using the agent's current pose.
+
+        rel_forward = how many cells in front of the agent the slot is (>=0).
+        rel_right   = how many cells to the agent's right (>0 right, <0 left).
+        These are then rotated by the agent's facing into the world frame."""
+        ax, ay = AGENT_POS  # (3, 6)
+        rel_forward = ay - sy
+        rel_right = sx - ax
+        f = self._mem_facing
+        if f == 0:    # +y world is "ahead" of the agent
+            wdx, wdy = rel_right, rel_forward
+        elif f == 1:  # +x world is "ahead"
+            wdx, wdy = rel_forward, -rel_right
+        elif f == 2:  # -y world is "ahead"
+            wdx, wdy = -rel_right, -rel_forward
+        else:         # f == 3, -x world is "ahead"
+            wdx, wdy = -rel_forward, rel_right
+        return (self._mem_x + wdx, self._mem_y + wdy)
+
+    def _navigate_toward(self, target: tuple[int, int], allowed: tuple[int, ...],
+                         forward_blocked_now: bool) -> int:
+        """Greedy single-step toward a known world-frame target.
+
+        Picks the cardinal direction that closes the larger of |dx|, |dy|.
+        Turns toward that direction one step at a time, forwards when aligned.
+        Falls through to a turn if forward is currently blocked.
+        """
+        FORWARD, TURN_LEFT, TURN_RIGHT = 2, 0, 1
+        tx, ty = target
+        dx = tx - self._mem_x
+        dy = ty - self._mem_y
+        if dx == 0 and dy == 0:
+            # Already on the cell — turn to scan (target may be in an adjacent
+            # tile; this nudges the camera).
+            return TURN_RIGHT if TURN_RIGHT in allowed else allowed[0]
+        # Pick the desired facing (0=+y, 1=+x, 2=-y, 3=-x).
+        if abs(dy) >= abs(dx):
+            desired = 0 if dy > 0 else 2
+        else:
+            desired = 1 if dx > 0 else 3
+        diff = (desired - self._mem_facing) % 4
+        if diff == 0:
+            if FORWARD in allowed and not forward_blocked_now:
+                return FORWARD
+            # Aligned but blocked: turn right to look for a sidestep
+            return TURN_RIGHT if TURN_RIGHT in allowed else allowed[0]
+        if diff == 1:
+            return TURN_RIGHT if TURN_RIGHT in allowed else allowed[0]
+        if diff == 3:
+            return TURN_LEFT if TURN_LEFT in allowed else allowed[0]
+        # diff == 2 (180°): rotate one step at a time toward target
+        return TURN_RIGHT if TURN_RIGHT in allowed else allowed[0]
+
     @torch.no_grad()
     def _memory_select(
         self,
@@ -376,6 +440,17 @@ class GroundedAgent:
                     self._mem_x, self._mem_y, self._mem_facing
                 )
                 self._mem_visited.add((self._mem_x, self._mem_y))
+
+        # 1b. Update object-instance cache from the current observation.
+        # Each visible (type, color) gets its world-frame position recorded so
+        # the agent can navigate back if the target leaves view later.
+        try:
+            obs_np = obs.detach().cpu().numpy()
+            for s in extract_slots_from_normalized(obs_np):
+                self._mem_objects[(s.type_id, s.color_id)] = self._slot_to_world(s.x, s.y)
+        except Exception:
+            # Slot extraction is opportunistic — never crash the agent on it.
+            pass
 
         # 2. Read goal predicates from current state.
         idx_visible = idx_facing = idx_adjacent = None
@@ -431,7 +506,15 @@ class GroundedAgent:
             p_face_right = float(next_probs[1, idx_facing].item())
             action = TURN_LEFT if p_face_left >= p_face_right else TURN_RIGHT
             branch = "rotate_to_face"
-        # 3d. target hidden OR forward currently blocked: frontier exploration
+        # 3d. target hidden but cached from a prior observation: navigate back.
+        # All weighted goals share (type_id, color_id), so use the first.
+        elif goal_preds and (goal_preds[0].type_id, goal_preds[0].color_id) in self._mem_objects:
+            target_xy = self._mem_objects[(goal_preds[0].type_id, goal_preds[0].color_id)]
+            action = self._navigate_toward(target_xy, allowed, forward_blocked_now)
+            branch = "cached_navigate"
+            info["cached_target_x"] = float(target_xy[0])
+            info["cached_target_y"] = float(target_xy[1])
+        # 3e. target hidden and never seen: frontier exploration.
         else:
             action = self._frontier_action(allowed, forward_blocked_now)
             branch = "frontier"
