@@ -1,13 +1,17 @@
 """LatentPlanner — reward-free planning in JEPA latent space.
 
-Two planning modes:
-  beam_search(z_start, z_goal)    — goal-directed: find the action sequence
-      whose predicted dynamics trajectory ends closest to z_goal.
-  novelty_plan(z_start, z_memory) — curiosity-driven: find the sequence that
-      maximizes distance from all previously visited psi-states.
+Three planning modes:
+  beam_search(z_start, z_goal)               — goal-directed: terminal latent
+      scoring toward z_goal.
+  novelty_plan(z_start, z_memory)            — curiosity-driven: maximize
+      distance from all visited psi-states.
+  find_subgoal_chain(z_start, z_goal, z_mem) — stepping-stone selection:
+      project z_memory onto the z_start→z_goal axis and pick n_subgoals
+      waypoints evenly spaced along it. Feed each waypoint to beam_search
+      in sequence, switching when cos_dist < switch_threshold.
 
-Both use batched beam expansion: all K beams × 17 actions expanded in a
-single dynamics call per horizon step (no Python loop over actions).
+Both beam methods use batched expansion: all K beams × 17 actions expanded
+in a single dynamics call per horizon step (no Python loop over actions).
 
 Shapes:
   obs:      (3, 64, 64)   float32 or uint8  — single frame, no batch dim
@@ -171,3 +175,62 @@ class LatentPlanner:
             beam_scores = top_vals
 
         return beam_acts[0]
+
+    @torch.no_grad()
+    def find_subgoal_chain(
+        self,
+        z_start: torch.Tensor,   # (E,)
+        z_goal: torch.Tensor,    # (E,)
+        z_memory: torch.Tensor,  # (M, E)
+        n_subgoals: int = 3,
+    ) -> List[torch.Tensor]:
+        """Select n_subgoals stepping-stone latents from z_memory for z_start→z_goal.
+
+        Works in normalized (cosine) space. Projects each memory state onto the
+        z_start→z_goal axis, filters to states strictly between start and goal
+        (5%–95% along the axis), and picks n_subgoals states evenly spaced from
+        near-start to near-goal.
+
+        Returns [z_sg_1, ..., z_sg_n, z_goal] ordered start→goal.
+        Falls back to [z_goal] when z_memory is empty or has no valid candidates.
+
+        Shapes: (E,), (E,), (M, E) → List[Tensor (E,)], len in [1, n_subgoals+1].
+        """
+        if z_memory.numel() == 0:
+            return [z_goal]
+
+        z_s_n = F.normalize(z_start,  dim=-1)   # (E,)
+        z_g_n = F.normalize(z_goal,   dim=-1)   # (E,)
+        z_m_n = F.normalize(z_memory, dim=-1)   # (M, E)
+
+        # Axis from start to goal in cosine space
+        diff      = z_g_n - z_s_n               # (E,)
+        diff_norm = diff.norm().clamp(min=1e-8)
+        direction = diff / diff_norm             # (E,) unit vector
+
+        # Scalar projection of each memory state onto the axis
+        rel         = z_m_n - z_s_n.unsqueeze(0)         # (M, E)
+        scalar_proj = rel @ direction                      # (M,)
+        norm_proj   = scalar_proj / diff_norm              # (M,)  ~[0,1]
+
+        # Only keep states strictly between start and goal
+        valid = (norm_proj > 0.05) & (norm_proj < 0.95)
+        if valid.sum() == 0:
+            return [z_goal]
+
+        # Sort valid candidates by projection (start → goal order)
+        valid_idx   = valid.nonzero(as_tuple=True)[0]     # (V,)
+        proj_order  = norm_proj[valid_idx].argsort()
+        ordered_idx = valid_idx[proj_order]               # (V,) low→high projection
+
+        # Pick n_subgoals evenly spaced across the ordered candidates
+        V = len(ordered_idx)
+        if V <= n_subgoals:
+            selected = ordered_idx
+        else:
+            picks    = torch.linspace(0, V - 1, n_subgoals).long()
+            selected = ordered_idx[picks]
+
+        chain = [z_memory[int(i)] for i in selected]
+        chain.append(z_goal)
+        return chain

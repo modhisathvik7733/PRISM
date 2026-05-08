@@ -1,18 +1,22 @@
 """Reward-free latent planning with the JEPA world model on Crafter.
 
-Two experiments:
+Three experiments:
   goal      — encode a goal observation, beam-search toward it in psi-space
                via receding-horizon replanning (no reward, no PPO gradient)
   curiosity — no goal; score each beam by novelty from visited psi-states,
                pure latent-space exploration
+  chain     — two-phase: (1) curiosity exploration builds z_memory,
+               (2) find_subgoal_chain picks waypoints along the start→goal
+               axis, beam_search chained through each waypoint in order
 
 Usage:
     python -m scripts.crafter.plan_jepa \\
         --jepa-checkpoint runs/crafter_jepa/jepa_final.pt \\
         --ppo-checkpoint  runs/crafter_ppo_jepa/policy_final.pt \\
-        --experiment both \\
+        --experiment chain \\
+        --n-subgoals 3 --explore-steps 300 --plan-steps 300 \\
         --horizon 15 --beam-k 10 --exec-steps 5 \\
-        --trials 5 --seed 42 --device cpu
+        --switch-threshold 0.20 --trials 3 --seed 42 --device cpu
 """
 
 from __future__ import annotations
@@ -263,6 +267,142 @@ def run_curiosity_experiment(
     print(f"\n[curiosity] achievements across all trials: {sorted(all_ach)}")
 
 
+def run_chain_experiment(
+    planner: LatentPlanner,
+    goal_obs: np.ndarray,
+    n_trials: int = 3,
+    n_subgoals: int = 3,
+    explore_steps: int = 300,
+    plan_steps: int = 300,
+    max_memory: int = 500,
+    horizon: int = 15,
+    beam_k: int = 10,
+    exec_steps: int = 5,
+    switch_threshold: float = 0.20,
+    seed: int = 42,
+    device: torch.device = torch.device("cpu"),
+) -> None:
+    """Two-phase subgoal-chaining experiment.
+
+    Phase 1 (explore_steps): curiosity beam search builds z_memory.
+    Phase 2 (plan_steps):    find_subgoal_chain selects waypoints from
+        z_memory along the start→goal axis; beam_search chains through
+        each waypoint, switching when cos_dist < switch_threshold.
+
+    Key diagnostics:
+      chain_dists  — cos_dist of each waypoint to z_goal (quality of chain)
+      dist_to_sg   — distance to current subgoal target
+      dist_to_goal — distance to final z_goal (should trend down vs. direct)
+      sg_idx       — how far along the chain we got
+    """
+    z_goal   = planner.encode_obs(goal_obs)          # (E,)
+    z_goal_n = F.normalize(z_goal, dim=-1)
+    E        = int(z_goal.shape[0])
+
+    print("\n" + "=" * 60)
+    print("EXPERIMENT C: Subgoal chaining (explore → chain plan)")
+    print(f"  n_subgoals={n_subgoals}  explore={explore_steps}  plan={plan_steps}")
+    print(f"  horizon={horizon}  beam_k={beam_k}  exec_steps={exec_steps}"
+          f"  switch_threshold={switch_threshold}")
+    print("=" * 60)
+
+    all_final_dists:   list[float]    = []
+    all_achievements:  list[set[str]] = []
+    all_sg_reached:    list[int]      = []
+
+    for trial in range(n_trials):
+        base_seed = seed + trial * 1_000_003
+        worker    = CrafterEnvWorker(base_seed, worker_id=0, reward_mode="reward")
+        z_memory  = torch.zeros(0, E, device=device)
+        trial_achievements: set[str] = set()
+
+        # ── Phase 1: curiosity exploration ───────────────────────────────────
+        step = 0
+        while step < explore_steps:
+            z_cur   = planner.encode_obs(worker.obs)
+            actions = planner.novelty_plan(z_cur, z_memory, horizon=horizon, beam_k=beam_k)
+            for a in actions[:exec_steps]:
+                if step >= explore_steps:
+                    break
+                obs_visited = worker.obs.copy()
+                _, _, done, info = worker.step(a)
+                step += 1
+                if info:
+                    trial_achievements |= info.get("achievements", set())
+                if len(z_memory) < max_memory:
+                    z_memory = torch.cat(
+                        [z_memory, planner.encode_obs(obs_visited).unsqueeze(0)], dim=0
+                    )
+                if done:
+                    break
+
+        # ── Build subgoal chain from z_memory ────────────────────────────────
+        z_cur   = planner.encode_obs(worker.obs)
+        chain   = planner.find_subgoal_chain(z_cur, z_goal, z_memory, n_subgoals)
+        n_chain = len(chain)  # n_subgoals + 1 (last entry is z_goal)
+
+        chain_dists = []
+        for z_sg in chain:
+            d = 1.0 - float(F.normalize(z_sg, dim=-1) @ z_goal_n)
+            chain_dists.append(d)
+        print(f"\n[trial {trial+1}/{n_trials}] memory={len(z_memory)}"
+              f"  chain_len={n_chain}  chain_dists={[f'{d:.3f}' for d in chain_dists]}")
+
+        # ── Phase 2: chain-guided planning ───────────────────────────────────
+        sg_idx      = 0
+        step        = 0
+        dist_trace: list[tuple[int, float, float]] = []  # (sg_idx, d_sg, d_goal)
+        max_sg_idx  = 0
+
+        while step < plan_steps:
+            z_cur    = planner.encode_obs(worker.obs)
+            z_cur_n  = F.normalize(z_cur, dim=-1)
+            z_target = chain[sg_idx]
+            z_tgt_n  = F.normalize(z_target, dim=-1)
+
+            dist_to_sg   = float(1.0 - z_cur_n @ z_tgt_n)
+            dist_to_goal = float(1.0 - z_cur_n @ z_goal_n)
+            dist_trace.append((sg_idx, dist_to_sg, dist_to_goal))
+
+            # Advance subgoal when close enough (and not already at final goal)
+            if dist_to_sg < switch_threshold and sg_idx < n_chain - 1:
+                sg_idx  += 1
+                z_target = chain[sg_idx]
+                max_sg_idx = max(max_sg_idx, sg_idx)
+
+            actions = planner.beam_search(z_cur, z_target, horizon=horizon, beam_k=beam_k)
+
+            for a in actions[:exec_steps]:
+                if step >= plan_steps:
+                    break
+                _, _, done, info = worker.step(a)
+                step += 1
+                if info:
+                    trial_achievements |= info.get("achievements", set())
+                if done:
+                    break
+
+        z_final_n  = F.normalize(planner.encode_obs(worker.obs), dim=-1)
+        final_dist = float(1.0 - z_final_n @ z_goal_n)
+        all_final_dists.append(final_dist)
+        all_achievements.append(trial_achievements)
+        all_sg_reached.append(max_sg_idx)
+
+        # Print first 8 plan steps of the trace
+        trace_str = "  ".join(
+            f"[sg{r}|sg={ds:.2f}|g={dg:.2f}]"
+            for r, ds, dg in dist_trace[:8]
+        )
+        print(f"         trace=[{trace_str}{'...' if len(dist_trace) > 8 else ''}]")
+        print(f"         final_dist={final_dist:.3f}  max_sg_reached={max_sg_idx}/{n_chain-1}"
+              f"  ach={sorted(trial_achievements)}")
+
+    print(f"\n[chain] mean final_dist={np.mean(all_final_dists):.3f}  "
+          f"mean_sg_reached={np.mean(all_sg_reached):.1f}/{len(chain)-1}")
+    all_ach = set().union(*all_achievements)
+    print(f"[chain] achievements across all trials: {sorted(all_ach)}")
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def parse_args():
@@ -270,15 +410,20 @@ def parse_args():
     p.add_argument("--jepa-checkpoint",     default="runs/crafter_jepa/jepa_final.pt")
     p.add_argument("--ppo-checkpoint",      default="runs/crafter_ppo_jepa/policy_final.pt")
     p.add_argument("--experiment",          default="both",
-                   choices=["goal", "curiosity", "both"])
+                   choices=["goal", "curiosity", "both", "chain"])
     p.add_argument("--trigger-achievement", default="place_table")
     p.add_argument("--horizon",             type=int,   default=15)
     p.add_argument("--beam-k",              type=int,   default=10)
-    p.add_argument("--exec-steps",         type=int,   default=5)
+    p.add_argument("--exec-steps",          type=int,   default=5)
     p.add_argument("--trials",              type=int,   default=5)
     p.add_argument("--max-steps",           type=int,   default=200)
     p.add_argument("--max-memory",          type=int,   default=500)
     p.add_argument("--seed",                type=int,   default=42)
+    # chain-specific
+    p.add_argument("--n-subgoals",          type=int,   default=3)
+    p.add_argument("--explore-steps",       type=int,   default=300)
+    p.add_argument("--plan-steps",          type=int,   default=300)
+    p.add_argument("--switch-threshold",    type=float, default=0.20)
     p.add_argument("--device",
                    default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
@@ -325,6 +470,32 @@ def main() -> int:
             seed=args.seed + 2,
             device=device,
         )
+
+    if args.experiment == "chain":
+        goal_obs = collect_goal_obs(
+            args.jepa_checkpoint,
+            args.ppo_checkpoint,
+            trigger_achievement=args.trigger_achievement,
+            seed=args.seed,
+            device=device,
+        )
+        if goal_obs is None:
+            print("[chain] could not collect goal obs — aborting")
+        else:
+            run_chain_experiment(
+                planner, goal_obs,
+                n_trials=args.trials,
+                n_subgoals=args.n_subgoals,
+                explore_steps=args.explore_steps,
+                plan_steps=args.plan_steps,
+                max_memory=args.max_memory,
+                horizon=args.horizon,
+                beam_k=args.beam_k,
+                exec_steps=args.exec_steps,
+                switch_threshold=args.switch_threshold,
+                seed=args.seed + 3,
+                device=device,
+            )
 
     return 0
 
