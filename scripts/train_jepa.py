@@ -111,15 +111,33 @@ def main() -> int:
              "object-typed information that pure next-state prediction discards. "
              "Try 1.0 as a starting point."
     )
+    parser.add_argument(
+        "--agent-data-path", default=None,
+        help="Optional path to a .npz of goal-directed transitions collected by "
+             "scripts/collect_agent_data.py. If set, each training batch is built "
+             "by mixing random rollouts and agent transitions per --agent-data-mix. "
+             "This is the policy-iteration step — random rollouts under-represent "
+             "trajectories that actually approach targets, so the dynamics model "
+             "is degraded on the transitions the agent needs at inference."
+    )
+    parser.add_argument(
+        "--agent-data-mix", type=float, default=0.5,
+        help="Fraction of each batch drawn from agent data (0.0 = none, 1.0 = "
+             "agent only). Default 0.5 = balanced mix. Ignored if --agent-data-path "
+             "is not set."
+    )
     args = parser.parse_args()
 
     set_global_seed(args.seed)
     device = torch.device(args.device)
 
     aux_tag = f"_aux{args.aux_predicate_weight:g}" if args.aux_predicate_weight > 0 else ""
+    mix_tag = (
+        f"_mix{args.agent_data_mix:g}" if args.agent_data_path is not None else ""
+    )
     run_name = (
         args.run_name
-        or f"jepa_{args.encoder_type}{aux_tag}_{args.env_id}_seed{args.seed}"
+        or f"jepa_{args.encoder_type}{aux_tag}{mix_tag}_{args.env_id}_seed{args.seed}"
     )
     out_dir = Path("runs") / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -150,6 +168,31 @@ def main() -> int:
     loss_window = deque(maxlen=200)
     use_aux = args.aux_predicate_weight > 0.0
 
+    # Optional agent data — pre-collected goal-directed trajectories from
+    # scripts/collect_agent_data.py. We sample a fraction of every batch
+    # from this pool to expose the dynamics model to "approach target"
+    # transitions that random rollouts under-represent.
+    agent_data = None
+    n_agent_per_batch = 0
+    n_random_per_batch = args.batch_size
+    if args.agent_data_path is not None:
+        print(f"[train] loading agent data from {args.agent_data_path}")
+        npz = np.load(args.agent_data_path)
+        agent_data = {
+            "obs_t":         npz["obs_t"].astype(np.float32),
+            "actions":       npz["actions"].astype(np.int64),
+            "obs_tp1":       npz["obs_tp1"].astype(np.float32),
+            "predicates_t":  npz["predicates_t"].astype(np.float32),
+            "predicates_tp1": npz["predicates_tp1"].astype(np.float32),
+        }
+        n_agent_total = agent_data["obs_t"].shape[0]
+        n_agent_per_batch = int(round(args.batch_size * args.agent_data_mix))
+        n_random_per_batch = args.batch_size - n_agent_per_batch
+        print(
+            f"[train] agent data: {n_agent_total} transitions; "
+            f"per batch: {n_random_per_batch} random + {n_agent_per_batch} agent"
+        )
+
     for step in range(args.steps):
         if step % args.collect_every == 0:
             (
@@ -158,16 +201,51 @@ def main() -> int:
                 args.env_id, args.rollout_size, rng, with_predicates=use_aux
             )
 
-        idx = rng.integers(0, args.rollout_size, size=args.batch_size)
-        obs_t = torch.from_numpy(obs_t_buf[idx]).to(device)
-        a_t = torch.from_numpy(act_buf[idx]).to(device)
-        obs_tp1 = torch.from_numpy(obs_tp1_buf[idx]).to(device)
-        preds_t = (
-            torch.from_numpy(pred_t_buf[idx]).to(device) if use_aux else None
-        )
-        preds_tp1 = (
-            torch.from_numpy(pred_tp1_buf[idx]).to(device) if use_aux else None
-        )
+        # ------------------------------------------------ build batch
+        if n_random_per_batch > 0:
+            r_idx = rng.integers(0, args.rollout_size, size=n_random_per_batch)
+            r_obs_t = obs_t_buf[r_idx]
+            r_act = act_buf[r_idx]
+            r_obs_tp1 = obs_tp1_buf[r_idx]
+            r_pred_t = pred_t_buf[r_idx] if use_aux else None
+            r_pred_tp1 = pred_tp1_buf[r_idx] if use_aux else None
+        else:
+            r_obs_t = r_act = r_obs_tp1 = r_pred_t = r_pred_tp1 = None
+
+        if agent_data is not None and n_agent_per_batch > 0:
+            n_agent_total = agent_data["obs_t"].shape[0]
+            a_idx = rng.integers(0, n_agent_total, size=n_agent_per_batch)
+            a_obs_t = agent_data["obs_t"][a_idx]
+            a_act = agent_data["actions"][a_idx]
+            a_obs_tp1 = agent_data["obs_tp1"][a_idx]
+            a_pred_t = agent_data["predicates_t"][a_idx] if use_aux else None
+            a_pred_tp1 = agent_data["predicates_tp1"][a_idx] if use_aux else None
+            obs_t_np = (
+                np.concatenate([r_obs_t, a_obs_t]) if r_obs_t is not None else a_obs_t
+            )
+            act_np = np.concatenate([r_act, a_act]) if r_act is not None else a_act
+            obs_tp1_np = (
+                np.concatenate([r_obs_tp1, a_obs_tp1])
+                if r_obs_tp1 is not None else a_obs_tp1
+            )
+            pred_t_np = (
+                np.concatenate([r_pred_t, a_pred_t])
+                if (use_aux and r_pred_t is not None) else (a_pred_t if use_aux else None)
+            )
+            pred_tp1_np = (
+                np.concatenate([r_pred_tp1, a_pred_tp1])
+                if (use_aux and r_pred_tp1 is not None)
+                else (a_pred_tp1 if use_aux else None)
+            )
+        else:
+            obs_t_np, act_np, obs_tp1_np = r_obs_t, r_act, r_obs_tp1
+            pred_t_np, pred_tp1_np = r_pred_t, r_pred_tp1
+
+        obs_t = torch.from_numpy(obs_t_np).to(device)
+        a_t = torch.from_numpy(act_np).to(device)
+        obs_tp1 = torch.from_numpy(obs_tp1_np).to(device)
+        preds_t = torch.from_numpy(pred_t_np).to(device) if use_aux else None
+        preds_tp1 = torch.from_numpy(pred_tp1_np).to(device) if use_aux else None
 
         out = model.loss(
             obs_t, a_t, obs_tp1,
