@@ -122,6 +122,8 @@ def main() -> int:
     parser.add_argument("--max-steps", type=int, default=64)
     parser.add_argument("--horizon", type=int, default=4)
     parser.add_argument("--n-samples", type=int, default=8)
+    parser.add_argument("--scoring-mode", default="magnitude",
+                        choices=["magnitude", "binary"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -136,8 +138,16 @@ def main() -> int:
     jepa.eval()
     encoder_type = getattr(cfg, "encoder_type", "flat")
     print(f"[cohort] loaded JEPA: encoder={encoder_type}")
-    agent = GroundedAgent(jepa, device, horizon=args.horizon, n_samples=args.n_samples)
-    print(f"[cohort] horizon={args.horizon} n_samples={args.n_samples}")
+    agent = GroundedAgent(
+        jepa, device,
+        horizon=args.horizon,
+        n_samples=args.n_samples,
+        scoring_mode=args.scoring_mode,
+    )
+    print(
+        f"[cohort] horizon={args.horizon} n_samples={args.n_samples} "
+        f"scoring={args.scoring_mode}"
+    )
 
     env = gym.make(args.env_id)
 

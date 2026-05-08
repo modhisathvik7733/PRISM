@@ -143,6 +143,7 @@ class GroundedAgent:
         probe: torch.nn.Module | None = None,
         horizon: int = 4,
         n_samples: int = 8,
+        scoring_mode: str = "magnitude",
     ):
         """Args:
             horizon:    multi-step rollout depth. Each candidate first action
@@ -160,6 +161,9 @@ class GroundedAgent:
         self.device = device
         self.horizon = horizon
         self.n_samples = max(1, n_samples)
+        if scoring_mode not in ("magnitude", "binary"):
+            raise ValueError(f"unknown scoring_mode={scoring_mode!r}")
+        self.scoring_mode = scoring_mode
 
         # Resolve which probe to use.
         if probe is not None:
@@ -240,7 +244,17 @@ class GroundedAgent:
         next_probs_mean = next_probs.view(nA, nS, -1).mean(dim=1)      # (nA, 96)
 
         # Advantage: per-action improvement over baseline, averaged across samples.
-        improvement = next_probs_mean - baseline_probs.unsqueeze(0)
+        # `magnitude` uses raw probability difference — vulnerable to noise on
+        # low-base-rate predicates (adjacent positive_rate=0.007 means a 0.4
+        # turn-noise prediction × weight 8 = +3.2 fake score, which dominates
+        # forward's truthful +0). `binary` thresholds both predictions at 0.5
+        # and scores only predicate FLIPS, which silences the noise floor.
+        if self.scoring_mode == "binary":
+            next_bin = (next_probs_mean > 0.5).float()
+            base_bin = (baseline_probs > 0.5).float().unsqueeze(0)
+            improvement = next_bin - base_bin
+        else:
+            improvement = next_probs_mean - baseline_probs.unsqueeze(0)
         scores = torch.zeros(nA, device=self.device)
         for g in goal_preds:
             scores = scores + g.weight * improvement[:, g.flat_index]

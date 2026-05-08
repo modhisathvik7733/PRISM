@@ -156,6 +156,13 @@ def main() -> int:
     parser.add_argument("--n-samples", type=int, default=8,
                         help="random follow-up samples per first action (variance "
                              "reduction). 8 keeps single-step latency negligible.")
+    parser.add_argument("--scoring-mode", default="magnitude",
+                        choices=["magnitude", "binary"],
+                        help="magnitude (default) = raw prob diff. binary = score "
+                             "predicate FLIPS only (>0.5 threshold). Binary silences "
+                             "noise-floor amplification on rare predicates "
+                             "(adjacent base rate 0.7%) where weight 8 × turn-noise "
+                             "0.4 = +3.2 fake advantage.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--verbose", action="store_true",
@@ -190,10 +197,11 @@ def main() -> int:
         probe=external_probe,
         horizon=args.horizon,
         n_samples=args.n_samples,
+        scoring_mode=args.scoring_mode,
     )
     print(
         f"[agent] horizon={args.horizon} n_samples={args.n_samples} "
-        f"n_actions={agent.n_actions}"
+        f"scoring={args.scoring_mode} n_actions={agent.n_actions}"
     )
 
     # ------------------------------------------------------ env + run
