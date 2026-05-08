@@ -179,6 +179,8 @@ def main() -> int:
         print(f"[cohort] loaded recurrent policy from {args.policy_checkpoint}")
 
     env = gym.make(args.env_id)
+    from prism.envs.babyai import set_max_steps
+    set_max_steps(env, args.max_steps)
 
     # Aggregate per cohort
     by_cohort: dict[str, list[dict]] = defaultdict(list)

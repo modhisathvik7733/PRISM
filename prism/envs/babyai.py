@@ -86,6 +86,7 @@ def make_babyai_env(
     seed: int | None = None,
     include_mission: bool = True,
     render_mode: str | None = None,
+    max_steps: int | None = None,
 ) -> gym.Env:
     """Create a BabyAI env with PRISM's standard wrappers.
 
@@ -96,8 +97,27 @@ def make_babyai_env(
         include_mission: keep the mission string in obs (needed Phase 2+).
                          Set False for the SB3 image-only PPO baseline.
         render_mode: e.g. "rgb_array" for video logging.
+        max_steps: override the env's internal max-step budget. Default (None)
+                   leaves the level's built-in cap (64 for GoToLocal). A larger
+                   value gives the agent more time to solve hard spawns AND
+                   raises per-episode reward via BabyAI's
+                   `1 − 0.9 × (steps/max_steps)` formula (same step count
+                   becomes a smaller fraction of a longer budget). We apply
+                   the override on `env.unwrapped.max_steps` after gym.make
+                   AND on the spec's max_episode_steps so the gymnasium
+                   TimeLimit wrapper picks it up.
     """
     env = gym.make(env_id, render_mode=render_mode)
+    if max_steps is not None:
+        # MiniGrid stores its own truncation counter on the unwrapped env,
+        # gymnasium adds a TimeLimit wrapper that reads spec.max_episode_steps.
+        # Set both so neither truncates earlier than the other.
+        try:
+            env.unwrapped.max_steps = max_steps
+        except AttributeError:
+            pass
+        if env.spec is not None:
+            env.spec.max_episode_steps = max_steps
     if include_mission:
         env = PrismImageObsWrapper(env)
     else:
@@ -105,3 +125,15 @@ def make_babyai_env(
     if seed is not None:
         env.reset(seed=seed)
     return env
+
+
+def set_max_steps(env: gym.Env, max_steps: int) -> None:
+    """Override max_steps on an already-constructed env (for cases where the
+    caller used `gym.make(...)` directly instead of `make_babyai_env`).
+    """
+    try:
+        env.unwrapped.max_steps = max_steps
+    except AttributeError:
+        pass
+    if getattr(env, "spec", None) is not None:
+        env.spec.max_episode_steps = max_steps

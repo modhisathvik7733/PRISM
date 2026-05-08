@@ -240,6 +240,11 @@ def main() -> int:
 
     # ------------------------------------------------------ env + run
     env = gym.make(args.env_id)
+    # Override env's internal step cap so agents can use the longer budget.
+    # BabyAI's reward = 1 - 0.9*(steps/max_steps), so a larger max_steps also
+    # raises per-episode reward for the same step count.
+    from prism.envs.babyai import set_max_steps
+    set_max_steps(env, args.max_steps)
     rewards = []
     parsed_count = 0
     successes = 0  # episodes with reward > 0
