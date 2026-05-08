@@ -173,7 +173,10 @@ def main() -> int:
                 with_predicates=use_aux, augmented=use_distance,
             )
 
-        idx = rng.integers(0, args.rollout_size, size=args.batch_size)
+        # Sample against the actual buffer size — `collect_random_transitions_multi`
+        # returns n_per_env * len(envs) which can be < args.rollout_size due to
+        # integer division (e.g. 10000 // 3 = 3333 → 9999 total).
+        idx = rng.integers(0, obs_t_buf.shape[0], size=args.batch_size)
         obs_t = torch.from_numpy(obs_t_buf[idx]).to(device)
         a_t = torch.from_numpy(act_buf[idx]).to(device)
         obs_tp1 = torch.from_numpy(obs_tp1_buf[idx]).to(device)
