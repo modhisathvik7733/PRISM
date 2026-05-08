@@ -150,13 +150,19 @@ def _gen_synthetic_t1(split: str) -> list[tuple[str, str, str]]:
 
     Synthetic with the same vocab is operationally equivalent for testing
     the architecture's reasoning capacity. Distinct seeds for train/test
-    so they don't leak. Counts match the canonical 1k/1k split.
+    so they don't leak.
+
+    Sized to the real bAbI 10k variant (10k train / 1k test). The 1k
+    variant is too small for a 24M-param model — the model memorizes
+    train at ce=0 by step ~2000 and test acc stalls at 40-50%. With 10k
+    train the same model generalizes properly because no individual
+    (story, question) pattern can be memorized to convergence.
     """
     rng = random.Random({"train": 0, "test": 1}[split])
-    n = {"train": 1000, "test": 1000}[split]
-    # The same closed vocab the real Task 1 uses (8 locations, 4 people).
+    n = {"train": 10000, "test": 1000}[split]
+    # Same closed vocab the real Task 1 uses (8 locations, 4 people).
     LOCATIONS = ("bathroom", "kitchen", "bedroom", "garden",
-                 "hallway", "office", "kitchen", "park")
+                 "hallway", "office", "park", "school")
     PEOPLE = ("Mary", "John", "Daniel", "Sandra")
     VERBS = ("moved to", "went to", "travelled to", "journeyed to")
     examples: list[tuple[str, str, str]] = []

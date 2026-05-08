@@ -94,9 +94,19 @@ class LatentMiddle(nn.Module):
         aux_loss is 0.0 when JEPA aux is disabled."""
         B = ctx.shape[0]
         # Mix learned thought-init with a content-conditioned bias from
-        # the encoder. Use mean-pool over non-PAD positions if available,
-        # else simple mean.
-        ctx_pool = ctx.mean(dim=1, keepdim=True)            # (B, 1, D)
+        # the encoder. Mask-aware mean-pool: PAD positions contribute 0,
+        # divisor uses only non-PAD count. Without this, padded inputs
+        # (most of the batch in fixed-length-padded loaders) get a
+        # diluted "context summary" that drowns the real signal.
+        if cross_mask is not None:
+            # cross_mask is (B, 1, 1, T) with -inf at PAD, 0 elsewhere.
+            # not_pad: (B, T, 1) float.
+            not_pad = (cross_mask.squeeze(1).squeeze(1) == 0).float().unsqueeze(-1)
+            ctx_sum = (ctx * not_pad).sum(dim=1, keepdim=True)
+            ctx_count = not_pad.sum(dim=1, keepdim=True).clamp(min=1.0)
+            ctx_pool = ctx_sum / ctx_count
+        else:
+            ctx_pool = ctx.mean(dim=1, keepdim=True)
         thoughts = self.thought_init.expand(B, -1, -1) + self.ctx_to_thought(ctx_pool)
 
         aux_loss = ctx.new_zeros(())
