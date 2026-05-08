@@ -50,8 +50,17 @@ def main() -> int:
     parser.add_argument("--reward-threshold", type=float, default=0.55,
                         help="only save episodes with reward >= this value")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed-stride", type=int, default=7919,
+                        help="per-episode seed = seed + ep * seed_stride. "
+                             "Use a value coprime to the eval seeds' stride to "
+                             "avoid leak when you eval at the same base seed.")
+    parser.add_argument("--exclude-seeds", default="",
+                        help="comma-separated list of seeds to exclude from the "
+                             "training data. Set to '0,100,200' to keep eval "
+                             "seeds held out from the BC distribution.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+    excluded = set(int(s) for s in args.exclude_seeds.split(",") if s.strip())
 
     set_global_seed(args.seed)
     device = torch.device(args.device)
@@ -74,12 +83,20 @@ def main() -> int:
     ep_rewards = []
 
     n_kept = 0
-    for ep in range(args.episodes):
-        obs, _ = env.reset(seed=args.seed + ep * 7919)
+    ep_seed = args.seed
+    ep = 0
+    n_attempted = 0
+    while ep < args.episodes:
+        ep_seed = args.seed + n_attempted * args.seed_stride
+        n_attempted += 1
+        if ep_seed in excluded:
+            continue
+        obs, _ = env.reset(seed=ep_seed)
         agent.reset()
         mission = obs["mission"]
         parsed = goal_predicates_for_mission(mission)
         if parsed is None:
+            ep += 1
             continue
         goal_preds, spec = parsed
         allowed = allowed_actions_for_spec(spec, env.action_space.n)
@@ -113,10 +130,11 @@ def main() -> int:
             ep_rewards.append(ep_reward)
             n_kept += 1
 
-        if (ep + 1) % 50 == 0:
+        ep += 1
+        if ep % 50 == 0:
             mean_r_recent = float(np.mean(ep_rewards[-50:])) if ep_rewards else 0.0
-            print(f"[bc {ep+1:4d}/{args.episodes}] kept={n_kept}  "
-                  f"recent_mean_R={mean_r_recent:.3f}")
+            print(f"[bc {ep:4d}/{args.episodes}] attempted={n_attempted} "
+                  f"kept={n_kept}  recent_mean_R={mean_r_recent:.3f}")
 
     # Pad to T_max so we get a single tensor
     if n_kept == 0:
