@@ -114,9 +114,10 @@ class CrafterJepaWorldModel(nn.Module):
         z_t = self.online_encoder(obs_t)             # (B, E)
         z_pred = self.dynamics(z_t, action_t)        # (B, E)
         with torch.no_grad():
-            z_target = self.target_encoder(obs_tp1)  # (B, E)  stop-grad
+            z_target = self.target_encoder(obs_tp1)
+            z_target_n = F.normalize(z_target, dim=-1)  # (B, E) unit-norm, bounds MSE to [0,4]
 
-        l_pred = F.mse_loss(z_pred, z_target)          # (scalar)
+        l_pred = F.mse_loss(z_pred, z_target_n)        # (scalar) bounded regardless of encoder scale
 
         # VICReg variance floor on unnormalized z_t.
         # relu(1 - std) == 0 when std >= 1, so no overshoot penalty.
