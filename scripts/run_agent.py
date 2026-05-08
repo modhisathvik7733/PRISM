@@ -239,12 +239,12 @@ def main() -> int:
         print(f"[agent] loaded recurrent policy from {args.policy_checkpoint}")
 
     # ------------------------------------------------------ env + run
-    env = gym.make(args.env_id)
-    # Override env's internal step cap so agents can use the longer budget.
-    # BabyAI's reward = 1 - 0.9*(steps/max_steps), so a larger max_steps also
-    # raises per-episode reward for the same step count.
-    from prism.envs.babyai import set_max_steps
-    set_max_steps(env, args.max_steps)
+    # Use the documented gymnasium API (max_episode_steps kwarg to gym.make)
+    # plus the post-construction patch, and print the effective caps for
+    # verification. Larger max_steps both gives more time AND raises per-
+    # episode reward via BabyAI's `1 - 0.9*(steps/max_steps)` formula.
+    from prism.envs.babyai import make_env_with_max_steps
+    env = make_env_with_max_steps(args.env_id, args.max_steps)
     rewards = []
     parsed_count = 0
     successes = 0  # episodes with reward > 0

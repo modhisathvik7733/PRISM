@@ -55,7 +55,10 @@ class _MinigridNoiseFilter:
 
 
 def install_minigrid_noise_filter() -> None:
-    """Wrap sys.stdout to drop minigrid's 'Sampling rejected' lines.
-    Idempotent — calling twice is a no-op."""
+    """Wrap BOTH sys.stdout and sys.stderr to drop minigrid's
+    'Sampling rejected' lines. Some minigrid versions print to stderr
+    (depending on level class), so we cover both. Idempotent."""
     if not isinstance(sys.stdout, _MinigridNoiseFilter):
         sys.stdout = _MinigridNoiseFilter(sys.stdout)
+    if not isinstance(sys.stderr, _MinigridNoiseFilter):
+        sys.stderr = _MinigridNoiseFilter(sys.stderr)

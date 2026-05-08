@@ -48,7 +48,7 @@ import torch.nn.functional as F
 
 from prism.agents import goal_predicates_for_mission
 from prism.agents.grounded_agent import allowed_actions_for_spec
-from prism.envs.babyai import _encode_image, set_max_steps
+from prism.envs.babyai import _encode_image, make_env_with_max_steps, set_max_steps  # noqa: F401
 from prism.models.jepa import JepaConfig, JepaWorldModel, upgrade_config
 from prism.models.recurrent_policy import RecurrentPolicy
 from prism.perception import compute_distances, extract_slots
@@ -93,8 +93,13 @@ class EnvWorker:
     def __init__(self, env_id: str, base_seed: int, worker_id: int,
                  mission_dim: int, n_actions: int,
                  max_steps: int = 64, shaping_coef: float = 0.0):
-        self.env = gym.make(env_id)
-        if max_steps != 64:
+        # Pass max_episode_steps to gym.make AND apply set_max_steps post-
+        # construction for belt-and-suspenders coverage. Print the diagnostic
+        # only on the first worker so we don't spam 16 lines.
+        if worker_id == 0:
+            self.env = make_env_with_max_steps(env_id, max_steps)
+        else:
+            self.env = gym.make(env_id, max_episode_steps=max_steps)
             set_max_steps(self.env, max_steps)
         self.base_seed = base_seed
         self.worker_id = worker_id

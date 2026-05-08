@@ -137,24 +137,24 @@ def make_babyai_env(
 def set_max_steps(env: gym.Env, max_steps: int) -> None:
     """Override max_steps on an already-constructed env.
 
-    There are TWO layers that can truncate episodes:
-      1. MiniGrid's internal `step_count >= max_steps` check on the
-         unwrapped env. We update `env.unwrapped.max_steps`.
-      2. gymnasium's `TimeLimit` wrapper which stores `_max_episode_steps`
-         at construction time (read once from `spec.max_episode_steps`).
-         Mutating `spec` after construction does NOT update the wrapper's
-         private field. We walk the wrapper chain and patch any
-         `_max_episode_steps` we find.
+    Three layers can truncate episodes:
+      1. MiniGrid's internal `step_count >= max_steps` on the unwrapped env.
+         We update `env.unwrapped.max_steps`.
+      2. gymnasium's `TimeLimit` wrapper holds `_max_episode_steps` set at
+         construction. We walk the wrapper chain and patch any wrapper
+         that exposes that attribute.
+      3. The level-class itself may also override max_steps in its `_gen_grid`
+         method or `__init__`. The post-construction mutation handles 1 and 2.
 
-    Without (2), the env still truncates at the original cap (64 steps for
-    BabyAI-GoToLocal-v0) regardless of (1) — the symptom we observed:
-    eval reports identical episode trajectories at 64-step truncation.
+    For *new* env construction, callers should also pass
+    `gym.make(env_id, max_episode_steps=N)` — that's the documented gymnasium
+    API and the most reliable way to set the cap. This helper is a
+    best-effort retrofit for envs already constructed.
     """
     try:
         env.unwrapped.max_steps = max_steps
     except AttributeError:
         pass
-    # Walk wrapper chain — gymnasium wrappers expose .env to their inner.
     e = env
     seen_ids = set()
     while e is not None and id(e) not in seen_ids:
@@ -164,7 +164,6 @@ def set_max_steps(env: gym.Env, max_steps: int) -> None:
                 e._max_episode_steps = max_steps
             except AttributeError:
                 pass
-        # Also update any per-wrapper spec (some wrappers expose their own).
         spec = getattr(e, "spec", None)
         if spec is not None:
             try:
@@ -172,3 +171,21 @@ def set_max_steps(env: gym.Env, max_steps: int) -> None:
             except AttributeError:
                 pass
         e = getattr(e, "env", None)
+
+
+def make_env_with_max_steps(env_id: str, max_steps: int) -> gym.Env:
+    """Construct a BabyAI env with the requested max_steps using gymnasium's
+    documented `max_episode_steps` kwarg AND the post-construction patch as
+    belt-and-suspenders. Use this in scripts that need raw dict obs (run_agent,
+    eval_agent_cohorts, ppo_train) — make_babyai_env is for image-only flows.
+
+    Prints a diagnostic line so it's obvious in logs whether the override
+    actually took effect."""
+    env = gym.make(env_id, max_episode_steps=max_steps)
+    set_max_steps(env, max_steps)
+    # Diagnostic — print the effective caps so the operator can verify.
+    unwrapped_cap = getattr(env.unwrapped, "max_steps", "?")
+    spec_cap = getattr(env.spec, "max_episode_steps", "?") if env.spec else "?"
+    print(f"[env] {env_id}: unwrapped.max_steps={unwrapped_cap} "
+          f"spec.max_episode_steps={spec_cap}")
+    return env
