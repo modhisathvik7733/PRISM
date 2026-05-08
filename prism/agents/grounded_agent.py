@@ -221,6 +221,9 @@ class GroundedAgent:
         self._rec_hidden: torch.Tensor | None = None
         self._rec_prev_action: int = -1
         self._rec_mission: torch.Tensor | None = None
+        # Path B — optional pose tracker; only built when the attached policy
+        # has mem_feat_dim > 0.
+        self._rec_pose_tracker = None
 
     def reset(self) -> None:
         """Call at the start of each episode so curriculum-mode exploration
@@ -240,6 +243,9 @@ class GroundedAgent:
         self._rec_hidden = None
         self._rec_prev_action = -1
         self._rec_mission = None
+        # The PoseTracker (if any) gets re-initialized inside
+        # attach_recurrent_policy() once the goal pair is known.
+        self._rec_pose_tracker = None
 
     @torch.no_grad()
     def _curriculum_select(
@@ -628,27 +634,52 @@ class GroundedAgent:
             return TURN_RIGHT
         return allowed[0]
 
-    def attach_recurrent_policy(self, policy: torch.nn.Module, mission: torch.Tensor) -> None:
+    def attach_recurrent_policy(
+        self,
+        policy: torch.nn.Module,
+        mission: torch.Tensor,
+        *,
+        goal_type: int | None = None,
+        goal_color: int | None = None,
+    ) -> None:
         """Attach a trained RecurrentPolicy and the mission one-hot for the
         current episode. The mission is a (mission_dim,) tensor; we add a
         batch dim internally. Must be called after agent.reset() and before
-        the first select_action call when scoring_mode='recurrent'."""
+        the first select_action call when scoring_mode='recurrent'.
+
+        When the policy was trained with mem_feat_dim > 0 (Path B), pass
+        goal_type/goal_color so a PoseTracker is created and 5-d memory
+        features are fed alongside the latent at every step.
+        """
         self._rec_policy = policy.to(self.device).eval()
         self._rec_mission = mission.to(self.device).unsqueeze(0).float()
         self._rec_hidden = None
         self._rec_prev_action = -1
+        # Path B — only run pose tracking if the policy actually consumes it
+        # (mem_proj exists). Avoids wasted slot extraction for legacy ckpts.
+        mem_dim = int(getattr(policy, "mem_feat_dim", 0) or 0)
+        if mem_dim > 0:
+            from prism.agents.pose_tracker import PoseTracker
+            self._rec_pose_tracker = PoseTracker()
+            self._rec_pose_tracker.reset(goal_type, goal_color)
+        else:
+            self._rec_pose_tracker = None
 
     @torch.no_grad()
     def _recurrent_select(
         self,
         z_t: torch.Tensor,
         allowed_actions: tuple[int, ...] | None,
+        obs: torch.Tensor | None = None,
     ) -> tuple[int, dict[str, float]]:
         """One step of the trained recurrent policy.
 
         Maintains h_t and prev_action across calls. Mission is fixed per
         episode (set via attach_recurrent_policy). The frozen JEPA encoder
-        already produced z_t — we just feed it through the GRU + head.
+        already produced z_t — we just feed it through the GRU + head. When a
+        PoseTracker is attached (Path B), `obs` must be the normalized (3,7,7)
+        view so the tracker can update pose / goal cache before features are
+        read.
         """
         if self._rec_policy is None or self._rec_mission is None:
             raise RuntimeError(
@@ -658,8 +689,14 @@ class GroundedAgent:
         if self._rec_hidden is None:
             self._rec_hidden = self._rec_policy.init_hidden(1, self.device)
         prev_a = torch.tensor([self._rec_prev_action], device=self.device, dtype=torch.long)
+        mem_feat = None
+        if self._rec_pose_tracker is not None and obs is not None:
+            obs_np = obs.detach().cpu().numpy()
+            self._rec_pose_tracker.observe(obs_np)
+            mem_np = self._rec_pose_tracker.features()
+            mem_feat = torch.from_numpy(mem_np).unsqueeze(0).to(self.device)
         logits, h_next = self._rec_policy.step(
-            z_t, prev_a, self._rec_mission, self._rec_hidden
+            z_t, prev_a, self._rec_mission, self._rec_hidden, mem_feat=mem_feat
         )
         if allowed_actions is not None:
             mask = torch.full_like(logits, float("-inf"))
@@ -667,6 +704,8 @@ class GroundedAgent:
                 mask[0, a] = 0.0
             logits = logits + mask
         action = int(logits.argmax(dim=-1).item())
+        if self._rec_pose_tracker is not None:
+            self._rec_pose_tracker.commit(action)
         self._rec_hidden = h_next.detach()
         self._rec_prev_action = action
         info = {"chosen": action, "branch": "recurrent", "explored": 0.0, "max_score": 0.0}
@@ -727,7 +766,7 @@ class GroundedAgent:
         if self.scoring_mode == "memory":
             return self._memory_select(obs, z_t, baseline_probs, goal_preds, allowed_actions)
         if self.scoring_mode == "recurrent":
-            return self._recurrent_select(z_t, allowed_actions)
+            return self._recurrent_select(z_t, allowed_actions, obs=obs)
         # ----------------------------------------------------------------------
 
         # Multi-sample rollouts: for each candidate first action, simulate

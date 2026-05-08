@@ -48,6 +48,7 @@ import torch.nn.functional as F
 
 from prism.agents import goal_predicates_for_mission
 from prism.agents.grounded_agent import allowed_actions_for_spec
+from prism.agents.pose_tracker import MEM_FEAT_DIM, PoseTracker
 from prism.envs.babyai import _encode_image, make_env_with_max_steps, set_max_steps  # noqa: F401
 from prism.models.jepa import JepaConfig, JepaWorldModel, upgrade_config
 from prism.models.recurrent_policy import RecurrentPolicy
@@ -92,7 +93,8 @@ class EnvWorker:
 
     def __init__(self, env_id: str, base_seed: int, worker_id: int,
                  mission_dim: int, n_actions: int,
-                 max_steps: int = 64, shaping_coef: float = 0.0):
+                 max_steps: int = 64, shaping_coef: float = 0.0,
+                 use_pose_tracker: bool = False):
         # Pass max_episode_steps to gym.make AND apply set_max_steps post-
         # construction for belt-and-suspenders coverage. Print the diagnostic
         # only on the first worker so we don't spam 16 lines.
@@ -111,6 +113,12 @@ class EnvWorker:
         # The encoded version stored in self.obs_encoded is for the policy.
         self.raw_image = None
         self.prev_goal_dist = 1.0
+        # Path B — per-worker pose tracker. Disabled when use_pose_tracker=False
+        # so legacy runs without --mem-feat-dim behave bit-for-bit identically.
+        self.pose_tracker: PoseTracker | None = PoseTracker() if use_pose_tracker else None
+        self.mem_feat = (
+            np.zeros(MEM_FEAT_DIM, dtype=np.float32) if use_pose_tracker else None
+        )
         self._reset_episode()
 
     def _reset_episode(self):
@@ -144,12 +152,23 @@ class EnvWorker:
         self.prev_action = -1
         # h_prev is owned by the trainer and reset externally on done; we
         # don't carry it on the worker.
+        if self.pose_tracker is not None:
+            gt = self.goal_pair[0] if self.goal_pair is not None else None
+            gc = self.goal_pair[1] if self.goal_pair is not None else None
+            self.pose_tracker.reset(gt, gc)
+            self.pose_tracker.observe(self.obs_encoded)
+            self.mem_feat = self.pose_tracker.features()
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, dict]:
         # Force action into allowed set (defensive — the masked sample
         # should already respect this).
         if action not in self.allowed:
             action = self.allowed[0]
+        # Commit the action to the tracker BEFORE env.step so a turn rotates
+        # facing while observe() — fired below on next_obs — reconciles a
+        # forward by comparing pre/post obs and updating pose if it moved.
+        if self.pose_tracker is not None:
+            self.pose_tracker.commit(action)
         next_obs, env_reward, term, trunc, info = self.env.step(action)
         done = bool(term or trunc)
 
@@ -184,6 +203,9 @@ class EnvWorker:
         else:
             self.raw_image = next_obs["image"]
             self.obs_encoded = _encode_image(next_obs["image"])
+            if self.pose_tracker is not None:
+                self.pose_tracker.observe(self.obs_encoded)
+                self.mem_feat = self.pose_tracker.features()
             return self.obs_encoded, total_reward, False, {}
 
 
@@ -257,6 +279,14 @@ def main() -> int:
                              "dist is normalized manhattan to closest goal slot, "
                              "1.0 if goal not in view. Potential-based per Ng 1999, "
                              "preserves optimal policy.")
+    parser.add_argument("--mem-feat-dim", type=int, default=0,
+                        help="Path B: 0 disables, 5 enables explicit memory "
+                             "features (n_visited, n_blocked, goal_seen, "
+                             "goal_fwd, goal_right) projected as a zero-init "
+                             "residual into the policy/value head input. "
+                             "Loading an old checkpoint with strict=False "
+                             "leaves mem_proj at zero so initial behavior is "
+                             "identical to the base policy.")
     parser.add_argument("--seed", type=int, default=2_000_000,
                         help="training seed; large to avoid eval-seed overlap")
     parser.add_argument("--run-name", default="ppo_v1")
@@ -282,12 +312,19 @@ def main() -> int:
 
     # ---------- recurrent policy ----------
     bc = torch.load(args.bc_checkpoint, map_location=device, weights_only=False)
+    # mem_feat_dim is a CLI knob: when starting from an old checkpoint that
+    # didn't have a residual, mem_proj is added and zero-init so the loaded
+    # weights produce identical step-0 behavior. The checkpoint's own
+    # mem_feat_dim (if present) only sets the floor — CLI can override to
+    # match a new tracker layout.
+    mem_feat_dim = max(int(args.mem_feat_dim), int(bc.get("mem_feat_dim", 0) or 0))
     policy = RecurrentPolicy(
         latent_in_dim=bc["latent_in_dim"],
         n_actions=bc["n_actions"],
         mission_dim=bc["mission_dim"],
         hidden_dim=bc["hidden_dim"],
         latent_proj_dim=bc["latent_proj_dim"],
+        mem_feat_dim=mem_feat_dim,
     ).to(device)
     # strict=False so the value_head (newly added) loads with random init.
     missing, unexpected = policy.load_state_dict(bc["policy_state_dict"], strict=False)
@@ -296,6 +333,8 @@ def main() -> int:
         raise SystemExit("BC policy / JEPA latent_dim mismatch")
     n_params = sum(p.numel() for p in policy.parameters())
     print(f"[ppo] policy params: {n_params:,}  (value head random-init)")
+    print(f"[ppo] mem_feat_dim={mem_feat_dim}  "
+          f"(mem_proj {'enabled (zero-init)' if mem_feat_dim > 0 else 'disabled'})")
 
     opt = torch.optim.AdamW(policy.parameters(), lr=args.lr, weight_decay=1e-4)
 
@@ -304,14 +343,22 @@ def main() -> int:
     print(f"[ppo] writing to {out_dir}")
 
     # ---------- vectorized envs (sync) ----------
+    use_pose_tracker = mem_feat_dim > 0
+    if use_pose_tracker and mem_feat_dim != MEM_FEAT_DIM:
+        raise SystemExit(
+            f"--mem-feat-dim must be {MEM_FEAT_DIM} (PoseTracker layout) "
+            f"or 0 (disabled); got {mem_feat_dim}"
+        )
     workers = [
         EnvWorker(
             args.env_id, args.seed, i, mission_dim, n_actions,
             max_steps=args.max_steps, shaping_coef=args.shaping_coef,
+            use_pose_tracker=use_pose_tracker,
         )
         for i in range(args.n_envs)
     ]
-    print(f"[ppo] env: max_steps={args.max_steps} shaping_coef={args.shaping_coef}")
+    print(f"[ppo] env: max_steps={args.max_steps} shaping_coef={args.shaping_coef} "
+          f"pose_tracker={use_pose_tracker}")
 
     # ---------- training loop ----------
     n_iterations = args.total_steps // (args.rollout_steps * args.n_envs)
@@ -339,6 +386,10 @@ def main() -> int:
         buf_prev_actions = torch.zeros(T, B, dtype=torch.long, device=device)
         buf_missions = torch.zeros(T, B, mission_dim, device=device)
         buf_action_mask = torch.zeros(T, B, n_actions, device=device)
+        buf_mem = (
+            torch.zeros(T, B, mem_feat_dim, device=device)
+            if use_pose_tracker else None
+        )
 
         with torch.no_grad():
             for t in range(T):
@@ -357,7 +408,15 @@ def main() -> int:
                 buf_prev_actions[t] = prev_actions
                 buf_missions[t] = missions
                 buf_action_mask[t] = mask
-                logits, value, h_next = policy.step_with_value(z, prev_actions, missions, h)
+                if use_pose_tracker:
+                    mem_np = np.stack([w.mem_feat for w in workers], axis=0)
+                    mem_batch = torch.from_numpy(mem_np).float().to(device)
+                    buf_mem[t] = mem_batch
+                else:
+                    mem_batch = None
+                logits, value, h_next = policy.step_with_value(
+                    z, prev_actions, missions, h, mem_feat=mem_batch
+                )
                 masked = logits + mask
                 dist = torch.distributions.Categorical(logits=masked)
                 action = dist.sample()
@@ -392,7 +451,14 @@ def main() -> int:
             missions_np = np.stack([w.mission_oh for w in workers])
             missions = torch.from_numpy(missions_np).float().to(device)
             z = jepa.encode(obs_batch)
-            _, last_value, _ = policy.step_with_value(z, prev_actions, missions, h)
+            if use_pose_tracker:
+                mem_np = np.stack([w.mem_feat for w in workers], axis=0)
+                mem_last = torch.from_numpy(mem_np).float().to(device)
+            else:
+                mem_last = None
+            _, last_value, _ = policy.step_with_value(
+                z, prev_actions, missions, h, mem_feat=mem_last
+            )
 
         total_env_steps += T * B
 
@@ -437,6 +503,7 @@ def main() -> int:
                 mb_returns = returns[:, mb_envs_t]                  # (T, mb)
                 mb_adv = advantages_norm[:, mb_envs_t]              # (T, mb)
                 mb_dones = buf_dones[:, mb_envs_t]                  # (T, mb)
+                mb_mem = buf_mem[:, mb_envs_t] if buf_mem is not None else None
 
                 # We need to handle within-rollout episode boundaries: when
                 # done at step t, reset hidden for env at step t+1. Use
@@ -451,8 +518,9 @@ def main() -> int:
                 logits_seq = []
                 values_seq = []
                 for t in range(T):
+                    mem_t = mb_mem[t] if mb_mem is not None else None
                     logits_t, value_t, h_run = policy.step_with_value(
-                        mb_z[t], mb_prev[t], mb_missions[t], h_run
+                        mb_z[t], mb_prev[t], mb_missions[t], h_run, mem_feat=mem_t
                     )
                     logits_t = logits_t + mb_mask[t]
                     logits_seq.append(logits_t)
@@ -511,6 +579,7 @@ def main() -> int:
                 "mission_dim": bc["mission_dim"],
                 "hidden_dim": bc["hidden_dim"],
                 "latent_proj_dim": bc["latent_proj_dim"],
+                "mem_feat_dim": mem_feat_dim,
                 "jepa_checkpoint": args.jepa_checkpoint,
                 "bc_checkpoint": args.bc_checkpoint,
                 "iteration": it + 1,
@@ -528,6 +597,7 @@ def main() -> int:
         "mission_dim": bc["mission_dim"],
         "hidden_dim": bc["hidden_dim"],
         "latent_proj_dim": bc["latent_proj_dim"],
+        "mem_feat_dim": mem_feat_dim,
         "jepa_checkpoint": args.jepa_checkpoint,
         "bc_checkpoint": args.bc_checkpoint,
         "env_steps": total_env_steps,

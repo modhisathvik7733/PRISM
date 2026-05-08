@@ -30,10 +30,12 @@ class RecurrentPolicy(nn.Module):
         action_emb_dim: int = 16,
         hidden_dim: int = 256,
         latent_proj_dim: int = 128,
+        mem_feat_dim: int = 0,
     ):
         super().__init__()
         self.n_actions = n_actions
         self.hidden_dim = hidden_dim
+        self.mem_feat_dim = mem_feat_dim
         # Latent projection — flatten any spatial structure and reduce dim.
         self.latent_proj = nn.Sequential(
             nn.Flatten(),
@@ -57,9 +59,30 @@ class RecurrentPolicy(nn.Module):
         # exactly what we want for PPO fine-tune from BC: critic is learned
         # fresh while policy is fine-tuned from BC.
         self.value_head = nn.Linear(hidden_dim, 1)
+        # Path B — explicit memory features projected as a residual onto the
+        # GRU output. Zero-initialized so a checkpoint loaded with strict=False
+        # behaves identically to the base policy at step 0 of fine-tuning;
+        # PPO then learns to use the (n_visited, n_blocked, goal_seen,
+        # goal_fwd, goal_right) signal to escape the adjacent/near cohort
+        # plateau the GRU couldn't crack on its own. We add the residual to
+        # h_next *only for the heads* — the next-step hidden remains the pure
+        # GRU output so the recurrence stays unaffected by feature spikes.
+        if mem_feat_dim > 0:
+            self.mem_proj = nn.Linear(mem_feat_dim, hidden_dim)
+            nn.init.zeros_(self.mem_proj.weight)
+            nn.init.zeros_(self.mem_proj.bias)
+        else:
+            self.mem_proj = None
 
     def init_hidden(self, batch_size: int, device: torch.device) -> torch.Tensor:
         return torch.zeros(batch_size, self.hidden_dim, device=device)
+
+    def _head_input(self, h_next: torch.Tensor, mem_feat: torch.Tensor | None) -> torch.Tensor:
+        """Apply the zero-init memory residual to the GRU output. Returns
+        h_next unchanged when mem_feat is None or the residual is disabled."""
+        if mem_feat is None or self.mem_proj is None:
+            return h_next
+        return h_next + self.mem_proj(mem_feat)
 
     def step(
         self,
@@ -67,6 +90,7 @@ class RecurrentPolicy(nn.Module):
         prev_action: torch.Tensor,   # (B,) int64 with -1 for first step
         mission: torch.Tensor,       # (B, mission_dim)
         h_prev: torch.Tensor,        # (B, hidden_dim)
+        mem_feat: torch.Tensor | None = None,  # (B, mem_feat_dim) or None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One recurrent step. Returns (logits, h_next)."""
         # Map -1 sentinel → n_actions (the dedicated 'no prev action' index).
@@ -77,7 +101,8 @@ class RecurrentPolicy(nn.Module):
         ze = self.latent_proj(z)
         x = torch.cat([ze, ae, me], dim=-1)
         h_next = self.gru(x, h_prev)
-        logits = self.policy_head(h_next)
+        h_eff = self._head_input(h_next, mem_feat)
+        logits = self.policy_head(h_eff)
         return logits, h_next
 
     def step_with_value(
@@ -86,6 +111,7 @@ class RecurrentPolicy(nn.Module):
         prev_action: torch.Tensor,
         mission: torch.Tensor,
         h_prev: torch.Tensor,
+        mem_feat: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """One recurrent step that ALSO returns the state value.
         Used by PPO. Returns (logits, value, h_next), where value has
@@ -98,8 +124,9 @@ class RecurrentPolicy(nn.Module):
         ze = self.latent_proj(z)
         x = torch.cat([ze, ae, me], dim=-1)
         h_next = self.gru(x, h_prev)
-        logits = self.policy_head(h_next)
-        value = self.value_head(h_next).squeeze(-1)  # (B,)
+        h_eff = self._head_input(h_next, mem_feat)
+        logits = self.policy_head(h_eff)
+        value = self.value_head(h_eff).squeeze(-1)  # (B,)
         return logits, value, h_next
 
     def forward(

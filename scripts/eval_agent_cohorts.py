@@ -73,7 +73,11 @@ def run_episode(env, agent, *, seed, max_steps, recurrent_policy=None):
         tc_idx = type_color_index(goal_preds[0].type_id, goal_preds[0].color_id)
         mission_one_hot = torch.zeros(len(OBJECT_TYPES) * NUM_COLORS)
         mission_one_hot[tc_idx] = 1.0
-        agent.attach_recurrent_policy(recurrent_policy, mission_one_hot)
+        agent.attach_recurrent_policy(
+            recurrent_policy, mission_one_hot,
+            goal_type=goal_preds[0].type_id,
+            goal_color=goal_preds[0].color_id,
+        )
 
     raw_t0 = obs["image"]
     gt_t0 = compute_predicates(extract_slots(raw_t0))
@@ -167,16 +171,21 @@ def main() -> int:
             raise SystemExit("--policy-checkpoint required for scoring-mode=recurrent")
         from prism.models.recurrent_policy import RecurrentPolicy
         pckpt = torch.load(args.policy_checkpoint, map_location=device, weights_only=False)
+        ckpt_mem_dim = int(pckpt.get("mem_feat_dim", 0) or 0)
         recurrent_policy = RecurrentPolicy(
             latent_in_dim=pckpt["latent_in_dim"],
             n_actions=pckpt["n_actions"],
             mission_dim=pckpt["mission_dim"],
             hidden_dim=pckpt["hidden_dim"],
             latent_proj_dim=pckpt["latent_proj_dim"],
+            mem_feat_dim=ckpt_mem_dim,
         ).to(device)
         recurrent_policy.load_state_dict(pckpt["policy_state_dict"])
         recurrent_policy.eval()
-        print(f"[cohort] loaded recurrent policy from {args.policy_checkpoint}")
+        print(
+            f"[cohort] loaded recurrent policy from {args.policy_checkpoint} "
+            f"(mem_feat_dim={ckpt_mem_dim})"
+        )
 
     from prism.envs.babyai import make_env_with_max_steps
     env = make_env_with_max_steps(args.env_id, args.max_steps)
