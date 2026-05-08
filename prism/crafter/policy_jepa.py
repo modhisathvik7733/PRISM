@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 
 from prism.crafter.cnn_encoder import CrafterCNN
-from prism.crafter.jepa_crafter import CrafterJepaConfig, CrafterJepaWorldModel
+from prism.crafter.jepa_crafter import CrafterJepaConfig
 
 
 class CrafterPolicyJepa(nn.Module):
@@ -48,7 +48,7 @@ class CrafterPolicyJepa(nn.Module):
         self.hidden_dim = hidden_dim
 
         # Load and freeze the JEPA online encoder.
-        ckpt = torch.load(jepa_checkpoint, map_location=device)
+        ckpt = torch.load(jepa_checkpoint, map_location=device, weights_only=False)
         cfg: CrafterJepaConfig = ckpt["cfg"]
         encoder = CrafterCNN(embed_dim=cfg.embed_dim)
         encoder.load_state_dict(ckpt["online_encoder_state"])
