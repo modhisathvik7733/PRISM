@@ -48,12 +48,30 @@ import torch.nn.functional as F
 
 from prism.agents import goal_predicates_for_mission
 from prism.agents.grounded_agent import allowed_actions_for_spec
-from prism.envs.babyai import _encode_image
+from prism.envs.babyai import _encode_image, set_max_steps
 from prism.models.jepa import JepaConfig, JepaWorldModel, upgrade_config
 from prism.models.recurrent_policy import RecurrentPolicy
+from prism.perception import compute_distances, extract_slots
 from prism.perception.predicates import type_color_index
 from prism.perception.slots import NUM_COLORS, OBJECT_TYPES
 from prism.utils.seed import set_global_seed
+
+
+def _goal_distance_from_raw_obs(raw_image_hwc, goal_pair) -> float:
+    """Compute normalized manhattan distance to the closest goal slot in the
+    current view. Returns 1.0 (max) when goal not in view. Used by reward
+    shaping. raw_image_hwc is the un-normalized BabyAI image obs (H, W, 3)."""
+    if goal_pair is None:
+        return 1.0
+    gt, gc = goal_pair
+    slots = extract_slots(raw_image_hwc)
+    cands = [s for s in slots if s.type_id == gt and s.color_id == gc]
+    if not cands:
+        return 1.0
+    # Reuse the existing distance computation: returns (24,) where index i is
+    # min normalized manhattan dist to (type, color)_i, 1.0 if absent.
+    dists = compute_distances(slots)
+    return float(dists[type_color_index(gt, gc)])
 
 
 def latent_dim_for_cfg(cfg: JepaConfig) -> int:
@@ -73,13 +91,21 @@ class EnvWorker:
     each worker by calling .step(action) and reading .obs_encoded etc."""
 
     def __init__(self, env_id: str, base_seed: int, worker_id: int,
-                 mission_dim: int, n_actions: int):
+                 mission_dim: int, n_actions: int,
+                 max_steps: int = 64, shaping_coef: float = 0.0):
         self.env = gym.make(env_id)
+        if max_steps != 64:
+            set_max_steps(self.env, max_steps)
         self.base_seed = base_seed
         self.worker_id = worker_id
         self.episode_idx = 0
         self.n_actions = n_actions
         self.mission_dim = mission_dim
+        self.shaping_coef = shaping_coef
+        # Hold raw HWC image to compute goal-distance for reward shaping.
+        # The encoded version stored in self.obs_encoded is for the policy.
+        self.raw_image = None
+        self.prev_goal_dist = 1.0
         self._reset_episode()
 
     def _reset_episode(self):
@@ -105,7 +131,9 @@ class EnvWorker:
             self.mission_oh = np.zeros(self.mission_dim, dtype=np.float32)
             self.mission_oh[tc_idx] = 1.0
             self.goal_pair = (goal_preds[0].type_id, goal_preds[0].color_id)
+        self.raw_image = obs["image"]
         self.obs_encoded = _encode_image(obs["image"])
+        self.prev_goal_dist = _goal_distance_from_raw_obs(self.raw_image, self.goal_pair)
         self.episode_reward = 0.0
         self.episode_steps = 0
         self.prev_action = -1
@@ -117,21 +145,41 @@ class EnvWorker:
         # should already respect this).
         if action not in self.allowed:
             action = self.allowed[0]
-        next_obs, reward, term, trunc, info = self.env.step(action)
+        next_obs, env_reward, term, trunc, info = self.env.step(action)
         done = bool(term or trunc)
-        self.episode_reward += float(reward)
+
+        # Component 2 — potential-based shaping.
+        # Compute goal-distance BEFORE potentially resetting, on the new
+        # observation. Bonus = shaping_coef * (prev_dist - cur_dist):
+        #   - positive when the agent moved closer (or brought goal into view)
+        #   - negative when it moved further / lost sight of the goal
+        # Per Ng et al. 1999, this is potential-based and preserves the
+        # optimal policy under terminal reward, but provides dense gradient
+        # signal that PPO needs to converge fast on this sparse env.
+        shaping_bonus = 0.0
+        if self.shaping_coef != 0.0:
+            cur_goal_dist = _goal_distance_from_raw_obs(next_obs["image"], self.goal_pair)
+            shaping_bonus = self.shaping_coef * (self.prev_goal_dist - cur_goal_dist)
+            self.prev_goal_dist = cur_goal_dist
+
+        # Total reward seen by PPO; episode-reward summary uses the env
+        # reward only so logged window_R stays comparable across runs.
+        total_reward = float(env_reward) + float(shaping_bonus)
+        self.episode_reward += float(env_reward)  # log unshaped for honesty
         self.episode_steps += 1
         self.prev_action = action
+
         if done:
             ep_summary = {
                 "ep_reward": self.episode_reward,
                 "ep_steps": self.episode_steps,
             }
             self._reset_episode()
-            return self.obs_encoded, float(reward), True, ep_summary
+            return self.obs_encoded, total_reward, True, ep_summary
         else:
+            self.raw_image = next_obs["image"]
             self.obs_encoded = _encode_image(next_obs["image"])
-            return self.obs_encoded, float(reward), False, {}
+            return self.obs_encoded, total_reward, False, {}
 
 
 def make_action_mask(allowed_per_env, n_actions: int, device: torch.device):
@@ -193,6 +241,17 @@ def main() -> int:
     parser.add_argument("--ent-coef-end", type=float, default=0.001)
     parser.add_argument("--value-coef", type=float, default=0.5)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
+    parser.add_argument("--max-steps", type=int, default=64,
+                        help="env's truncation budget (Component 1). 64 = "
+                             "BabyAI default, 128 = extended budget for harder spawns. "
+                             "Affects per-episode reward via 1 - 0.9*(steps/max_steps).")
+    parser.add_argument("--shaping-coef", type=float, default=0.0,
+                        help="Component 2 reward shaping coefficient. 0.0 = "
+                             "disabled (env reward only). 0.1 = recommended; "
+                             "shaping_bonus = coef * (prev_dist - cur_dist) where "
+                             "dist is normalized manhattan to closest goal slot, "
+                             "1.0 if goal not in view. Potential-based per Ng 1999, "
+                             "preserves optimal policy.")
     parser.add_argument("--seed", type=int, default=2_000_000,
                         help="training seed; large to avoid eval-seed overlap")
     parser.add_argument("--run-name", default="ppo_v1")
@@ -241,9 +300,13 @@ def main() -> int:
 
     # ---------- vectorized envs (sync) ----------
     workers = [
-        EnvWorker(args.env_id, args.seed, i, mission_dim, n_actions)
+        EnvWorker(
+            args.env_id, args.seed, i, mission_dim, n_actions,
+            max_steps=args.max_steps, shaping_coef=args.shaping_coef,
+        )
         for i in range(args.n_envs)
     ]
+    print(f"[ppo] env: max_steps={args.max_steps} shaping_coef={args.shaping_coef}")
 
     # ---------- training loop ----------
     n_iterations = args.total_steps // (args.rollout_steps * args.n_envs)

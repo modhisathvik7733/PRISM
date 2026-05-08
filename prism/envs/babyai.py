@@ -128,12 +128,40 @@ def make_babyai_env(
 
 
 def set_max_steps(env: gym.Env, max_steps: int) -> None:
-    """Override max_steps on an already-constructed env (for cases where the
-    caller used `gym.make(...)` directly instead of `make_babyai_env`).
+    """Override max_steps on an already-constructed env.
+
+    There are TWO layers that can truncate episodes:
+      1. MiniGrid's internal `step_count >= max_steps` check on the
+         unwrapped env. We update `env.unwrapped.max_steps`.
+      2. gymnasium's `TimeLimit` wrapper which stores `_max_episode_steps`
+         at construction time (read once from `spec.max_episode_steps`).
+         Mutating `spec` after construction does NOT update the wrapper's
+         private field. We walk the wrapper chain and patch any
+         `_max_episode_steps` we find.
+
+    Without (2), the env still truncates at the original cap (64 steps for
+    BabyAI-GoToLocal-v0) regardless of (1) — the symptom we observed:
+    eval reports identical episode trajectories at 64-step truncation.
     """
     try:
         env.unwrapped.max_steps = max_steps
     except AttributeError:
         pass
-    if getattr(env, "spec", None) is not None:
-        env.spec.max_episode_steps = max_steps
+    # Walk wrapper chain — gymnasium wrappers expose .env to their inner.
+    e = env
+    seen_ids = set()
+    while e is not None and id(e) not in seen_ids:
+        seen_ids.add(id(e))
+        if hasattr(e, "_max_episode_steps"):
+            try:
+                e._max_episode_steps = max_steps
+            except AttributeError:
+                pass
+        # Also update any per-wrapper spec (some wrappers expose their own).
+        spec = getattr(e, "spec", None)
+        if spec is not None:
+            try:
+                spec.max_episode_steps = max_steps
+            except AttributeError:
+                pass
+        e = getattr(e, "env", None)
