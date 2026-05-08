@@ -1,12 +1,16 @@
-"""CrafterJepaWorldModel — JEPA latent world model for Crafter RGB observations.
+"""CrafterJepaWorldModel -- JEPA latent world model for Crafter RGB observations.
 
-Encoder:  CrafterCNN (IMPALA-style, 4 strided convs) → (B, 256)
-Dynamics: MLP  concat(z_t, a_embed) → z_pred,  all in embed_dim space
+Encoder:  CrafterCNN (IMPALA-style, 4 strided convs) -> (B, 256)
+Dynamics: MLP  concat(z_t, a_embed) -> z_pred,  all in embed_dim space
 Target:   EMA copy of online encoder, no grad
 
 Losses:
-  L_pred = MSE(norm(z_pred), sg(norm(target(obs_{t+1}))))  cosine-equivalent
-  L_var  = mean(relu(1 - std(z_t, dim=0)))                 VICReg variance floor
+  L_pred = MSE(z_pred, sg(target(obs_{t+1})))     standard JEPA prediction
+  L_var  = mean(relu(1 - std(z_t, dim=0)))        VICReg variance floor
+
+  L_var is asymmetric: penalises std < 1 (collapse) but not std > 1
+  (overshoot). This avoids the (var-1)^2 Gaussian reg failure mode where
+  the encoder overshoots and l_pred keeps rising across epochs.
 
 Shapes locked:
   obs:     (B, 3, 64, 64)  float32  [0, 1]
@@ -33,7 +37,7 @@ class CrafterJepaConfig:
     embed_dim: int = 256
     n_actions: int = 17
     ema_decay: float = 0.996
-    reg_weight: float = 1e-2   # weight on VICReg variance floor (was 1e-3 Gaussian reg -- see loss())
+    reg_weight: float = 1e-1   # VICReg floor weight; 0.1 >> l_pred to break collapse
     dynamics_hidden: int = 256
 
 
@@ -112,17 +116,14 @@ class CrafterJepaWorldModel(nn.Module):
         with torch.no_grad():
             z_target = self.target_encoder(obs_tp1)  # (B, E)  stop-grad
 
-        # L2-normalize before MSE: equivalent to cosine distance, immune to
-        # scale drift. Prevents the encoder from minimising l_pred by simply
-        # shrinking or expanding all outputs uniformly.
-        z_pred_n   = F.normalize(z_pred,   dim=-1)  # (B, E) unit-norm
-        z_target_n = F.normalize(z_target, dim=-1)  # (B, E) unit-norm
-        l_pred = F.mse_loss(z_pred_n, z_target_n)   # in [0, 4]
+        l_pred = F.mse_loss(z_pred, z_target)          # (scalar)
 
-        # VICReg variance floor: push per-dim std >= 1, no penalty above 1.
-        # Anti-collapse only -- unlike (var-1)^2 it cannot overshoot.
-        std = z_t.std(dim=0).clamp(min=1e-4)        # (E,)
-        l_var = F.relu(1.0 - std).mean()            # in [0, 1]
+        # VICReg variance floor on unnormalized z_t.
+        # relu(1 - std) == 0 when std >= 1, so no overshoot penalty.
+        # reg_weight=0.1 makes this ~3-5x l_pred early in training so the
+        # encoder is forced to spread before the dynamics can exploit collapse.
+        std = z_t.std(dim=0).clamp(min=1e-4)          # (E,)
+        l_var = F.relu(1.0 - std).mean()              # in [0, 1]
 
         loss = l_pred + self.cfg.reg_weight * l_var
         return {
