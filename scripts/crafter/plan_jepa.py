@@ -351,8 +351,14 @@ def run_chain_experiment(
         # ── Phase 2: chain-guided planning ───────────────────────────────────
         sg_idx      = 0
         step        = 0
+        sg_patience = 0          # replans on current subgoal without progress
         dist_trace: list[tuple[int, float, float]] = []  # (sg_idx, d_sg, d_goal)
         max_sg_idx  = 0
+        patience_limit = 10      # skip unreachable subgoal after this many replans
+
+        def _rebuild_chain() -> list:
+            z_c = planner.encode_obs(worker.obs)
+            return planner.find_subgoal_chain(z_c, z_goal, z_memory, n_subgoals)
 
         while step < plan_steps:
             z_cur    = planner.encode_obs(worker.obs)
@@ -364,14 +370,23 @@ def run_chain_experiment(
             dist_to_goal = float(1.0 - z_cur_n @ z_goal_n)
             dist_trace.append((sg_idx, dist_to_sg, dist_to_goal))
 
-            # Advance subgoal when close enough (and not already at final goal)
+            # Advance subgoal when close enough
             if dist_to_sg < switch_threshold and sg_idx < n_chain - 1:
-                sg_idx  += 1
-                z_target = chain[sg_idx]
-                max_sg_idx = max(max_sg_idx, sg_idx)
+                sg_idx     += 1
+                sg_patience = 0
+                max_sg_idx  = max(max_sg_idx, sg_idx)
+                z_target    = chain[sg_idx]
+            else:
+                sg_patience += 1
+                # Skip a stuck subgoal and move to the next one
+                if sg_patience >= patience_limit and sg_idx < n_chain - 1:
+                    sg_idx     += 1
+                    sg_patience = 0
+                    z_target    = chain[sg_idx]
 
             actions = planner.beam_search(z_cur, z_target, horizon=horizon, beam_k=beam_k)
 
+            episode_done = False
             for a in actions[:exec_steps]:
                 if step >= plan_steps:
                     break
@@ -380,7 +395,15 @@ def run_chain_experiment(
                 if info:
                     trial_achievements |= info.get("achievements", set())
                 if done:
+                    episode_done = True
                     break
+
+            # After episode reset, rebuild the chain from the new starting state
+            if episode_done:
+                chain       = _rebuild_chain()
+                n_chain     = len(chain)
+                sg_idx      = 0
+                sg_patience = 0
 
         z_final_n  = F.normalize(planner.encode_obs(worker.obs), dim=-1)
         final_dist = float(1.0 - z_final_n @ z_goal_n)

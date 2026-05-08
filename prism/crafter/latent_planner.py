@@ -104,7 +104,6 @@ class LatentPlanner:
         beam_prune = torch.zeros(1, device=self.device)  # (K,)
 
         for step in range(horizon):
-            K      = len(beam_z)
             z_next = self._expand(beam_z)               # (K*n, E)
 
             z_next_n   = F.normalize(z_next, dim=-1)    # (K*n, E)
@@ -186,10 +185,11 @@ class LatentPlanner:
     ) -> List[torch.Tensor]:
         """Select n_subgoals stepping-stone latents from z_memory for z_start→z_goal.
 
-        Works in normalized (cosine) space. Projects each memory state onto the
-        z_start→z_goal axis, filters to states strictly between start and goal
-        (5%–95% along the axis), and picks n_subgoals states evenly spaced from
-        near-start to near-goal.
+        Selection guarantees a MONOTONICALLY DECREASING chain of distances to
+        z_goal (each waypoint is strictly closer to the goal than the previous):
+          1. Filter to states closer to z_goal than z_start (cos_dist < start_dist).
+          2. Sort by cos_dist_to_goal descending (far → near), i.e. start-end first.
+          3. Pick n_subgoals evenly spaced by rank in that ordering.
 
         Returns [z_sg_1, ..., z_sg_n, z_goal] ordered start→goal.
         Falls back to [z_goal] when z_memory is empty or has no valid candidates.
@@ -203,25 +203,25 @@ class LatentPlanner:
         z_g_n = F.normalize(z_goal,   dim=-1)   # (E,)
         z_m_n = F.normalize(z_memory, dim=-1)   # (M, E)
 
-        # Axis from start to goal in cosine space
-        diff      = z_g_n - z_s_n               # (E,)
-        diff_norm = diff.norm().clamp(min=1e-8)
-        direction = diff / diff_norm             # (E,) unit vector
+        # Cosine distance of each memory state to the goal
+        cos_sim_to_goal  = z_m_n @ z_g_n          # (M,)
+        dist_to_goal     = 1.0 - cos_sim_to_goal   # (M,)
 
-        # Scalar projection of each memory state onto the axis
-        rel         = z_m_n - z_s_n.unsqueeze(0)         # (M, E)
-        scalar_proj = rel @ direction                      # (M,)
-        norm_proj   = scalar_proj / diff_norm              # (M,)  ~[0,1]
+        # Baseline: distance from z_start to z_goal
+        start_dist = float(1.0 - z_s_n @ z_g_n)
 
-        # Only keep states strictly between start and goal
-        valid = (norm_proj > 0.05) & (norm_proj < 0.95)
+        # Keep only states strictly between start and goal:
+        #   closer to goal than start (dist < start_dist)
+        #   but not at the goal itself (dist > 0.02)
+        valid = (dist_to_goal < start_dist - 0.02) & (dist_to_goal > 0.02)
         if valid.sum() == 0:
             return [z_goal]
 
-        # Sort valid candidates by projection (start → goal order)
-        valid_idx   = valid.nonzero(as_tuple=True)[0]     # (V,)
-        proj_order  = norm_proj[valid_idx].argsort()
-        ordered_idx = valid_idx[proj_order]               # (V,) low→high projection
+        # Sort valid candidates by distance to goal, DESCENDING (far → near goal)
+        # so index 0 is the "first step away from start", last is "closest to goal"
+        valid_idx    = valid.nonzero(as_tuple=True)[0]           # (V,)
+        dist_order   = dist_to_goal[valid_idx].argsort(descending=True)
+        ordered_idx  = valid_idx[dist_order]                     # (V,) far→near goal
 
         # Pick n_subgoals evenly spaced across the ordered candidates
         V = len(ordered_idx)
