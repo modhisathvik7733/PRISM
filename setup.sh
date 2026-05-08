@@ -34,26 +34,27 @@ uv pip install -e ".[baseline,dev]"
 
 # --------------------------------------------------------------------- 4. torch with right CUDA
 # Pick the right CUDA wheel for the GPU.
-#   RTX 30xx/40xx (Ampere/Ada)   → cu121 or cu124 fine
-#   RTX 5090     (Blackwell)     → cu128 (sm_120) required
-#   H100         (Hopper)        → cu124 / cu126
+#   RTX 30xx/40xx (Ampere/Ada)            → cu121 or cu124 fine
+#   RTX 5060/5070/5070Ti/5080/5090 (Blackwell) → cu128 (sm_120) required
+#   H100                          (Hopper)     → cu124 / cu126
 CUDA="${CUDA:-}"
 GPU="${GPU:-}"
 
 if [ -z "$CUDA" ]; then
   case "$GPU" in
-    5090|blackwell) CUDA=cu128 ;;
+    5060|5070|5080|5090|blackwell) CUDA=cu128 ;;
     h100|hopper)    CUDA=cu126 ;;
-    4090|3090|ada|ampere) CUDA=cu124 ;;
+    4090|4080|3090|3080|ada|ampere) CUDA=cu124 ;;
     *)
       # Auto-detect via nvidia-smi
       if command -v nvidia-smi >/dev/null 2>&1; then
         SMI_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)
         log "Detected GPU: ${SMI_NAME:-unknown}"
         case "$SMI_NAME" in
-          *5090*|*B200*|*Blackwell*) CUDA=cu128 ;;
-          *H100*|*H200*)             CUDA=cu126 ;;
-          *4090*|*L40*|*A100*|*3090*) CUDA=cu124 ;;
+          # All RTX 50-series (Blackwell, sm_120) need cu128.
+          *RTX\ 50*|*5060*|*5070*|*5080*|*5090*|*B200*|*Blackwell*) CUDA=cu128 ;;
+          *H100*|*H200*)              CUDA=cu126 ;;
+          *4090*|*4080*|*L40*|*A100*|*3090*|*3080*) CUDA=cu124 ;;
           *)                          CUDA=cu124 ;;
         esac
       else
