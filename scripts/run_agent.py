@@ -29,6 +29,7 @@ import numpy as np
 import torch
 
 from prism.agents import GroundedAgent, goal_predicates_for_mission
+from prism.agents.grounded_agent import allowed_actions_for_spec
 from prism.envs.babyai import _encode_image
 from prism.models.jepa import JepaConfig, JepaWorldModel, upgrade_config
 from prism.perception import compute_predicates, extract_slots
@@ -78,8 +79,8 @@ def run_episode(
 ) -> dict:
     obs, _ = env.reset(seed=seed)
     mission = obs["mission"]
-    goal_preds = goal_predicates_for_mission(mission)
-    if goal_preds is None:
+    parsed = goal_predicates_for_mission(mission)
+    if parsed is None:
         # Fallback: random policy. Phase 4+ will handle compositional missions.
         n_actions = env.action_space.n
         rng = np.random.default_rng(seed)
@@ -99,6 +100,8 @@ def run_episode(
             "steps": len(chosen_actions),
             "actions": chosen_actions,
         }
+    goal_preds, spec = parsed
+    allowed = allowed_actions_for_spec(spec, env.action_space.n)
 
     chosen_actions = []
     ep_reward = 0.0
@@ -106,13 +109,21 @@ def run_episode(
         raw = obs["image"]                     # (7, 7, 3) uint8
         encoded = _encode_image(raw)           # (3, 7, 7) float32 normalized
         obs_t = torch.from_numpy(encoded).float()
-        action, info = agent.select_action(obs_t, goal_preds)
+        action, info = agent.select_action(obs_t, goal_preds, allowed_actions=allowed)
         if verbose:
-            scores = [round(info[f"score_a{i}"], 2) for i in range(env.action_space.n)]
-            print(f"  step {step:2d} action={action} scores={scores}")
+            n_actions = env.action_space.n
+            scores = []
+            for i in range(n_actions):
+                v = info[f"score_a{i}"]
+                scores.append("masked" if v == float("-inf") else round(v, 2))
+            explored_tag = " (explored)" if info.get("explored", 0.0) else ""
+            print(
+                f"  step {step:2d} action={action}{explored_tag} "
+                f"allowed={allowed} scores={scores}"
+            )
             _diagnose_step(
                 agent.jepa, agent, raw, encoded, goal_preds, agent.device,
-                env.action_space.n,
+                n_actions,
             )
         obs, r, term, trunc, _ = env.step(action)
         ep_reward += float(r)

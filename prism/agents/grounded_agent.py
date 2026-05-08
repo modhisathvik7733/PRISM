@@ -44,6 +44,23 @@ from prism.perception.predicates import predicate_index
 from prism.perception.slots import COLOR_NAME_TO_IDX
 
 
+# MiniGrid action ids:
+#   0 = turn left, 1 = turn right, 2 = forward,
+#   3 = pickup,    4 = drop,        5 = toggle,
+#   6 = done
+#
+# For each mission predicate type we know which actions are operationally
+# relevant. The other actions are no-ops in this env and would otherwise
+# dominate the agent's score because no-ops keep the predicted latent close
+# to the current latent (preserving the probe's noise floor) while real
+# actions can push predicates either up or down.
+MISSION_ALLOWED_ACTIONS: dict[str, tuple[int, ...]] = {
+    "at":      (0, 1, 2),         # "go to <X>" — only navigation
+    "holding": (0, 1, 2, 3),      # "pick up <X>" — navigation + pickup
+    "open":    (0, 1, 2, 5),      # "open <door>" — navigation + toggle
+}
+
+
 # Default weights: each finer-grained predicate is worth more than the
 # previous coarser one. Magnitudes matter less than the ordering.
 GOAL_PREDICATE_WEIGHTS: dict[str, float] = {
@@ -65,9 +82,12 @@ class WeightedGoal:
     flat_index: int    # position in the 96-d predicate vector
 
 
-def goal_predicates_for_mission(mission: str) -> list[WeightedGoal] | None:
-    """Map a BabyAI mission string to the set of weighted goal predicates the
-    agent should try to maximize.
+def goal_predicates_for_mission(
+    mission: str,
+) -> tuple[list[WeightedGoal], GoalSpec] | None:
+    """Map a BabyAI mission string to the weighted goal predicates the agent
+    should try to maximize, plus the parsed GoalSpec (so the caller can derive
+    which actions are operationally relevant).
 
     Returns None if the mission can't be parsed (e.g. compositional templates
     we don't yet support). Caller can fall back to random or no-op behavior.
@@ -87,7 +107,7 @@ def goal_predicates_for_mission(mission: str) -> list[WeightedGoal] | None:
         color = COLOR_NAME_TO_IDX["red"]
 
     type_id = spec.type_id
-    return [
+    goals = [
         WeightedGoal(
             name=name,
             type_id=type_id,
@@ -97,6 +117,14 @@ def goal_predicates_for_mission(mission: str) -> list[WeightedGoal] | None:
         )
         for name, w in GOAL_PREDICATE_WEIGHTS.items()
     ]
+    return goals, spec
+
+
+def allowed_actions_for_spec(spec: GoalSpec, n_actions: int) -> tuple[int, ...]:
+    """Resolve a parsed mission spec to the action ids the agent is allowed
+    to take. Falls back to all actions if we don't have a mapping.
+    """
+    return MISSION_ALLOWED_ACTIONS.get(spec.predicate, tuple(range(n_actions)))
 
 
 class GroundedAgent:
@@ -140,6 +168,7 @@ class GroundedAgent:
         obs: torch.Tensor,            # (3, 7, 7) float32 normalized
         goal_preds: list[WeightedGoal],
         *,
+        allowed_actions: tuple[int, ...] | None = None,
         exploration_threshold: float = 1e-3,
     ) -> tuple[int, dict[str, float]]:
         """Pick an action by rolling each candidate forward and scoring the
@@ -194,13 +223,27 @@ class GroundedAgent:
         for g in goal_preds:
             scores = scores + g.weight * improvement[:, g.flat_index]
 
-        # Exploration fallback when no action shows progress.
+        # Mask disallowed actions to -inf so argmax skips them. Also defines
+        # the candidate pool for the exploration fallback. For "go to X"
+        # missions this restricts the agent to {turn_left, turn_right, forward}
+        # — pickup/drop/toggle/done are no-ops and would otherwise dominate
+        # the score by preserving the probe's noise floor.
+        if allowed_actions is None:
+            allowed = tuple(range(self.n_actions))
+        else:
+            allowed = allowed_actions
+        allowed_t = torch.tensor(allowed, device=self.device, dtype=torch.long)
+        mask = torch.zeros(self.n_actions, dtype=torch.bool, device=self.device)
+        mask[allowed_t] = True
+        scores = torch.where(mask, scores, torch.full_like(scores, float("-inf")))
+
+        # Exploration fallback when no allowed action shows progress —
+        # uniformly sample over the allowed set, not all actions.
         explored = False
         max_score = float(scores.max().item())
         if max_score < exploration_threshold:
-            action = int(
-                torch.randint(0, self.n_actions, (1,), device=self.device).item()
-            )
+            pick = int(torch.randint(0, len(allowed_t), (1,), device=self.device).item())
+            action = int(allowed_t[pick].item())
             explored = True
         else:
             action = int(scores.argmax().item())
