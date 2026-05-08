@@ -3,9 +3,12 @@
 The Farama-maintained `minigrid` package ships the BabyAI levels as
 `BabyAI-*-v0` envs. We wrap them with a small obs adapter that:
 
-  1. Extracts the partial-view image (HWC uint8) and casts to (C, H, W) float32 / 255.
-  2. Keeps the natural-language `mission` string accessible alongside.
-  3. Optionally fixes the seed for deterministic eval.
+  1. Extracts the partial-view (HWC) and rearranges to (C, H, W).
+  2. Normalizes by the per-channel max code (NOT by 255 — these are symbolic
+     codes, not pixels: ch0=object type 0–10, ch1=color 0–5, ch2=state 0–3).
+     Dividing by 255 squashes everything into [0, 0.04] and PPO can't learn.
+  3. Keeps the natural-language `mission` string accessible alongside.
+  4. Optionally fixes the seed for deterministic eval.
 
 This wrapper is intentionally thin — Phase 0 only needs to load + step.
 Encoding `mission` into instruction-conditioning vectors happens in Phase 4.
@@ -19,6 +22,20 @@ import gymnasium as gym
 import minigrid  # noqa: F401  (registers BabyAI-* envs)
 import numpy as np
 from gymnasium import spaces
+
+
+# Per-channel max values for MiniGrid's symbolic image obs.
+# ch0: object type — wall/floor/door/key/ball/box/goal/lava/agent → up to 10.
+# ch1: color id (red, green, blue, purple, yellow, grey)         → up to 5.
+# ch2: state (door open/closed/locked, etc.)                     → up to 3.
+# Use a small safety margin so we don't clip on edge cases.
+_CHANNEL_MAX = np.array([11.0, 6.0, 4.0], dtype=np.float32).reshape(3, 1, 1)
+
+
+def _encode_image(img_hwc: np.ndarray) -> np.ndarray:
+    """HWC uint8 (symbolic codes) -> CHW float32 in roughly [0, 1]."""
+    chw = np.transpose(img_hwc, (2, 0, 1)).astype(np.float32)
+    return chw / _CHANNEL_MAX
 
 
 class PrismImageObsWrapper(gym.ObservationWrapper):
@@ -40,10 +57,8 @@ class PrismImageObsWrapper(gym.ObservationWrapper):
         )
 
     def observation(self, obs: dict[str, Any]) -> dict[str, Any]:
-        img = obs["image"].astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))  # HWC → CHW
         return {
-            "image": img,
+            "image": _encode_image(obs["image"]),
             "direction": int(obs["direction"]),
             "mission": str(obs.get("mission", "")),
         }
@@ -62,8 +77,7 @@ class PrismImageOnlyWrapper(gym.ObservationWrapper):
         )
 
     def observation(self, obs: dict[str, Any]) -> np.ndarray:
-        img = obs["image"].astype(np.float32) / 255.0
-        return np.transpose(img, (2, 0, 1))
+        return _encode_image(obs["image"])
 
 
 def make_babyai_env(

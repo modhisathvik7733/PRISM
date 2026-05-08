@@ -63,20 +63,28 @@ def main() -> int:
     # 7x7x3 = 147 features — too small for SB3's NatureCNN (which requires
     # ≥36x36 images). MlpPolicy auto-flattens via FlattenExtractor and is the
     # right baseline at this scale anyway.
+    #
+    # Hyperparameters tuned for BabyAI's sparse reward + short episodes:
+    #   * n_steps=256 — bigger rollout so each PPO update sees more completed
+    #     episodes (BabyAI episodes cap at ~64 steps).
+    #   * ent_coef=0.001 — at 0.01 entropy was actually rising during training
+    #     (agent stayed too random). Lower so the policy commits.
     model = PPO(
         "MlpPolicy",
         venv,
         verbose=1,
         device=args.device,
         seed=args.seed,
-        n_steps=128,
-        batch_size=256,
+        n_steps=256,
+        batch_size=512,
         learning_rate=3e-4,
-        n_epochs=4,
+        n_epochs=8,
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.01,
+        ent_coef=0.001,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
         policy_kwargs={"net_arch": [128, 128]},
         tensorboard_log=str(out_dir / "tb"),
     )
