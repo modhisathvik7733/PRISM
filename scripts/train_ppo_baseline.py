@@ -25,7 +25,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import gymnasium as gym
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
@@ -61,9 +60,11 @@ def main() -> int:
     VecEnv = SubprocVecEnv if args.vec == "subproc" else DummyVecEnv
     venv = VecEnv([make_env_fn(args.env_id, seed=args.seed + i) for i in range(args.n_envs)])
 
-    # SB3 PPO with NatureCNN; obs is (3, 7, 7) which is small but works.
+    # 7x7x3 = 147 features — too small for SB3's NatureCNN (which requires
+    # ≥36x36 images). MlpPolicy auto-flattens via FlattenExtractor and is the
+    # right baseline at this scale anyway.
     model = PPO(
-        "CnnPolicy",
+        "MlpPolicy",
         venv,
         verbose=1,
         device=args.device,
@@ -76,6 +77,7 @@ def main() -> int:
         gae_lambda=0.95,
         clip_range=0.2,
         ent_coef=0.01,
+        policy_kwargs={"net_arch": [128, 128]},
         tensorboard_log=str(out_dir / "tb"),
     )
 
