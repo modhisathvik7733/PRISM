@@ -36,7 +36,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import numpy as np
 import torch
 
 from prism.language.mission_parser import GoalSpec, parse_mission
@@ -494,59 +493,6 @@ class GroundedAgent:
             slots_list = list(extract_slots_from_normalized(obs_np))
             for s in slots_list:
                 self._mem_objects[(s.type_id, s.color_id)] = self._slot_to_world(s.x, s.y)
-        except Exception:
-            pass
-
-        # 1c. Component C (Phase 3): expand the agent's known map by reading
-        # the FULL 7x7 view, not just slot positions. Each step the agent's
-        # view reveals up to 49 cells; classifying them as passable / blocked
-        # gives BFS a much richer search space than just-stepped-into cells.
-        #
-        # Type encoding (minigrid OBJECT_TO_IDX):
-        #   0 unseen (occluded — don't classify)
-        #   1 empty, 3 floor, 8 goal-tile  → passable
-        #   2 wall                          → blocked
-        #   4 door (closed), 5 key, 6 ball, 7 box → blocked unless it's the goal
-        #
-        # We never re-classify a cell from blocked to passable (sticky blocks).
-        # The agent's own cell (view 3, 6) is the cell we're standing on,
-        # always passable, but we skip it to avoid redundant updates.
-        if goal_preds:
-            _gt = goal_preds[0].type_id
-            _gc = goal_preds[0].color_id
-        else:
-            _gt = _gc = -1
-        try:
-            chw = np.asarray(obs_np, dtype=np.float32)
-            cmax = np.array([11.0, 6.0, 4.0], dtype=np.float32).reshape(3, 1, 1)
-            raw_view = np.rint(chw * cmax).astype(np.int64)  # (3, 7, 7)
-            types_grid = raw_view[0]
-            colors_grid = raw_view[1]
-            for sy in range(7):
-                for sx in range(7):
-                    if sx == 3 and sy == 6:
-                        continue  # agent's own cell
-                    t = int(types_grid[sy, sx])
-                    if t == 0:
-                        continue  # occluded, can't classify
-                    wxy = self._slot_to_world(sx, sy)
-                    if t in (1, 3, 8):  # passable
-                        if wxy not in self._mem_blocked:
-                            self._mem_visited.add(wxy)
-                    elif t == 2:  # wall
-                        self._mem_blocked.add(wxy)
-                        self._mem_visited.discard(wxy)
-                    elif t in (4, 5, 6, 7):  # object
-                        c = int(colors_grid[sy, sx])
-                        if t == _gt and c == _gc:
-                            # Goal target — leave it un-marked so BFS routes to
-                            # an adjacent cell (target cell itself is impassable
-                            # but env terminates on adjacent-and-facing).
-                            self._mem_visited.discard(wxy)
-                            self._mem_blocked.discard(wxy)
-                        else:
-                            self._mem_blocked.add(wxy)
-                            self._mem_visited.discard(wxy)
         except Exception:
             pass
 
