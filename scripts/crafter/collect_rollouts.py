@@ -58,7 +58,11 @@ def main() -> int:
         embed_dim=ckpt.get("embed_dim", 256),
         hidden_dim=ckpt.get("hidden_dim", 256),
     ).to(device)
-    policy.load_state_dict(ckpt["policy_state_dict"])
+    # Remap old key "cnn.fc.1.*" → "cnn.head.*" (CrafterCNN renamed when state_dim was added).
+    sd = ckpt["policy_state_dict"]
+    sd = {k.replace("cnn.fc.1.", "cnn.head.", 1) if k.startswith("cnn.fc.1.") else k: v
+          for k, v in sd.items()}
+    policy.load_state_dict(sd)
     policy.eval()
     print(f"[collect] loaded policy from {args.checkpoint}")
 

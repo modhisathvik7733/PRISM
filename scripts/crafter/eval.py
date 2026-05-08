@@ -46,7 +46,10 @@ def main() -> int:
         embed_dim=pckpt["embed_dim"],
         hidden_dim=pckpt["hidden_dim"],
     ).to(device)
-    policy.load_state_dict(pckpt["policy_state_dict"])
+    sd = pckpt["policy_state_dict"]
+    sd = {k.replace("cnn.fc.1.", "cnn.head.", 1) if k.startswith("cnn.fc.1.") else k: v
+          for k, v in sd.items()}
+    policy.load_state_dict(sd)
     policy.eval()
     print(f"[eval] policy loaded from {args.policy_checkpoint}")
     print(f"[eval] running {args.episodes} episodes…")
