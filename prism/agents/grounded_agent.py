@@ -41,7 +41,7 @@ import torch
 from prism.language.mission_parser import GoalSpec, parse_mission
 from prism.models.jepa import JepaWorldModel
 from prism.perception.predicates import predicate_index
-from prism.perception.slots import COLOR_NAME_TO_IDX, OBJECT_NAME_TO_TYPE
+from prism.perception.slots import COLOR_NAME_TO_IDX
 
 
 # Default weights: each finer-grained predicate is worth more than the
@@ -139,24 +139,46 @@ class GroundedAgent:
         self,
         obs: torch.Tensor,            # (3, 7, 7) float32 normalized
         goal_preds: list[WeightedGoal],
+        *,
+        exploration_threshold: float = 1e-3,
     ) -> tuple[int, dict[str, float]]:
-        """Pick an action by rolling each candidate forward and scoring its
-        predicted next-latent under the goal predicates.
+        """Pick an action by rolling each candidate forward and scoring the
+        IMPROVEMENT of each goal predicate relative to the current state.
 
-        Returns (action, info) where info has the per-action scores for
-        debugging / logging.
+        Why improvement, not absolute probability:
+          Even when no goal predicate is true, the probe outputs a small
+          baseline ~0.003 per slot (sigmoid noise floor). With our weighting
+          {visible=1, facing=2, near=4, adjacent=8} summing to 15, no-op
+          actions like pickup/drop/toggle/done preserve this 0.05 of "weighted
+          baseline noise" — while informative actions like turn-right that
+          push visible from 0.003 → 0.02 only get a score of ~0.04.
+          The agent then prefers no-ops over progress. (This is exactly the
+          Phase 2 capstone failure we observed.)
+
+          Subtracting baseline = scoring "advantage": no-ops get 0, useful
+          actions get the real magnitude of predicate change.
+
+        Exploration fallback:
+          If the maximum advantage is below `exploration_threshold`, the
+          model thinks no action makes meaningful progress — usually because
+          the target is so far away it doesn't appear in any 1-step rollout.
+          We pick a random action so the agent isn't stuck.
+
+        Returns (action, info) with per-action scores for diagnostics.
         """
         obs_b = obs.unsqueeze(0).to(self.device)      # (1, 3, 7, 7)
         z_t = self.jepa.encode(obs_b)                 # (1, embed_dim)
 
-        # Replicate z_t once per candidate action.
+        # Baseline predicate probabilities at the CURRENT state.
+        baseline_logits = self.probe(z_t)             # (1, 96)
+        baseline_probs = torch.sigmoid(baseline_logits).squeeze(0)  # (96,)
+
+        # One-step latent rollouts for every candidate action.
         z_t_rep = z_t.expand(self.n_actions, -1)
         actions = torch.arange(self.n_actions, device=self.device, dtype=torch.long)
-
         z_next = self.jepa.predict(z_t_rep, actions)  # (n_actions, embed_dim)
 
-        # Optional multi-step rollout under random follow-up actions.
-        # horizon=1 (default) just scores ẑ_{t+1} directly.
+        # Multi-step rollout under random follow-up actions.
         if self.horizon > 1:
             for _ in range(self.horizon - 1):
                 rand_a = torch.randint(
@@ -164,15 +186,28 @@ class GroundedAgent:
                 )
                 z_next = self.jepa.predict(z_next, rand_a)
 
-        pred_logits = self.probe(z_next)              # (n_actions, 96)
-        pred_probs = torch.sigmoid(pred_logits)
+        next_probs = torch.sigmoid(self.probe(z_next))  # (n_actions, 96)
 
-        # Score each candidate action.
+        # Advantage: per-action improvement of each predicate over baseline.
+        improvement = next_probs - baseline_probs.unsqueeze(0)
         scores = torch.zeros(self.n_actions, device=self.device)
         for g in goal_preds:
-            scores = scores + g.weight * pred_probs[:, g.flat_index]
+            scores = scores + g.weight * improvement[:, g.flat_index]
 
-        action = int(scores.argmax().item())
+        # Exploration fallback when no action shows progress.
+        explored = False
+        max_score = float(scores.max().item())
+        if max_score < exploration_threshold:
+            action = int(
+                torch.randint(0, self.n_actions, (1,), device=self.device).item()
+            )
+            explored = True
+        else:
+            action = int(scores.argmax().item())
+
         info = {f"score_a{i}": float(scores[i].item()) for i in range(self.n_actions)}
         info["chosen"] = action
+        info["explored"] = float(explored)
+        info["max_score"] = max_score
+        info["baseline_visible"] = float(baseline_probs.max().item())
         return action, info

@@ -39,10 +39,13 @@ from prism.utils.seed import set_global_seed
 def _diagnose_step(jepa, agent, raw_obs, encoded_obs, goal_preds, device, n_actions):
     """Print a side-by-side of:
         - ground-truth predicates from slots
-        - predicates the probe reads from encode(obs_t)
-        - predicates the probe reads from predict(z_t, a) for each a
+        - probe(z_t)               = baseline at current state
+        - probe(predict(z_t, a))   = imagined per-action
+        - improvement              = imagined − baseline   (this is what the
+                                     advantage scorer actually uses)
 
-    Useful for spotting where the train/inference distribution gap shows up.
+    Useful for spotting where the train/inference distribution gap shows up
+    AND for sanity-checking the advantage formulation.
     """
     gt = compute_predicates(extract_slots(raw_obs))
     z_t = jepa.encode(torch.from_numpy(encoded_obs).float().unsqueeze(0).to(device))
@@ -52,15 +55,16 @@ def _diagnose_step(jepa, agent, raw_obs, encoded_obs, goal_preds, device, n_acti
     z_next = jepa.predict(z_t.expand(n_actions, -1), actions)
     probe_next = torch.sigmoid(agent.probe(z_next)).cpu().numpy()  # (n_actions, 96)
 
-    # Focus on the goal predicates only (less noise).
-    print("    [diag] goal predicates: name | gt | probe(z_t) | probe(predict(z_t, a)) for a in 0..6")
+    print("    [diag] goal predicates: name | gt | base | next per-action | improvement per-action")
     for g in goal_preds:
-        per_action = " ".join(f"{probe_next[a, g.flat_index]:.2f}" for a in range(n_actions))
+        idx = g.flat_index
+        next_str = " ".join(f"{probe_next[a, idx]:.2f}" for a in range(n_actions))
+        imp_str = " ".join(f"{probe_next[a, idx] - probe_t[idx]:+.2f}" for a in range(n_actions))
         print(
             f"        {g.name:9s}({g.color_id},{g.type_id:>2d}) "
-            f"gt={gt[g.flat_index]:.0f} "
-            f"probe_t={probe_t[g.flat_index]:.2f}   "
-            f"after_a: {per_action}"
+            f"gt={gt[idx]:.0f} base={probe_t[idx]:.2f}   "
+            f"next: {next_str}   "
+            f"imp: {imp_str}"
         )
 
 
