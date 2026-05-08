@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Envs
+.venv/
+venv/
+env/
+
+# uv
+.uv-cache/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# Experiment artifacts (write to ./runs/ and ./checkpoints/)
+runs/
+checkpoints/
+wandb/
+logs/
+*.log
+*.pt
+*.pth
+*.ckpt
+
+# Local notes
+NOTES.local.md
+TODO.local.md
