@@ -27,14 +27,31 @@ python -m scripts.crafter.smoke_test
 Expect 4/4 checks to pass with random-episode achievement count of 0-2
 (random policy unlocks `collect_wood` occasionally).
 
-### Commit 2 — PPO baseline (no JEPA)
-- `scripts/crafter/ppo_train_baseline.py` — RecurrentPolicy with
-  end-to-end CNN encoder + GRU + PPO. No mission, no pose features.
-- `scripts/crafter/eval.py` — geometric-mean achievement score across
-  N episodes.
+### Commit 2 (this one) — PPO baseline (no JEPA)
+- `prism/crafter/policy.py` — `CrafterPolicy`: CNN + GRU + actor-critic
+  heads, trained end-to-end with PPO. No JEPA, no BC warmstart.
+- `prism/crafter/env_worker.py` — `CrafterEnvWorker` for vec rollouts +
+  `aggregate_achievement_score` (geometric-mean formula).
+- `scripts/crafter/ppo_train_baseline.py` — full PPO loop. Stores raw
+  obs in the rollout buffer so PPO gradients flow through the CNN.
+- `scripts/crafter/eval.py` — runs N episodes greedy, prints per-
+  achievement unlock rates + geometric-mean score.
 
-Goal: hit the published ~5% baseline. Validates the env + RL infra
-before we layer in the world model.
+**Run** (~3-6 hr for 250k env steps on a single GPU; Crafter rendering
+is the bottleneck):
+```bash
+python -m scripts.crafter.ppo_train_baseline \
+    --total-steps 250000 --n-envs 8 --rollout-steps 256 \
+    --run-name crafter_ppo_baseline --device cuda
+
+python -m scripts.crafter.eval \
+    --policy-checkpoint runs/crafter_ppo_baseline/policy_final.pt \
+    --episodes 100 --device cuda
+```
+
+Goal: hit the published ~5% baseline. If it hits 3-7%, the env + RL
+infra are healthy and we proceed to commit 3. If it stalls at <2% the
+PPO setup needs tuning before adding JEPA.
 
 ### Commit 3 — RGB JEPA + PPO with frozen latent
 - `prism/crafter/jepa_rgb.py` — JEPA model with `CrafterCNN` encoder +
