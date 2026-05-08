@@ -141,11 +141,25 @@ class GroundedAgent:
         device: torch.device,
         *,
         probe: torch.nn.Module | None = None,
-        horizon: int = 1,
+        horizon: int = 4,
+        n_samples: int = 8,
     ):
+        """Args:
+            horizon:    multi-step rollout depth. Each candidate first action
+                        is followed by `horizon - 1` random actions in the
+                        imagined latent space; predicates are read from the
+                        final latent. horizon=4 is the default — at horizon=1
+                        the agent only sees what each action does *immediately*,
+                        which doesn't help when the target is multiple steps
+                        away.
+            n_samples:  how many random follow-up sequences to draw per first
+                        action. The scores are averaged across samples to
+                        reduce variance from the random follow-ups.
+        """
         self.jepa = jepa
         self.device = device
         self.horizon = horizon
+        self.n_samples = max(1, n_samples)
 
         # Resolve which probe to use.
         if probe is not None:
@@ -169,7 +183,7 @@ class GroundedAgent:
         goal_preds: list[WeightedGoal],
         *,
         allowed_actions: tuple[int, ...] | None = None,
-        exploration_threshold: float = 1e-3,
+        exploration_threshold: float = 1e-2,
     ) -> tuple[int, dict[str, float]]:
         """Pick an action by rolling each candidate forward and scoring the
         IMPROVEMENT of each goal predicate relative to the current state.
@@ -202,24 +216,30 @@ class GroundedAgent:
         baseline_logits = self.probe(z_t)             # (1, 96)
         baseline_probs = torch.sigmoid(baseline_logits).squeeze(0)  # (96,)
 
-        # One-step latent rollouts for every candidate action.
-        z_t_rep = z_t.expand(self.n_actions, -1)
-        actions = torch.arange(self.n_actions, device=self.device, dtype=torch.long)
-        z_next = self.jepa.predict(z_t_rep, actions)  # (n_actions, embed_dim)
+        # Multi-sample rollouts: for each candidate first action, simulate
+        # `n_samples` independent random follow-up trajectories of length
+        # `horizon - 1`. Score by AVERAGING the final-state predicate probs
+        # across samples — this gives a low-variance estimate of "this first
+        # action tends to lead to good futures" that beats single-rollout noise.
+        nA = self.n_actions
+        nS = self.n_samples
+        # Replicate (z_t, action) for every (action_id, sample_idx) pair.
+        z_t_rep = z_t.expand(nA * nS, -1)             # (nA*nS, embed_dim)
+        first_actions = torch.arange(nA, device=self.device, dtype=torch.long)
+        first_actions = first_actions.repeat_interleave(nS)  # [0,0,..,0, 1,1,..,1, ...]
+        z_next = self.jepa.predict(z_t_rep, first_actions)
 
-        # Multi-step rollout under random follow-up actions.
         if self.horizon > 1:
             for _ in range(self.horizon - 1):
-                rand_a = torch.randint(
-                    0, self.n_actions, (self.n_actions,), device=self.device
-                )
+                rand_a = torch.randint(0, nA, (nA * nS,), device=self.device)
                 z_next = self.jepa.predict(z_next, rand_a)
 
-        next_probs = torch.sigmoid(self.probe(z_next))  # (n_actions, 96)
+        next_probs = torch.sigmoid(self.probe(z_next))                 # (nA*nS, 96)
+        next_probs_mean = next_probs.view(nA, nS, -1).mean(dim=1)      # (nA, 96)
 
-        # Advantage: per-action improvement of each predicate over baseline.
-        improvement = next_probs - baseline_probs.unsqueeze(0)
-        scores = torch.zeros(self.n_actions, device=self.device)
+        # Advantage: per-action improvement over baseline, averaged across samples.
+        improvement = next_probs_mean - baseline_probs.unsqueeze(0)
+        scores = torch.zeros(nA, device=self.device)
         for g in goal_preds:
             scores = scores + g.weight * improvement[:, g.flat_index]
 

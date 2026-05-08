@@ -150,8 +150,12 @@ def main() -> int:
     parser.add_argument("--env-id", default="BabyAI-GoToLocal-v0")
     parser.add_argument("--episodes", type=int, default=50)
     parser.add_argument("--max-steps", type=int, default=64)
-    parser.add_argument("--horizon", type=int, default=1,
-                        help="latent rollout horizon for action scoring (>=1)")
+    parser.add_argument("--horizon", type=int, default=4,
+                        help="latent rollout horizon for action scoring (>=1). "
+                             "horizon=4 averages over 4-step imagined futures.")
+    parser.add_argument("--n-samples", type=int, default=8,
+                        help="random follow-up samples per first action (variance "
+                             "reduction). 8 keeps single-step latency negligible.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--verbose", action="store_true",
@@ -181,8 +185,16 @@ def main() -> int:
         external_probe.eval()
         print(f"[agent] loaded external probe from {args.probe_checkpoint}")
 
-    agent = GroundedAgent(jepa, device, probe=external_probe, horizon=args.horizon)
-    print(f"[agent] horizon={args.horizon} n_actions={agent.n_actions}")
+    agent = GroundedAgent(
+        jepa, device,
+        probe=external_probe,
+        horizon=args.horizon,
+        n_samples=args.n_samples,
+    )
+    print(
+        f"[agent] horizon={args.horizon} n_samples={args.n_samples} "
+        f"n_actions={agent.n_actions}"
+    )
 
     # ------------------------------------------------------ env + run
     env = gym.make(args.env_id)
