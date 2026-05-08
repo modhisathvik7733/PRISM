@@ -173,19 +173,70 @@ def set_max_steps(env: gym.Env, max_steps: int) -> None:
         e = getattr(e, "env", None)
 
 
-def make_env_with_max_steps(env_id: str, max_steps: int) -> gym.Env:
-    """Construct a BabyAI env with the requested max_steps using gymnasium's
-    documented `max_episode_steps` kwarg AND the post-construction patch as
-    belt-and-suspenders. Use this in scripts that need raw dict obs (run_agent,
-    eval_agent_cohorts, ppo_train) — make_babyai_env is for image-only flows.
+class PersistentMaxStepsWrapper(gym.Wrapper):
+    """Re-apply max_steps after every reset.
 
-    Prints a diagnostic line so it's obvious in logs whether the override
-    actually took effect."""
+    BabyAI's `RoomGridLevel.reset()` recomputes `self.max_steps` from the
+    level geometry on each reset (formula:
+    `num_navs * room_size² * num_rows * num_cols`). For
+    `BabyAI-GoToLocal-v0` that's `1 × 8² × 1 × 1 = 64`. So a one-shot
+    `set_max_steps` is silently undone on the first reset.
+
+    This wrapper patches both the unwrapped env's `max_steps` AND any
+    `_max_episode_steps` it finds on inner wrappers (TimeLimit) IMMEDIATELY
+    AFTER each `reset()`. The override survives across episodes.
+    """
+
+    def __init__(self, env: gym.Env, max_steps: int):
+        super().__init__(env)
+        self._target_max_steps = max_steps
+        self._patch()
+
+    def _patch(self) -> None:
+        try:
+            self.env.unwrapped.max_steps = self._target_max_steps
+        except AttributeError:
+            pass
+        e = self.env
+        seen = set()
+        while e is not None and id(e) not in seen:
+            seen.add(id(e))
+            if hasattr(e, "_max_episode_steps"):
+                try:
+                    e._max_episode_steps = self._target_max_steps
+                except AttributeError:
+                    pass
+            e = getattr(e, "env", None)
+
+    def reset(self, **kwargs):
+        result = self.env.reset(**kwargs)
+        self._patch()
+        return result
+
+
+def make_env_with_max_steps(env_id: str, max_steps: int) -> gym.Env:
+    """Construct a BabyAI env with the requested max_steps that survives
+    across resets.
+
+    Three layers cooperate:
+      1. `gym.make(env_id, max_episode_steps=N)` — gymnasium's documented
+         API, configures TimeLimit at construction.
+      2. `set_max_steps(env, N)` — patches unwrapped + walks the wrapper
+         chain right after construction.
+      3. `PersistentMaxStepsWrapper` — re-applies the patch after every
+         reset, defeating BabyAI's per-reset max_steps recomputation.
+
+    The diagnostic line confirms which value actually persists into the
+    first episode (printed AFTER one no-op reset)."""
     env = gym.make(env_id, max_episode_steps=max_steps)
     set_max_steps(env, max_steps)
-    # Diagnostic — print the effective caps so the operator can verify.
+    env = PersistentMaxStepsWrapper(env, max_steps)
+    # Trigger one no-op reset so the persistent patch fires before we read
+    # the diagnostic — that way the line reflects the value the agent will
+    # actually see during episodes.
+    env.reset(seed=0)
     unwrapped_cap = getattr(env.unwrapped, "max_steps", "?")
     spec_cap = getattr(env.spec, "max_episode_steps", "?") if env.spec else "?"
     print(f"[env] {env_id}: unwrapped.max_steps={unwrapped_cap} "
-          f"spec.max_episode_steps={spec_cap}")
+          f"spec.max_episode_steps={spec_cap} (persistent)")
     return env
