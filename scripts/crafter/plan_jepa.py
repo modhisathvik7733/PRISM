@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -57,59 +58,73 @@ def load_jepa(path: str, device: torch.device):
 
 def collect_goal_obs(
     jepa_checkpoint: str,
-    ppo_checkpoint: str,
+    ppo_checkpoint: Optional[str],
     trigger_achievement: str = "place_table",
-    max_episodes: int = 50,
+    max_episodes: int = 100,
     seed: int = 42,
     device: torch.device = torch.device("cpu"),
 ) -> Optional[np.ndarray]:
-    """Run the PPO policy until trigger_achievement fires; return that obs."""
-    policy = CrafterPolicyJepa(
-        jepa_checkpoint=jepa_checkpoint,
-        n_actions=17,
-        device=device,
-    ).to(device)
-    ckpt = torch.load(ppo_checkpoint, map_location=device, weights_only=False)
-    policy.load_state_dict(ckpt["policy_state_dict"])
-    policy.eval()
+    """Roll out a policy until trigger_achievement fires; return that obs.
 
-    worker = CrafterEnvWorker(seed, worker_id=0, reward_mode="reward")
-    h           = policy.init_hidden(1, device)
-    prev_action = torch.full((1,), -1, dtype=torch.long, device=device)
+    If ppo_checkpoint exists, uses the trained PPO policy.
+    Otherwise falls back to a random policy (more episodes needed).
+    """
+    use_ppo = ppo_checkpoint is not None and Path(ppo_checkpoint).exists()
+    if use_ppo:
+        policy = CrafterPolicyJepa(
+            jepa_checkpoint=jepa_checkpoint,
+            n_actions=17,
+            device=device,
+        ).to(device)
+        ckpt = torch.load(ppo_checkpoint, map_location=device, weights_only=False)
+        policy.load_state_dict(ckpt["policy_state_dict"])
+        policy.eval()
+        h           = policy.init_hidden(1, device)
+        prev_action = torch.full((1,), -1, dtype=torch.long, device=device)
+        print(f"[goal] collecting with PPO policy from {ppo_checkpoint}")
+    else:
+        policy = None
+        print(f"[goal] PPO checkpoint not found — using random policy "
+              f"(max_episodes raised to {max_episodes})")
 
+    worker   = CrafterEnvWorker(seed, worker_id=0, reward_mode="reward")
     episodes = 0
-    while episodes < max_episodes:
-        obs_np = worker.obs.copy()                                # (3, 64, 64)
-        obs_t  = torch.from_numpy(obs_np).unsqueeze(0).to(device)
 
+    while episodes < max_episodes:
+        obs_np     = worker.obs.copy()
         ach_before = set(worker.achievements)
 
-        with torch.no_grad():
-            logits, _, h_next = policy.step_with_value(obs_t, prev_action, h)
-        action   = torch.distributions.Categorical(logits=logits).sample()
-        _, _, done, info = worker.step(int(action.item()))
+        if use_ppo:
+            obs_t = torch.from_numpy(obs_np).unsqueeze(0).to(device)
+            with torch.no_grad():
+                logits, _, h_next = policy.step_with_value(obs_t, prev_action, h)
+            action_int = int(torch.distributions.Categorical(logits=logits).sample().item())
+        else:
+            action_int = int(np.random.randint(17))
+            h_next     = None
+
+        _, _, done, info = worker.step(action_int)
 
         if not done:
             new_ach = worker.achievements - ach_before
             if trigger_achievement in new_ach:
-                print(f"[goal] trigger '{trigger_achievement}' fired  "
-                      f"(ep {episodes}, non-terminal step)")
+                print(f"[goal] '{trigger_achievement}' fired (ep {episodes}, non-terminal)")
                 return worker.obs.copy()
         else:
-            # info["achievements"] is the full ep set; _reset_episode already called
             if trigger_achievement in info.get("achievements", set()):
-                print(f"[goal] trigger '{trigger_achievement}' fired  "
-                      f"(ep {episodes}, terminal step)")
-                return obs_np  # obs just before done
+                print(f"[goal] '{trigger_achievement}' fired (ep {episodes}, terminal)")
+                return obs_np
             episodes += 1
-            h           = policy.init_hidden(1, device)
-            prev_action = torch.full((1,), -1, dtype=torch.long, device=device)
-            if episodes % 10 == 0:
+            if use_ppo:
+                h           = policy.init_hidden(1, device)
+                prev_action = torch.full((1,), -1, dtype=torch.long, device=device)
+            if episodes % 20 == 0:
                 print(f"[goal] {episodes}/{max_episodes} episodes — trigger not yet fired")
             continue
 
-        h           = h_next
-        prev_action = action
+        if use_ppo:
+            h           = h_next
+            prev_action = torch.tensor([action_int], dtype=torch.long, device=device)
 
     print(f"[goal] WARNING: '{trigger_achievement}' not fired in {max_episodes} episodes")
     return None
