@@ -543,13 +543,24 @@ def run_precondition_experiment(
              achievement action in a burst and check if the achievement fires.
 
     goal_obs may be a list of pre-achievement observations; in that case z_goal
-    is the mean of their normalized latents (more robust across spawn positions).
+    is selected as the candidate with the most coverage in z_memory_seed —
+    i.e. the goal whose closest rollout neighbor is most similar. This picks a
+    goal that is actually reachable via beam_search rather than an abstract
+    centroid (which averages to a ghost with no near-neighbours in the data).
     """
     if isinstance(goal_obs, list):
-        z_goals  = [planner.encode_obs(g) for g in goal_obs]
-        # Mean of unit vectors → renormalise → centroid in ψ-space.
-        z_goal   = F.normalize(torch.stack(z_goals).mean(0), dim=-1)
-        print(f"[precondition] z_goal = mean of {len(z_goals)} pre-achievement latents")
+        z_goals = [planner.encode_obs(g) for g in goal_obs]
+        if z_memory_seed is not None and len(z_memory_seed) > 0:
+            z_g_n    = F.normalize(torch.stack(z_goals), dim=-1)    # (N, E)
+            z_m_n    = F.normalize(z_memory_seed, dim=-1)            # (M, E)
+            best_sim = (z_g_n @ z_m_n.T).max(dim=-1).values         # (N,) max cosine to any mem state
+            best_idx = int(best_sim.argmax())
+            z_goal   = z_goals[best_idx]
+            print(f"[precondition] selected goal {best_idx+1}/{len(z_goals)} "
+                  f"(best mem coverage: max_sim={best_sim[best_idx]:.3f})")
+        else:
+            z_goal = z_goals[0]
+            print(f"[precondition] using goal 1/{len(z_goals)} (no memory seed for selection)")
     else:
         z_goal   = planner.encode_obs(goal_obs)
     z_goal_n = F.normalize(z_goal, dim=-1)
