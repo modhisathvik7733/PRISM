@@ -130,14 +130,28 @@ def collect_goal_obs(
     seed: int = 42,
     device: torch.device = torch.device("cpu"),
 ) -> Optional[tuple[np.ndarray, np.ndarray]]:
-    """Roll out a policy until trigger_achievement fires; return (pre_obs, pre_state).
+    """Roll out until trigger_achievement fires; return (pre_obs, pre_state)."""
+    results = collect_goal_obs_multi(
+        jepa_checkpoint, ppo_checkpoint, trigger_achievement,
+        max_goals=1, max_episodes=max_episodes, seed=seed, device=device,
+    )
+    return results[0] if results else None
 
-    Returns the PRE-achievement observation (player facing the target object,
-    before the achievement action is executed) so the planner can navigate
-    toward this common precondition state rather than the rare post-obs.
 
-    If ppo_checkpoint exists, uses the trained PPO policy.
-    Otherwise falls back to a random policy (more episodes needed).
+def collect_goal_obs_multi(
+    jepa_checkpoint: str,
+    ppo_checkpoint: Optional[str],
+    trigger_achievement: str = "collect_wood",
+    max_goals: int = 5,
+    max_episodes: int = 300,
+    seed: int = 42,
+    device: torch.device = torch.device("cpu"),
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Collect up to max_goals PRE-achievement (obs, state) pairs for goal averaging.
+
+    More goal samples → more robust z_goal centroid that represents the
+    precondition across different spawn positions/trees rather than one
+    specific pixel configuration.
     """
     use_ppo = ppo_checkpoint is not None and Path(ppo_checkpoint).exists()
     if use_ppo:
@@ -154,14 +168,14 @@ def collect_goal_obs(
         print(f"[goal] collecting with PPO policy from {ppo_checkpoint}")
     else:
         policy = None
-        print(f"[goal] PPO checkpoint not found — using random policy "
-              f"(max_episodes raised to {max_episodes})")
+        print(f"[goal] PPO checkpoint not found — using random policy, "
+              f"collecting up to {max_goals} goal obs over {max_episodes} episodes")
 
     worker   = CrafterEnvWorker(seed, worker_id=0, reward_mode="reward")
     episodes = 0
+    goals: list[tuple[np.ndarray, np.ndarray]] = []
 
-    while episodes < max_episodes:
-        # Capture pre-step obs and game state BEFORE the action fires.
+    while episodes < max_episodes and len(goals) < max_goals:
         obs_np     = worker.obs.copy()
         pre_state  = worker.env.get_game_state()
         ach_before = set(worker.achievements)
@@ -177,31 +191,36 @@ def collect_goal_obs(
 
         _, _, done, info = worker.step(action_int)
 
+        fired = False
         if not done:
-            new_ach = worker.achievements - ach_before
-            if trigger_achievement in new_ach:
-                print(f"[goal] '{trigger_achievement}' fired (ep {episodes}, non-terminal) "
-                      f"— returning PRE-achievement obs")
-                return obs_np, pre_state
+            if trigger_achievement in (worker.achievements - ach_before):
+                fired = True
         else:
             if trigger_achievement in info.get("achievements", set()):
-                print(f"[goal] '{trigger_achievement}' fired (ep {episodes}, terminal) "
-                      f"— returning PRE-achievement obs")
-                return obs_np, pre_state
+                fired = True
             episodes += 1
             if use_ppo:
                 h           = policy.init_hidden(1, device)
                 prev_action = torch.full((1,), -1, dtype=torch.long, device=device)
-            if episodes % 20 == 0:
-                print(f"[goal] {episodes}/{max_episodes} episodes — trigger not yet fired")
-            continue
+            if episodes % 20 == 0 and not fired:
+                print(f"[goal] {episodes}/{max_episodes} ep, "
+                      f"{len(goals)}/{max_goals} goals collected")
 
-        if use_ppo:
+        if fired:
+            goals.append((obs_np, pre_state))
+            ep_type = "terminal" if done else "non-terminal"
+            print(f"[goal] '{trigger_achievement}' fired (ep {episodes}, {ep_type}) "
+                  f"— goal {len(goals)}/{max_goals} collected")
+
+        if not done and use_ppo:
             h           = h_next
             prev_action = torch.tensor([action_int], dtype=torch.long, device=device)
 
-    print(f"[goal] WARNING: '{trigger_achievement}' not fired in {max_episodes} episodes")
-    return None
+    if not goals:
+        print(f"[goal] WARNING: '{trigger_achievement}' not fired in {max_episodes} episodes")
+    else:
+        print(f"[goal] collected {len(goals)} pre-achievement observations")
+    return goals
 
 
 # ── experiments ───────────────────────────────────────────────────────────────
@@ -499,7 +518,7 @@ def run_chain_experiment(
 
 def run_precondition_experiment(
     planner: LatentPlanner,
-    goal_obs: np.ndarray,           # pre-achievement obs (player facing tree, etc.)
+    goal_obs: "np.ndarray | list[np.ndarray]",  # single obs or list → averaged latent
     trigger_achievement: str,
     n_trials: int = 5,
     n_subgoals: int = 3,
@@ -508,10 +527,10 @@ def run_precondition_experiment(
     max_memory: int = 2000,
     horizon: int = 15,
     beam_k: int = 10,
-    exec_steps: int = 5,
+    exec_steps: int = 1,
     switch_threshold: float = 0.20,
-    execute_threshold: float = 0.15,  # cos_dist below which to try the achievement action
-    execute_burst: int = 20,          # how many times to try the action per close encounter
+    execute_threshold: float = 0.30,  # cos_dist below which to try the achievement action
+    execute_burst: int = 30,          # how many times to try the action per close encounter
     seed: int = 42,
     device: torch.device = torch.device("cpu"),
     z_memory_seed: Optional[torch.Tensor] = None,
@@ -522,8 +541,17 @@ def run_precondition_experiment(
     Phase 2: subgoal chain navigates toward the PRE-achievement obs (player
              facing the target). When cos_dist < execute_threshold, fire the
              achievement action in a burst and check if the achievement fires.
+
+    goal_obs may be a list of pre-achievement observations; in that case z_goal
+    is the mean of their normalized latents (more robust across spawn positions).
     """
-    z_goal   = planner.encode_obs(goal_obs)      # (E,)
+    if isinstance(goal_obs, list):
+        z_goals  = [planner.encode_obs(g) for g in goal_obs]
+        # Mean of unit vectors → renormalise → centroid in ψ-space.
+        z_goal   = F.normalize(torch.stack(z_goals).mean(0), dim=-1)
+        print(f"[precondition] z_goal = mean of {len(z_goals)} pre-achievement latents")
+    else:
+        z_goal   = planner.encode_obs(goal_obs)
     z_goal_n = F.normalize(z_goal, dim=-1)
     E        = int(z_goal.shape[0])
     ach_action = ACHIEVEMENT_ACTIONS.get(trigger_achievement, 5)
@@ -598,6 +626,8 @@ def run_precondition_experiment(
 
             # Check if we're close enough to attempt the achievement action.
             if dist_to_goal < execute_threshold:
+                print(f"    [EXECUTE BURST] step={step}  dist={dist_to_goal:.3f} — "
+                      f"firing {execute_burst}x action {ach_action}")
                 for _ in range(execute_burst):
                     if step >= plan_steps:
                         break
@@ -793,17 +823,19 @@ def main() -> int:
             )
 
     if args.experiment == "precondition":
-        result = collect_goal_obs(
+        goal_list = collect_goal_obs_multi(
             args.jepa_checkpoint,
             args.ppo_checkpoint,
             trigger_achievement=args.trigger_achievement,
+            max_goals=5,
+            max_episodes=300,
             seed=args.seed,
             device=device,
         )
-        if result is None:
+        if not goal_list:
             print("[precondition] could not collect goal obs — aborting")
         else:
-            goal_obs, _goal_state = result
+            goal_obs_list = [obs for obs, _ in goal_list]
             z_mem_seed2: Optional[torch.Tensor] = None
             if args.memory_npz is not None and Path(args.memory_npz).exists():
                 z_mem_seed2 = load_memory_from_npz(
@@ -815,7 +847,7 @@ def main() -> int:
                 print(f"[precondition] WARNING: --memory-npz {args.memory_npz} not found, "
                       f"starting with empty memory")
             run_precondition_experiment(
-                planner, goal_obs,
+                planner, goal_obs_list,
                 trigger_achievement=args.trigger_achievement,
                 n_trials=args.trials,
                 n_subgoals=args.n_subgoals,
