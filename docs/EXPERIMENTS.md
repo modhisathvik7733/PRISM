@@ -1,8 +1,11 @@
 # Experiment Log — PRISM
 
-Single-env (v1.x) results on `BabyAI-GoToLocal-v0`. Multi-env (v2.x) results
-across the BabyAI go-to family. All evals run with
-`scripts/eval_agent_cohorts.py --episodes 1000 --max-steps 128` unless noted.
+Single-env (v1.x) RL results on `BabyAI-GoToLocal-v0`. Multi-env (v2.x) RL
+results across the BabyAI go-to family. Language-domain (v3.x) results test
+whether the structured-latent-middle thesis transfers from gridworld RL to
+text reasoning. All RL evals run with
+`scripts/eval_agent_cohorts.py --episodes 1000 --max-steps 128`; lang evals
+run via `scripts/lang/eval.py --episodes 1000` unless noted.
 
 ## Summary — single-env (GoToLocal-v0)
 
@@ -21,6 +24,113 @@ Multi-env policies trained jointly on the 3 envs below; evaluated separately on 
 |---------|--------|-------------:|--------:|-----------:|-------|
 | v1.3 zero-shot (universal JEPA) | `ppo_v6_pathB iter400` | 0.570 (59.5%) | 0.163 (17.2%) | 0.898 (94.4%) | Same v1.3 weights, but using v2 universal JEPA — quantifies the JEPA-swap penalty (~−36 pt on GoToLocal) |
 | **v2.0**| `v2_ppo_multienv policy_final` | **0.895 (94.6%)** | 0.178 (18.9%) | **0.965 (100%)** | Multi-env BC + multi-env PPO, 16 workers round-robin across 3 envs. Recipe transfers cleanly to GoToObj; GoTo's hidden-cohort exploration ceiling is unchanged from v1.3. |
+
+## Summary — language reasoning (v3.x)
+
+| Version | Model | Params | Task | mean_acc | Notes |
+|---------|-------|-------:|------|---------:|-------|
+| **v3.0**| `lang_t1_v1` (PRISM-Lang small, AR + JEPA-middle + AR) | 24M | Synthetic bAbI Task 1 (10k train) | **100.0%** | Architecture sanity check — proves the AR-edge + JEPA-middle stack can reach perfect accuracy on a controlled task. |
+| **v3.0**| `lang_all_v0 step ~14k` (same arch, real bAbI) | 24M | bAbI 1k variant, all 20 tasks | **57.3%** | Beats vanilla LSTM band (~30%), below pretrained-fine-tune band (~75%). Per-task breakdown shows architecture handles condensation tasks (3 tasks ≥85%) but plateaus on multi-hop reasoning, exactly the literature-predicted ceiling for a from-scratch transformer on bAbI 1k. |
+
+---
+
+## v3.0 — PRISM-Lang on bAbI
+
+**Date:** 2026-05-09
+**Architecture:** AR transformer encoder (4 layers, d=256) →
+LatentMiddle (8 thought tokens × 6 recurrent thinking steps + EMA-target
+JEPA aux loss) → AR transformer decoder cross-attending to thoughts only
+→ tied LM head over GPT-2 BPE vocab. 24,174,417 params.
+**Tag (suggested):** `v3.0-lang-babi-step14k`
+
+### Phase 1 — synthetic Task 1 (architecture validation)
+**Checkpoint:** `runs/lang_t1_v1/model_final.pt`
+**Final test_acc: 100.0% (1000 examples)**
+
+Trajectory: random → 49% by step 500 → 73% by step 2500 → 92% by 3500 →
+99.5% by 4500 → **100% from step 5000 onward**, held through step 8000.
+Train CE stayed in the 0.005-0.05 range (rule-learning, not memorization).
+
+This proves the architecture can reach the ceiling on a clean reasoning
+task. Required two fixes from the v0 attempt: (1) bump synthetic data
+1k → 10k so the 24M model can't trivially memorize; (2) mask-aware
+pooling in the middle's `ctx_to_thought` projection (without it, ~85%
+of the pool was PAD-position zeros at max_seq_len=256, drowning the
+content-conditioned thought-init bias).
+
+### Phase 2 — real bAbI all 20 tasks (1k variant)
+**Checkpoint:** `runs/lang_all_v0/model_step14000.pt` (best-loss
+checkpoint; the step-50000 final overfit hard, dropping to 50.5%).
+**Final test_acc: 57.3% mean (1000 examples per task)**
+
+Per-task breakdown:
+
+| task | name | acc% |
+|---:|---|---:|
+| 20 | agents-motivations | **96.9** |
+| 13 | compound-coreference | **92.1** |
+| 18 | size-reasoning | **85.4** |
+| 7 | counting | 73.3 |
+| 11 | basic-coreference | 69.8 |
+| 6 | yes-no-questions | 66.7 |
+| 9 | simple-negation | 66.2 |
+| 8 | lists-sets | 65.5 |
+| 12 | conjunction | 64.5 |
+| 4 | two-arg-relations | 64.2 |
+| 10 | indefinite-knowledge | 57.7 |
+| 17 | positional-reasoning | 56.1 |
+| 15 | basic-deduction | 50.8 |
+| 16 | basic-induction | 47.3 |
+| 1 | single-supporting-fact | 46.9 |
+| 5 | three-arg-relations | 45.9 |
+| 14 | time-reasoning | 35.8 |
+| 2 | two-supporting-facts | 32.9 |
+| 3 | three-supporting-facts | 18.5 |
+| 19 | path-finding | **8.6** |
+| **mean** | | **57.3** |
+
+### Headline conclusions
+- **Architecture handles whole-story condensation tasks** (3 tasks
+  ≥85%): tasks 13/18/20 are "synthesize the story → answer" patterns
+  that the K=8 thought tokens × N=6 cross-attn iterations match cleanly.
+- **Architecture plateaus on multi-hop sequential reasoning**: tasks 2
+  (32.9%), 3 (18.5%), 19 (8.6%) need explicit multi-step chains the
+  middle's recurrence at this scale cannot learn from 1k examples.
+- **Result is in the literature-predicted band** for a 24M from-scratch
+  transformer on bAbI 1k: above vanilla LSTM (~30%), below pretrained
+  GPT-2 fine-tune (~75-85%), well below purpose-built Memory Networks
+  (~93%).
+- **Output vocabulary is locked to bAbI's answer set**. Free-form
+  prompting reveals the LM head learned a closed answer distribution
+  (~10 location words, ~5 object words). OOV inputs like "hi" or
+  "Story: Alice walked to the library" get mapped to the nearest
+  bAbI-vocab token (`bathroom`, `kitchen`, etc). The encoder/middle
+  process the input fine — the decoder bottleneck collapses outputs
+  to learned vocab. **This motivates v3.1**: pretrained encoder+decoder
+  weights so the LM head is broad, with the middle layer trained from
+  scratch on top.
+- **Surprising weak point**: Task 1 at 46.9% (synthetic equivalent hit
+  100%). Real Task 1 stories are longer than the 2-6-sentence synthetic
+  variant; the model probably needs more thinking-step capacity for
+  long-context recency tracking.
+
+### What this proves about the JEPA-middle thesis
+The middle is doing real work — different inputs produce different
+(and sometimes correct) outputs across 20 distinct reasoning patterns.
+The `--show-mistakes` traces confirm the model is recall-pattern-
+matching rather than syntactic copying. But at 24M from-scratch, on 1k
+examples per task, it cannot learn the multi-hop chains that Memory
+Networks solve via task-specific architecture or that pretrained models
+solve via scale. The hypothesis ("structured latent middle adds
+inductive bias") is **partially supported** — a clean ablation against
+a matched-param vanilla AR baseline would isolate the middle's
+contribution; that's deferred to a follow-up.
+
+### Out of scope (deferred to v3.1)
+- Pretrained encoder/decoder backbones (the path to free-form English)
+- Coconut-style continuous-thought CoT replacement curriculum
+- Reasoning tasks with longer sequences (GSM8K math)
+- Matched-param vanilla AR baseline for clean architecture comparison
 
 ---
 
