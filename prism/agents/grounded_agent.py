@@ -161,7 +161,7 @@ class GroundedAgent:
         self.device = device
         self.horizon = horizon
         self.n_samples = max(1, n_samples)
-        if scoring_mode not in ("magnitude", "binary", "distance", "curriculum"):
+        if scoring_mode not in ("magnitude", "binary", "distance", "curriculum", "memory"):
             raise ValueError(f"unknown scoring_mode={scoring_mode!r}")
         self.scoring_mode = scoring_mode
         if scoring_mode == "distance":
@@ -190,12 +190,34 @@ class GroundedAgent:
         # alternate forward/turn when the target is hidden so the agent doesn't
         # walk into a wall and stall.
         self._explore_step = 0
+        # ----- Memory-mode state (Phase 3) ---------------------------------
+        # Memoryless agents cannot exceed ~0.4 mean reward in BabyAI partial-view
+        # because they re-visit the same cells when the target is hidden at t=0
+        # (55% of episodes). We track a relative-pose frame and the set of
+        # cells already visited so the policy can drive toward unexplored
+        # frontier cells. World-frame pose (relative to episode start):
+        #   facing 0 = initial-forward, 1 = right, 2 = back, 3 = left
+        self._mem_x = 0
+        self._mem_y = 0
+        self._mem_facing = 0
+        self._mem_visited: set[tuple[int, int]] = {(0, 0)}
+        self._mem_blocked: set[tuple[int, int]] = set()
+        self._mem_last_action: int | None = None
+        self._mem_last_obs: torch.Tensor | None = None
 
     def reset(self) -> None:
         """Call at the start of each episode so curriculum-mode exploration
         cycle starts fresh. Calling this from run_agent's run_episode keeps
         exploration deterministic across episodes for reproducibility."""
         self._explore_step = 0
+        # Reset memory-mode state
+        self._mem_x = 0
+        self._mem_y = 0
+        self._mem_facing = 0
+        self._mem_visited = {(0, 0)}
+        self._mem_blocked = set()
+        self._mem_last_action = None
+        self._mem_last_obs = None
 
     @torch.no_grad()
     def _curriculum_select(
@@ -298,6 +320,177 @@ class GroundedAgent:
         info["branch"] = "explore_fallback"
         return allowed[0], info
 
+    @staticmethod
+    def _step_xy(x: int, y: int, facing: int) -> tuple[int, int]:
+        """Return (x, y) one cell in front of the given pose.
+        Convention: facing 0 = +y (initial forward), 1 = +x (right of initial),
+        2 = -y (back), 3 = -x (left). Right-handed when seen from above."""
+        if facing == 0:
+            return x, y + 1
+        if facing == 1:
+            return x + 1, y
+        if facing == 2:
+            return x, y - 1
+        return x - 1, y  # facing == 3
+
+    @torch.no_grad()
+    def _memory_select(
+        self,
+        obs: torch.Tensor,
+        z_t: torch.Tensor,
+        baseline_probs: torch.Tensor,
+        goal_preds: list[WeightedGoal],
+        allowed_actions: tuple[int, ...] | None,
+    ) -> tuple[int, dict[str, float]]:
+        """Memory-equipped policy: pose tracking + frontier exploration.
+
+        The world model is used as in curriculum mode (current-state predicates
+        choose the action class; 1-step prediction breaks the binary turn-
+        direction tie when target is visible). The new bit is exploration:
+        when the target is hidden, the agent uses its tracked pose and the
+        set of visited cells to drive toward unexplored frontier cells, so it
+        doesn't re-visit the same area until timeout.
+
+        Pose update is delayed by one step: we only mark a forward as
+        successful (and update pose / visited) if the next observation
+        differs from the previous one. If the obs is unchanged, the front
+        cell is treated as blocked.
+        """
+        FORWARD, TURN_LEFT, TURN_RIGHT = 2, 0, 1
+
+        # 1. Reconcile pose from previous step.
+        last_a = self._mem_last_action
+        last_o = self._mem_last_obs
+        forward_blocked_now = False
+        if last_a == FORWARD and last_o is not None:
+            if torch.equal(obs, last_o):
+                # Forward last step did NOT move us — front cell at the time
+                # of last decision is blocked. We record that *world-frame*
+                # cell as blocked.
+                fx, fy = self._step_xy(self._mem_x, self._mem_y, self._mem_facing)
+                self._mem_blocked.add((fx, fy))
+                forward_blocked_now = True
+            else:
+                # Forward succeeded — update position.
+                self._mem_x, self._mem_y = self._step_xy(
+                    self._mem_x, self._mem_y, self._mem_facing
+                )
+                self._mem_visited.add((self._mem_x, self._mem_y))
+
+        # 2. Read goal predicates from current state.
+        idx_visible = idx_facing = idx_adjacent = None
+        for g in goal_preds:
+            if g.name == "visible":
+                idx_visible = g.flat_index
+            elif g.name == "facing":
+                idx_facing = g.flat_index
+            elif g.name == "adjacent":
+                idx_adjacent = g.flat_index
+        p_visible = float(baseline_probs[idx_visible].item()) if idx_visible is not None else 0.0
+        p_facing = float(baseline_probs[idx_facing].item()) if idx_facing is not None else 0.0
+        p_adjacent = float(baseline_probs[idx_adjacent].item()) if idx_adjacent is not None else 0.0
+
+        if allowed_actions is None:
+            allowed = tuple(range(self.n_actions))
+        else:
+            allowed = allowed_actions
+
+        info = {
+            "p_visible": p_visible,
+            "p_facing": p_facing,
+            "p_adjacent": p_adjacent,
+            "pose_x": float(self._mem_x),
+            "pose_y": float(self._mem_y),
+            "pose_facing": float(self._mem_facing),
+            "n_visited": float(len(self._mem_visited)),
+            "n_blocked": float(len(self._mem_blocked)),
+            "explored": 0.0,
+            "max_score": 0.0,
+        }
+
+        action = None
+        branch = ""
+
+        # 3. Action selection — curriculum hierarchy + frontier fallback.
+        # 3a. adjacent: forward
+        if p_adjacent > 0.5 and FORWARD in allowed and not forward_blocked_now:
+            action = FORWARD
+            branch = "adjacent"
+        # 3b. facing the goal AND not blocked: forward
+        elif p_facing > 0.5 and FORWARD in allowed and not forward_blocked_now:
+            action = FORWARD
+            branch = "facing"
+        # 3c. visible (but not facing / forward blocked): turn toward
+        elif p_visible > 0.5 and idx_facing is not None and (TURN_LEFT in allowed or TURN_RIGHT in allowed):
+            actions_t = torch.tensor([TURN_LEFT, TURN_RIGHT], device=self.device, dtype=torch.long)
+            expand_shape = (2,) + (-1,) * (z_t.ndim - 1)
+            z_rep = z_t.expand(*expand_shape)
+            z_next = self.jepa.predict(z_rep, actions_t)
+            next_probs = torch.sigmoid(self.probe(z_next))
+            p_face_left = float(next_probs[0, idx_facing].item())
+            p_face_right = float(next_probs[1, idx_facing].item())
+            action = TURN_LEFT if p_face_left >= p_face_right else TURN_RIGHT
+            branch = "rotate_to_face"
+        # 3d. target hidden OR forward currently blocked: frontier exploration
+        else:
+            action = self._frontier_action(allowed, forward_blocked_now)
+            branch = "frontier"
+
+        info["branch"] = branch
+        info["chosen"] = action
+
+        # 4. Local pose update for turn actions; forward update is deferred
+        # to next call's reconciliation step (we don't yet know if it succeeds).
+        if action == TURN_LEFT:
+            self._mem_facing = (self._mem_facing - 1) % 4
+        elif action == TURN_RIGHT:
+            self._mem_facing = (self._mem_facing + 1) % 4
+
+        # 5. Record for next-step reconciliation. Detach + clone to avoid
+        # holding GPU memory across steps.
+        self._mem_last_action = action
+        self._mem_last_obs = obs.detach().clone()
+        return action, info
+
+    def _frontier_action(self, allowed: tuple[int, ...], forward_blocked_now: bool) -> int:
+        """Pick action that drives the agent toward unvisited cells.
+
+        Strategy (cheap and local):
+          1. If the cell directly in front is unvisited and not known-blocked,
+             go forward.
+          2. Otherwise scan the 4 cardinal directions in {right, left, back}
+             order and turn toward the first one whose target cell is unvisited
+             and not known-blocked. Turning back = one turn now, the next call
+             will continue the rotation.
+          3. If every direction is visited or blocked, fall through to forward
+             (or, if forward is blocked, turn right) so we don't deadlock.
+        """
+        FORWARD, TURN_LEFT, TURN_RIGHT = 2, 0, 1
+        x, y, facing = self._mem_x, self._mem_y, self._mem_facing
+
+        # Helper: is (cell) a fresh frontier?
+        def fresh(cell: tuple[int, int]) -> bool:
+            return cell not in self._mem_visited and cell not in self._mem_blocked
+
+        front = self._step_xy(x, y, facing)
+        # 1. forward into a fresh cell
+        if FORWARD in allowed and not forward_blocked_now and fresh(front):
+            return FORWARD
+
+        # 2. turn toward a fresh-cell direction
+        for dir_offset, turn in ((1, TURN_RIGHT), (-1, TURN_LEFT), (2, TURN_RIGHT)):
+            new_facing = (facing + dir_offset) % 4
+            target = self._step_xy(x, y, new_facing)
+            if fresh(target) and turn in allowed:
+                return turn
+
+        # 3. all known options exhausted — break out of the local trap.
+        if FORWARD in allowed and not forward_blocked_now:
+            return FORWARD
+        if TURN_RIGHT in allowed:
+            return TURN_RIGHT
+        return allowed[0]
+
     @torch.no_grad()
     def select_action(
         self,
@@ -348,6 +541,8 @@ class GroundedAgent:
         # (which way to turn when target visible but not facing).
         if self.scoring_mode == "curriculum":
             return self._curriculum_select(z_t, baseline_probs, goal_preds, allowed_actions)
+        if self.scoring_mode == "memory":
+            return self._memory_select(obs, z_t, baseline_probs, goal_preds, allowed_actions)
         # ----------------------------------------------------------------------
 
         # Multi-sample rollouts: for each candidate first action, simulate

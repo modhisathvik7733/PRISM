@@ -124,7 +124,7 @@ def main() -> int:
     parser.add_argument("--horizon", type=int, default=4)
     parser.add_argument("--n-samples", type=int, default=8)
     parser.add_argument("--scoring-mode", default="magnitude",
-                        choices=["magnitude", "binary", "distance", "curriculum"])
+                        choices=["magnitude", "binary", "distance", "curriculum", "memory"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()

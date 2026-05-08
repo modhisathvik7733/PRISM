@@ -158,7 +158,7 @@ def main() -> int:
                         help="random follow-up samples per first action (variance "
                              "reduction). 8 keeps single-step latency negligible.")
     parser.add_argument("--scoring-mode", default="magnitude",
-                        choices=["magnitude", "binary", "distance", "curriculum"],
+                        choices=["magnitude", "binary", "distance", "curriculum", "memory"],
                         help="magnitude (default) = raw prob diff. binary = score "
                              "predicate FLIPS only. distance = use the 24-d "
                              "continuous distance head (requires JEPA trained with "
