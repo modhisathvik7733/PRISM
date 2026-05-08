@@ -382,6 +382,37 @@ class GroundedAgent:
         gt, gc = weighted_goal.type_id, weighted_goal.color_id
         return any(s.type_id == gt and s.color_id == gc for s in slots_list)
 
+    def _slot_rotate_when_visible(self, slots_list, weighted_goal,
+                                   allowed: tuple[int, ...]) -> int:
+        """Component A: deterministic slot-geometry rotation for branch 3 of
+        `_memory_select` when `p_visible > 0.5` AND the goal slot is in view.
+
+        Picks the turn direction that brings the closest goal slot into the
+        agent's forward arc:
+          slot.x <  agent.x → TURN_LEFT
+          slot.x >  agent.x → TURN_RIGHT
+          slot.x == agent.x → TURN_RIGHT (symmetric tie-break; the slot is at
+                              the agent's column but not in the forward arc,
+                              i.e. directly behind or beside — either turn
+                              eventually finds it).
+
+        Slot extraction is perception (no learning), so this is ~100%
+        precision compared to the 1-step model prediction's F1=0.57.
+        """
+        TURN_LEFT, TURN_RIGHT = 0, 1
+        ax, ay = AGENT_POS
+        gt, gc = weighted_goal.type_id, weighted_goal.color_id
+        cands = [s for s in slots_list if s.type_id == gt and s.color_id == gc]
+        target = min(cands, key=lambda s: abs(s.x - ax) + abs(s.y - ay))
+        if target.x < ax and TURN_LEFT in allowed:
+            return TURN_LEFT
+        if target.x > ax and TURN_RIGHT in allowed:
+            return TURN_RIGHT
+        # target.x == ax: behind / directly beside; default to a right rotation.
+        if TURN_RIGHT in allowed:
+            return TURN_RIGHT
+        return allowed[0]
+
     def _slot_rotate_fallback(self, slots_list, weighted_goal,
                               allowed: tuple[int, ...],
                               forward_blocked_now: bool) -> int:
@@ -539,17 +570,32 @@ class GroundedAgent:
         elif p_facing > 0.5 and FORWARD in allowed and not forward_blocked_now:
             action = FORWARD
             branch = "facing"
-        # 3c. visible (but not facing / forward blocked): turn toward
+        # 3c. visible (but not facing / forward blocked): turn toward.
+        # Component A (Phase 3): when the goal slot is in the current view,
+        # use deterministic slot geometry (~100% precision) instead of the
+        # 1-step JEPA prediction (turn F1=0.57 → ~43% wrong). The model
+        # prediction stays as a fallback for the rare case where the predicate
+        # fires but the slot extraction misses the goal (edge cases).
         elif p_visible > 0.5 and idx_facing is not None and (TURN_LEFT in allowed or TURN_RIGHT in allowed):
-            actions_t = torch.tensor([TURN_LEFT, TURN_RIGHT], device=self.device, dtype=torch.long)
-            expand_shape = (2,) + (-1,) * (z_t.ndim - 1)
-            z_rep = z_t.expand(*expand_shape)
-            z_next = self.jepa.predict(z_rep, actions_t)
-            next_probs = torch.sigmoid(self.probe(z_next))
-            p_face_left = float(next_probs[0, idx_facing].item())
-            p_face_right = float(next_probs[1, idx_facing].item())
-            action = TURN_LEFT if p_face_left >= p_face_right else TURN_RIGHT
-            branch = "rotate_to_face"
+            if goal_preds and self._goal_in_slots(slots_list, goal_preds[0]):
+                # Slot-geometry rotation — pick the turn direction that brings
+                # the closest goal slot into the forward arc.
+                action = self._slot_rotate_when_visible(
+                    slots_list, goal_preds[0], allowed
+                )
+                branch = "rotate_to_face_slot"
+            else:
+                # Predicate says visible but slot extraction missed the goal.
+                # Fall back to the original 1-step model rotation.
+                actions_t = torch.tensor([TURN_LEFT, TURN_RIGHT], device=self.device, dtype=torch.long)
+                expand_shape = (2,) + (-1,) * (z_t.ndim - 1)
+                z_rep = z_t.expand(*expand_shape)
+                z_next = self.jepa.predict(z_rep, actions_t)
+                next_probs = torch.sigmoid(self.probe(z_next))
+                p_face_left = float(next_probs[0, idx_facing].item())
+                p_face_right = float(next_probs[1, idx_facing].item())
+                action = TURN_LEFT if p_face_left >= p_face_right else TURN_RIGHT
+                branch = "rotate_to_face_model"
         # 3d. predicate dipped < 0.5 but the goal is actually in the current
         # slot extraction — fall back to slot-based rotate so we don't redirect
         # via cache to a position we're already next to.
