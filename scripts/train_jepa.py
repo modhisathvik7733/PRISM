@@ -33,7 +33,11 @@ import minigrid  # noqa: F401  (registers BabyAI envs)
 
 from prism.envs.babyai import _encode_image
 from prism.models.jepa import JepaConfig, JepaWorldModel
-from prism.perception import compute_predicates, extract_slots
+from prism.perception import (
+    compute_augmented_predicates,
+    compute_predicates,
+    extract_slots,
+)
 from prism.utils.seed import set_global_seed
 
 
@@ -43,6 +47,7 @@ def collect_random_transitions(
     rng: np.random.Generator,
     *,
     with_predicates: bool = False,
+    augmented: bool = False,
 ):
     """Collect n one-step transitions under random policy.
 
@@ -70,8 +75,9 @@ def collect_random_transitions(
         act_list.append(a)
         obs_tp1_list.append(_encode_image(raw_tp1))
         if with_predicates:
-            pred_t_list.append(compute_predicates(extract_slots(raw_t)))
-            pred_tp1_list.append(compute_predicates(extract_slots(raw_tp1)))
+            pred_fn = compute_augmented_predicates if augmented else compute_predicates
+            pred_t_list.append(pred_fn(extract_slots(raw_t)))
+            pred_tp1_list.append(pred_fn(extract_slots(raw_tp1)))
 
         if term or trunc:
             obs, _ = env.reset(seed=int(rng.integers(0, 1_000_000)))
@@ -114,6 +120,19 @@ def main() -> int:
              "a small predicate readout head and forces the encoder to preserve "
              "object-typed information that pure next-state prediction discards. "
              "Try 1.0 as a starting point."
+    )
+    parser.add_argument(
+        "--aux-distance-dim", type=int, default=0,
+        help="Continuous-distance head dim. 0 = binary-only (legacy 96 head). "
+             "24 = enable distance head: aux head outputs 96 binary logits + "
+             "24 sigmoid-distance regressors. Distance gives the agent a smooth "
+             "gradient signal (forward → 1 cell closer) that binary predicates "
+             "cannot — addresses the 'spinning in place' failure where forward "
+             "scores 0 because no predicate flips per step."
+    )
+    parser.add_argument(
+        "--aux-distance-weight", type=float, default=1.0,
+        help="MSE scale for distance head relative to BCE for binary head."
     )
     parser.add_argument(
         "--agent-data-path", default=None,
@@ -162,6 +181,8 @@ def main() -> int:
     device = torch.device(args.device)
 
     aux_tag = f"_aux{args.aux_predicate_weight:g}" if args.aux_predicate_weight > 0 else ""
+    if args.aux_distance_dim > 0:
+        aux_tag += f"_dist{args.aux_distance_dim}"
     mix_tag = (
         f"_mix{args.agent_data_mix:g}" if args.agent_data_path is not None else ""
     )
@@ -193,6 +214,8 @@ def main() -> int:
         n_actions=n_actions,
         encoder_type=args.encoder_type,
         aux_predicate_weight=args.aux_predicate_weight,
+        aux_distance_dim=args.aux_distance_dim,
+        aux_distance_weight=args.aux_distance_weight,
         dynamics_hidden_dim=args.dynamics_hidden,
         dynamics_layers=args.dynamics_layers,
         dynamics_type=args.dynamics_type,
@@ -210,6 +233,9 @@ def main() -> int:
     obs_t_buf = act_buf = obs_tp1_buf = pred_t_buf = pred_tp1_buf = None
     loss_window = deque(maxlen=200)
     use_aux = args.aux_predicate_weight > 0.0
+    use_distance = args.aux_distance_dim > 0
+    if use_distance:
+        print(f"[train] distance head enabled: dim={args.aux_distance_dim} weight={args.aux_distance_weight}")
 
     # Optional agent data — pre-collected goal-directed trajectories from
     # scripts/collect_agent_data.py. We sample a fraction of every batch
@@ -241,7 +267,8 @@ def main() -> int:
             (
                 obs_t_buf, act_buf, obs_tp1_buf, pred_t_buf, pred_tp1_buf
             ) = collect_random_transitions(
-                args.env_id, args.rollout_size, rng, with_predicates=use_aux
+                args.env_id, args.rollout_size, rng,
+                with_predicates=use_aux, augmented=use_distance,
             )
 
         # ------------------------------------------------ build batch
@@ -318,6 +345,12 @@ def main() -> int:
                 aux_tp1_val = out["loss_aux_tp1"].item()
                 writer.add_scalar("loss/aux_tp1", aux_tp1_val, step)
                 aux_str += f" aux_tp1={aux_tp1_val:.4f}"
+            if "loss_dist_t" in out:
+                writer.add_scalar("loss/dist_t", out["loss_dist_t"].item(), step)
+                aux_str += f" dist_t={out['loss_dist_t'].item():.4f}"
+            if "loss_dist_tp1" in out:
+                writer.add_scalar("loss/dist_tp1", out["loss_dist_tp1"].item(), step)
+                aux_str += f" dist_tp1={out['loss_dist_tp1'].item():.4f}"
             print(
                 f"[step {step:6d}] loss={loss.item():.4f} "
                 f"pred={out['loss_pred'].item():.4f} reg={out['loss_reg'].item():.4f}"

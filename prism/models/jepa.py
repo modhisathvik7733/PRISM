@@ -55,6 +55,17 @@ class JepaConfig:
     # encoder can satisfy next-state prediction without encoding object types).
     aux_predicate_weight: float = 0.0
     aux_predicate_dim: int = 96  # PREDICATE_VECTOR_DIM — keep in sync
+    # Continuous distance head dimension. >0 extends the aux head output to
+    # `aux_predicate_dim + aux_distance_dim`; the binary block uses BCE, the
+    # distance block uses MSE on sigmoid output. 24 = NUM_TYPE_COLOR_PAIRS.
+    # Distance gives the agent a smooth gradient signal that the binary set
+    # cannot — for "target visible 5 cells away," every binary predicate is
+    # constant across forward steps, so the agent has no reason to prefer
+    # forward over turn. Distance is monotone-decreasing under forward when
+    # facing, so forward becomes scoreable. Default 0 = back-compat with old
+    # 96-d-only checkpoints.
+    aux_distance_dim: int = 0
+    aux_distance_weight: float = 1.0  # MSE scale relative to BCE
     # LatentDynamics capacity. Defaults reproduce the original 3-linear-layer
     # MLP (Linear(in,h)-GELU-Linear(h,h)-GELU-Linear(h,out)). dynamics_layers
     # counts the (Linear+GELU) blocks before the output projection — so 2 = current.
@@ -429,16 +440,19 @@ class JepaWorldModel(nn.Module):
         # keys (`aux_predicate_head.weight/bias`) still load.
         self.aux_predicate_head: nn.Module | None = None
         if getattr(self.cfg, "aux_predicate_weight", 0.0) > 0.0:
+            # Output is [predicate_logits (P) ‖ distance_logits (D)]. D=0 keeps
+            # the head shape identical to old 96-only checkpoints.
+            P = self.cfg.aux_predicate_dim
+            D = getattr(self.cfg, "aux_distance_dim", 0)
+            out_dim = P + D
             if _is_spatial_encoder(self.cfg):
                 C = getattr(self.cfg, "spatial_channels", 64)
                 in_dim = C * self.cfg.obs_h * self.cfg.obs_w
                 self.aux_predicate_head = nn.Sequential(
-                    nn.Flatten(), nn.Linear(in_dim, self.cfg.aux_predicate_dim)
+                    nn.Flatten(), nn.Linear(in_dim, out_dim)
                 )
             else:
-                self.aux_predicate_head = nn.Linear(
-                    self.cfg.embed_dim, self.cfg.aux_predicate_dim
-                )
+                self.aux_predicate_head = nn.Linear(self.cfg.embed_dim, out_dim)
         self._init_target_from_online()
 
     @torch.no_grad()
@@ -512,20 +526,34 @@ class JepaWorldModel(nn.Module):
         # came out wrong (capstone failure mode in v0.2).
         aux_w = getattr(self.cfg, "aux_predicate_weight", 0.0)
         if aux_w > 0.0 and self.aux_predicate_head is not None:
+            P = self.cfg.aux_predicate_dim
+            D = getattr(self.cfg, "aux_distance_dim", 0)
+            d_w = getattr(self.cfg, "aux_distance_weight", 1.0)
             if predicates_t is not None:
-                pred_logits_t = self.aux_predicate_head(z_t)
-                l_aux_t = F.binary_cross_entropy_with_logits(pred_logits_t, predicates_t)
+                logits_t = self.aux_predicate_head(z_t)
+                l_aux_t = F.binary_cross_entropy_with_logits(
+                    logits_t[:, :P], predicates_t[:, :P]
+                )
                 total = total + aux_w * l_aux_t
                 out["loss_aux_t"] = l_aux_t.detach()
-                # Backward compat alias for callers that still log "loss_aux".
-                out["loss_aux"] = l_aux_t.detach()
+                out["loss_aux"] = l_aux_t.detach()  # back-compat
+                if D > 0 and predicates_t.shape[1] >= P + D:
+                    dist_pred_t = torch.sigmoid(logits_t[:, P:P + D])
+                    l_dist_t = F.mse_loss(dist_pred_t, predicates_t[:, P:P + D])
+                    total = total + aux_w * d_w * l_dist_t
+                    out["loss_dist_t"] = l_dist_t.detach()
             if predicates_tp1 is not None:
-                pred_logits_tp1 = self.aux_predicate_head(z_pred)
+                logits_tp1 = self.aux_predicate_head(z_pred)
                 l_aux_tp1 = F.binary_cross_entropy_with_logits(
-                    pred_logits_tp1, predicates_tp1
+                    logits_tp1[:, :P], predicates_tp1[:, :P]
                 )
                 total = total + aux_w * l_aux_tp1
                 out["loss_aux_tp1"] = l_aux_tp1.detach()
+                if D > 0 and predicates_tp1.shape[1] >= P + D:
+                    dist_pred_tp1 = torch.sigmoid(logits_tp1[:, P:P + D])
+                    l_dist_tp1 = F.mse_loss(dist_pred_tp1, predicates_tp1[:, P:P + D])
+                    total = total + aux_w * d_w * l_dist_tp1
+                    out["loss_dist_tp1"] = l_dist_tp1.detach()
 
         out["loss"] = total
         return out

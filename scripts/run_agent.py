@@ -157,12 +157,12 @@ def main() -> int:
                         help="random follow-up samples per first action (variance "
                              "reduction). 8 keeps single-step latency negligible.")
     parser.add_argument("--scoring-mode", default="magnitude",
-                        choices=["magnitude", "binary"],
+                        choices=["magnitude", "binary", "distance"],
                         help="magnitude (default) = raw prob diff. binary = score "
-                             "predicate FLIPS only (>0.5 threshold). Binary silences "
-                             "noise-floor amplification on rare predicates "
-                             "(adjacent base rate 0.7%) where weight 8 × turn-noise "
-                             "0.4 = +3.2 fake advantage.")
+                             "predicate FLIPS only. distance = use the 24-d "
+                             "continuous distance head (requires JEPA trained with "
+                             "--aux-distance-dim 24); score = base_dist − next_dist, "
+                             "smooth gradient even when no predicate flips.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--verbose", action="store_true",

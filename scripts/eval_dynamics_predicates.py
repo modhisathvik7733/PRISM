@@ -39,7 +39,11 @@ import torch
 
 from prism.envs.babyai import _encode_image
 from prism.models.jepa import JepaConfig, JepaWorldModel, upgrade_config
-from prism.perception import compute_predicates, extract_slots
+from prism.perception import (
+    compute_augmented_predicates,
+    compute_predicates,
+    extract_slots,
+)
 from prism.perception.predicates import (
     NUM_TYPE_COLOR_PAIRS,
     PREDICATE_NAMES,
@@ -48,12 +52,14 @@ from prism.perception.predicates import (
 from prism.utils.seed import set_global_seed
 
 
-def collect(env, n_episodes: int, max_steps: int, rng: np.random.Generator):
+def collect(env, n_episodes: int, max_steps: int, rng: np.random.Generator,
+            *, augmented: bool = False):
     """Random-policy rollouts. Returns parallel arrays:
        obs_t (N,3,7,7), actions (N,), obs_tp1 (N,3,7,7),
-       preds_t (N,96), preds_tp1 (N,96).
+       preds_t (N,96 or 120), preds_tp1 (N,96 or 120).
     """
     obs_t, actions, obs_tp1, preds_t, preds_tp1 = [], [], [], [], []
+    pred_fn = compute_augmented_predicates if augmented else compute_predicates
     for _ in range(n_episodes):
         obs, _ = env.reset(seed=int(rng.integers(0, 1_000_000)))
         for _ in range(max_steps):
@@ -65,8 +71,8 @@ def collect(env, n_episodes: int, max_steps: int, rng: np.random.Generator):
             obs_t.append(_encode_image(raw_t))
             actions.append(a)
             obs_tp1.append(_encode_image(raw_tp1))
-            preds_t.append(compute_predicates(extract_slots(raw_t)))
-            preds_tp1.append(compute_predicates(extract_slots(raw_tp1)))
+            preds_t.append(pred_fn(extract_slots(raw_t)))
+            preds_tp1.append(pred_fn(extract_slots(raw_tp1)))
 
             if term or trunc:
                 break
@@ -198,43 +204,90 @@ def main() -> int:
         raise SystemExit("checkpoint has no aux_predicate_head — train with aux_predicate_weight > 0")
     print(f"[eval-l3] loaded checkpoint trained for {ckpt.get('step', '?')} steps")
 
+    aux_dist_dim = getattr(cfg, "aux_distance_dim", 0)
+    augmented = aux_dist_dim > 0
+    print(f"[eval-l3] aux_distance_dim={aux_dist_dim} (augmented={augmented})")
     print(f"[eval-l3] collecting {args.episodes} episodes (held-out seeds) ...")
     env = gym.make(args.env_id)
     rng = np.random.default_rng(args.seed)
-    obs_t, acts, obs_tp1, gt_t, gt_tp1 = collect(env, args.episodes, args.max_steps, rng)
+    obs_t, acts, obs_tp1, gt_t, gt_tp1 = collect(
+        env, args.episodes, args.max_steps, rng, augmented=augmented,
+    )
     n = len(acts)
     print(f"[eval-l3] N transitions = {n}")
-    print(f"[eval-l3] preds_t  positive rate = {gt_t.mean():.4f}")
-    print(f"[eval-l3] preds_tp1 positive rate = {gt_tp1.mean():.4f}")
+    # Slice ground truth into binary block (first 96) and distance block (last 24).
+    gt_bin_t, gt_bin_tp1 = gt_t[:, :PREDICATE_VECTOR_DIM], gt_tp1[:, :PREDICATE_VECTOR_DIM]
+    gt_dist_t = gt_t[:, PREDICATE_VECTOR_DIM:] if augmented else None
+    gt_dist_tp1 = gt_tp1[:, PREDICATE_VECTOR_DIM:] if augmented else None
+    print(f"[eval-l3] preds_t  positive rate = {gt_bin_t.mean():.4f}")
+    print(f"[eval-l3] preds_tp1 positive rate = {gt_bin_tp1.mean():.4f}")
+    if augmented:
+        print(f"[eval-l3] dist_t  mean = {gt_dist_t.mean():.4f}  min = {gt_dist_t.min():.4f}")
+        print(f"[eval-l3] dist_tp1 mean = {gt_dist_tp1.mean():.4f}  min = {gt_dist_tp1.min():.4f}")
 
     # Encode and predict.
     z_t = encode_all(model, obs_t, device)                  # online encoder, what the agent uses
     z_tp1_enc = encode_target_all(model, obs_tp1, device)   # EMA target encoder, training target
     z_tp1_pred = predict_all(model, z_t, acts, device)
 
-    probs_t = head_probs(model, z_t)
-    probs_enc_tp1 = head_probs(model, z_tp1_enc)
-    probs_pred_tp1 = head_probs(model, z_tp1_pred)
+    # The aux head outputs PREDICATE_VECTOR_DIM (96) + aux_distance_dim (0 or 24).
+    # We sigmoid the binary block for F1 and sigmoid the distance block for MAE.
+    P = PREDICATE_VECTOR_DIM
+    probs_t_full = head_probs(model, z_t)
+    probs_enc_tp1_full = head_probs(model, z_tp1_enc)
+    probs_pred_tp1_full = head_probs(model, z_tp1_pred)
+
+    probs_t, probs_enc_tp1, probs_pred_tp1 = (
+        probs_t_full[:, :P], probs_enc_tp1_full[:, :P], probs_pred_tp1_full[:, :P]
+    )
 
     print("\n=== aggregate accuracies (threshold 0.5) ===")
-    report_block("acc_t",        probs_t,         gt_t)
-    report_block("acc_enc_tp1",  probs_enc_tp1,   gt_tp1)
-    report_block("acc_pred_tp1", probs_pred_tp1,  gt_tp1)
+    report_block("acc_t",        probs_t,         gt_bin_t)
+    report_block("acc_enc_tp1",  probs_enc_tp1,   gt_bin_tp1)
+    report_block("acc_pred_tp1", probs_pred_tp1,  gt_bin_tp1)
 
     print("\n=== per-predicate F1 ===")
-    report_per_predicate("at z_t",                 probs_t,         gt_t)
-    report_per_predicate("at encode(s_{t+1})",     probs_enc_tp1,   gt_tp1)
-    report_per_predicate("at predict(z_t, a_t)",   probs_pred_tp1,  gt_tp1)
+    report_per_predicate("at z_t",                 probs_t,         gt_bin_t)
+    report_per_predicate("at encode(s_{t+1})",     probs_enc_tp1,   gt_bin_tp1)
+    report_per_predicate("at predict(z_t, a_t)",   probs_pred_tp1,  gt_bin_tp1)
 
     print("\n=== per-action breakdown (predicted t+1) ===")
-    report_per_action(probs_pred_tp1, gt_tp1, acts, model.cfg.n_actions)
+    report_per_action(probs_pred_tp1, gt_bin_tp1, acts, model.cfg.n_actions)
 
     print("\n=== predicate preservation (the agent's failure mode) ===")
-    report_target_preservation(probs_pred_tp1, gt_t, gt_tp1)
+    report_target_preservation(probs_pred_tp1, gt_bin_t, gt_bin_tp1)
+
+    if augmented:
+        print("\n=== distance head (MAE on continuous dim, lower = better) ===")
+        d_t = probs_t_full[:, P:]
+        d_enc_tp1 = probs_enc_tp1_full[:, P:]
+        d_pred_tp1 = probs_pred_tp1_full[:, P:]
+        # Overall MAE
+        print(f"  d_t           MAE = {np.abs(d_t - gt_dist_t).mean():.4f}")
+        print(f"  d_enc_tp1     MAE = {np.abs(d_enc_tp1 - gt_dist_tp1).mean():.4f}")
+        print(f"  d_pred_tp1    MAE = {np.abs(d_pred_tp1 - gt_dist_tp1).mean():.4f}")
+        # Per-action MAE — the rotation question. If turn-action distance MAE
+        # is much higher than forward, distance scoring will still under-pick
+        # forward when it should win.
+        print("  per-action distance MAE [predict(z_t, a)]:")
+        for a in range(model.cfg.n_actions):
+            mask = acts == a
+            if mask.sum() < 32:
+                print(f"    action {a}: n={mask.sum()} (too few)")
+                continue
+            mae = float(np.abs(d_pred_tp1[mask] - gt_dist_tp1[mask]).mean())
+            print(f"    action {a}: n={mask.sum():5d}  MAE={mae:.4f}")
+        # MAE restricted to the 1-2 distance bins where the agent actually
+        # operates (target visible in view): excludes the trivial "not visible
+        # → 1.0" entries which are easy.
+        visible_mask = gt_dist_tp1 < 0.99
+        if visible_mask.sum() > 0:
+            mae_vis = float(np.abs(d_pred_tp1[visible_mask] - gt_dist_tp1[visible_mask]).mean())
+            print(f"  d_pred_tp1 MAE | target visible: {mae_vis:.4f}  (n={int(visible_mask.sum())})")
 
     # Verdict
-    _, _, _, f1_t = f1((probs_t >= 0.5).astype(np.int8), gt_t.astype(np.int8))
-    _, _, _, f1_pred = f1((probs_pred_tp1 >= 0.5).astype(np.int8), gt_tp1.astype(np.int8))
+    _, _, _, f1_t = f1((probs_t >= 0.5).astype(np.int8), gt_bin_t.astype(np.int8))
+    _, _, _, f1_pred = f1((probs_pred_tp1 >= 0.5).astype(np.int8), gt_bin_tp1.astype(np.int8))
     drop = f1_t - f1_pred
     print("\n=== verdict ===")
     print(f"  F1(z_t)              = {f1_t:.3f}")

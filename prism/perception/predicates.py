@@ -35,6 +35,18 @@ NUM_PREDICATES = len(PREDICATE_NAMES)
 NUM_TYPE_COLOR_PAIRS = NUM_TYPES * NUM_COLORS  # 24
 PREDICATE_VECTOR_DIM = NUM_TYPE_COLOR_PAIRS * NUM_PREDICATES  # 96
 
+# Continuous per-(type, color) distance vector concatenated after the binary
+# predicates. Provides a smooth gradient for the agent ("forward gets me 1
+# cell closer") that the binary predicates cannot — the binary set only flips
+# at threshold crossings (visible/near/adjacent), so for "target visible but
+# 5 cells away" no predicate changes per forward step and the agent has no
+# reason to prefer forward over turn.
+DISTANCE_VECTOR_DIM = NUM_TYPE_COLOR_PAIRS  # 24
+AUGMENTED_VECTOR_DIM = PREDICATE_VECTOR_DIM + DISTANCE_VECTOR_DIM  # 120
+# Max manhattan distance from any cell in 7x7 view to the agent at (3, 6):
+# corner (6, 0) → |6-3| + |0-6| = 9. Use as the normalizer so distance ∈ [0, 1].
+MAX_VIEW_MANHATTAN = 9.0
+
 NEAR_THRESHOLD = 2
 ADJACENT_THRESHOLD = 1
 
@@ -59,6 +71,14 @@ def predicate_index(predicate: str, type_id: int, color_id: int) -> int:
             f"unknown predicate {predicate!r} (want one of {PREDICATE_NAMES})"
         ) from e
     return pi * NUM_TYPE_COLOR_PAIRS + type_color_index(type_id, color_id)
+
+
+def distance_index(type_id: int, color_id: int) -> int:
+    """(type_id, color_id) → flat index into the 24-d distance block of the
+    augmented 120-d vector. The distance block sits *after* the 96 binary
+    predicates: idx = PREDICATE_VECTOR_DIM + type_color_index.
+    """
+    return PREDICATE_VECTOR_DIM + type_color_index(type_id, color_id)
 
 
 def _is_facing(slot: Slot) -> bool:
@@ -100,6 +120,36 @@ def compute_predicates(slots: list[Slot]) -> np.ndarray:
             out[predicate_index("facing", s.type_id, s.color_id)] = 1.0
 
     return out
+
+
+def compute_distances(slots: list[Slot]) -> np.ndarray:
+    """Per-(type, color) min normalized manhattan distance, 1.0 if not visible.
+
+    Returns a flat (24,) float32 vector. Distance is normalized by
+    `MAX_VIEW_MANHATTAN` so all values are in [0, 1]. Missing pairs default
+    to 1.0 (max). The agent minimizes this for the goal pair.
+    """
+    out = np.ones(NUM_TYPE_COLOR_PAIRS, dtype=np.float32)
+    ax, ay = AGENT_POS
+    for s in slots:
+        if s.type_id not in OBJECT_TYPES:
+            continue
+        d = abs(s.x - ax) + abs(s.y - ay)
+        idx = type_color_index(s.type_id, s.color_id)
+        d_norm = min(1.0, d / MAX_VIEW_MANHATTAN)
+        if d_norm < out[idx]:
+            out[idx] = d_norm
+    return out
+
+
+def compute_augmented_predicates(slots: list[Slot]) -> np.ndarray:
+    """Concatenated [96 binary predicates ‖ 24 normalized distances] = (120,).
+
+    This is the JEPA's aux-head training target when distance-augmented
+    training is enabled. The first 96 dims supervise the binary head with
+    BCE; the last 24 supervise the distance head with MSE.
+    """
+    return np.concatenate([compute_predicates(slots), compute_distances(slots)])
 
 
 def predicate_summary(vec: np.ndarray) -> list[tuple[str, str, str]]:

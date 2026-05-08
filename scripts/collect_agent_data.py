@@ -41,7 +41,11 @@ from prism.agents import GroundedAgent, goal_predicates_for_mission
 from prism.agents.grounded_agent import allowed_actions_for_spec
 from prism.envs.babyai import _encode_image
 from prism.models.jepa import JepaConfig, JepaWorldModel, upgrade_config
-from prism.perception import compute_predicates, extract_slots
+from prism.perception import (
+    compute_augmented_predicates,
+    compute_predicates,
+    extract_slots,
+)
 from prism.utils.seed import set_global_seed
 
 
@@ -61,6 +65,11 @@ def main() -> int:
         "--filter", default="all", choices=["all", "success", "partial"],
         help="all = save every transition. success = only episodes with reward>0.7. "
              "partial = reward>0 (any progress)."
+    )
+    parser.add_argument(
+        "--augmented", action="store_true",
+        help="emit augmented 120-d predicates (96 binary + 24 distance). "
+             "Required when used to train a JEPA with --aux-distance-dim 24."
     )
     args = parser.parse_args()
 
@@ -111,13 +120,14 @@ def main() -> int:
                 obs_t, goal_preds, allowed_actions=allowed
             )
 
-            preds_t = compute_predicates(extract_slots(raw_t))
+            pred_fn = compute_augmented_predicates if args.augmented else compute_predicates
+            preds_t = pred_fn(extract_slots(raw_t))
 
             next_obs, r, term, trunc, _ = env.step(action)
             ep_reward += float(r)
             raw_tp1 = next_obs["image"]
             encoded_tp1 = _encode_image(raw_tp1)
-            preds_tp1 = compute_predicates(extract_slots(raw_tp1))
+            preds_tp1 = pred_fn(extract_slots(raw_tp1))
 
             ep_buf.append((encoded_t, action, encoded_tp1, preds_t, preds_tp1))
 

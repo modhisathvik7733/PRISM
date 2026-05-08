@@ -40,7 +40,7 @@ import torch
 
 from prism.language.mission_parser import GoalSpec, parse_mission
 from prism.models.jepa import JepaWorldModel
-from prism.perception.predicates import predicate_index
+from prism.perception.predicates import predicate_index, type_color_index
 from prism.perception.slots import COLOR_NAME_TO_IDX
 
 
@@ -161,9 +161,16 @@ class GroundedAgent:
         self.device = device
         self.horizon = horizon
         self.n_samples = max(1, n_samples)
-        if scoring_mode not in ("magnitude", "binary"):
+        if scoring_mode not in ("magnitude", "binary", "distance"):
             raise ValueError(f"unknown scoring_mode={scoring_mode!r}")
         self.scoring_mode = scoring_mode
+        if scoring_mode == "distance":
+            d = getattr(jepa.cfg, "aux_distance_dim", 0)
+            if d <= 0:
+                raise ValueError(
+                    "scoring_mode='distance' requires JEPA trained with "
+                    "aux_distance_dim > 0; this checkpoint has aux_distance_dim=0"
+                )
 
         # Resolve which probe to use.
         if probe is not None:
@@ -249,15 +256,28 @@ class GroundedAgent:
         # turn-noise prediction × weight 8 = +3.2 fake score, which dominates
         # forward's truthful +0). `binary` thresholds both predictions at 0.5
         # and scores only predicate FLIPS, which silences the noise floor.
-        if self.scoring_mode == "binary":
+        # `distance` reads the continuous distance dim for the goal (type, color)
+        # — score = base_dist − next_dist (positive = closer). This gives a
+        # smooth gradient where binary predicates are flat (target visible
+        # 5 cells away → no flip per forward step → no signal in binary mode).
+        if self.scoring_mode == "distance":
+            g = goal_preds[0]  # all goals share (type_id, color_id)
+            P = self.jepa.cfg.aux_predicate_dim
+            dist_idx = P + type_color_index(g.type_id, g.color_id)
+            base_d = baseline_probs[dist_idx]                    # scalar
+            next_d = next_probs_mean[:, dist_idx]                # (nA,)
+            scores = base_d - next_d                              # positive = closer
+            improvement = None  # unused below; we set scores directly
+        elif self.scoring_mode == "binary":
             next_bin = (next_probs_mean > 0.5).float()
             base_bin = (baseline_probs > 0.5).float().unsqueeze(0)
             improvement = next_bin - base_bin
         else:
             improvement = next_probs_mean - baseline_probs.unsqueeze(0)
-        scores = torch.zeros(nA, device=self.device)
-        for g in goal_preds:
-            scores = scores + g.weight * improvement[:, g.flat_index]
+        if self.scoring_mode != "distance":
+            scores = torch.zeros(nA, device=self.device)
+            for g in goal_preds:
+                scores = scores + g.weight * improvement[:, g.flat_index]
 
         # Mask disallowed actions to -inf so argmax skips them. Also defines
         # the candidate pool for the exploration fallback. For "go to X"

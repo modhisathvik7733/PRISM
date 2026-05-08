@@ -1,9 +1,16 @@
 from prism.perception.predicates import (
+    AUGMENTED_VECTOR_DIM,
+    DISTANCE_VECTOR_DIM,
+    MAX_VIEW_MANHATTAN,
     NUM_PREDICATES,
     NUM_TYPE_COLOR_PAIRS,
     PREDICATE_NAMES,
     PREDICATE_VECTOR_DIM,
+    compute_augmented_predicates,
+    compute_distances,
     compute_predicates,
+    distance_index,
+    predicate_index,
     type_color_index,
 )
 from prism.perception.slots import (
@@ -16,14 +23,21 @@ from prism.perception.slots import (
 
 __all__ = [
     "AGENT_POS",
+    "AUGMENTED_VECTOR_DIM",
     "COLOR_NAMES",
+    "DISTANCE_VECTOR_DIM",
+    "MAX_VIEW_MANHATTAN",
     "NUM_PREDICATES",
     "NUM_TYPE_COLOR_PAIRS",
     "OBJECT_TYPE_NAMES",
     "PREDICATE_NAMES",
     "PREDICATE_VECTOR_DIM",
     "Slot",
+    "compute_augmented_predicates",
+    "compute_distances",
     "compute_predicates",
+    "distance_index",
     "extract_slots",
+    "predicate_index",
     "type_color_index",
 ]
