@@ -627,11 +627,18 @@ def run_precondition_experiment(
             # Check if we're close enough to attempt the achievement action.
             if dist_to_goal < execute_threshold:
                 print(f"    [EXECUTE BURST] step={step}  dist={dist_to_goal:.3f} — "
-                      f"firing {execute_burst}x action {ach_action}")
-                for _ in range(execute_burst):
-                    if step >= plan_steps:
+                      f"local-search {execute_burst} steps (move+do)")
+                # Local search: alternate cardinal movements (face change) with
+                # action 5 (do). In Crafter, moving changes the player's facing
+                # direction, so cycling through 4 directions + do finds the tree
+                # even if the initial facing is wrong.
+                _FACE_CYCLE = [1, 2, 3, 4]  # left, right, up, down
+                for burst_i in range(execute_burst):
+                    if step >= plan_steps or achievement_fired:
                         break
-                    _, _, done, info = worker.step(ach_action)
+                    # Even steps: try "do"; odd steps: reface (cycle cardinal dirs)
+                    burst_act = ach_action if burst_i % 2 == 0 else _FACE_CYCLE[(burst_i // 2) % 4]
+                    _, _, done, info = worker.step(burst_act)
                     step += 1
                     if info:
                         trial_achievements |= info.get("achievements", set())
