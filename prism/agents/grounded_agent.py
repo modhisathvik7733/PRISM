@@ -558,17 +558,31 @@ class GroundedAgent:
                 slots_list, goal_preds[0], allowed, forward_blocked_now
             )
             branch = "slot_fallback"
-        # 3e. cached_navigate is currently DISABLED. Empirically, navigating
-        # back to a cached world-frame target costs more than it saves in
-        # BabyAI-GoToLocal-v0: random spawns + partial-view mean the agent has
-        # often walked past the target by the time it loses sight, so going
-        # "back" to the cached position requires a 180° turn + retrace,
-        # whereas frontier exploration keeps moving forward and re-acquires
-        # the target via natural sweep. We keep _slot_to_world / _navigate_toward
-        # / _mem_objects in place for future experiments (e.g. using the cache
-        # as a *bias* on frontier choice rather than a hard target). The cache
-        # update still happens above so future approaches can use it.
-        # 3f. target hidden — frontier exploration.
+        # 3e. Component B (Phase 3 episodic): goal is NOT in current view but
+        # we cached its world position from an earlier observation in this
+        # episode. BFS through (visited ∪ unknown-not-blocked) cells finds the
+        # shortest action sequence to a cell adjacent to the cached target.
+        # CRITICALLY slot-gated: only fires when slot extraction confirms the
+        # goal is genuinely not in current view. The previous v0.9 cache
+        # regressed because it fired on predicate dips while the slot was
+        # still in view, redirecting the agent to where it already was.
+        elif (
+            goal_preds
+            and (goal_preds[0].type_id, goal_preds[0].color_id) in self._mem_objects
+            and not self._goal_in_slots(slots_list, goal_preds[0])
+        ):
+            target_xy = self._mem_objects[(goal_preds[0].type_id, goal_preds[0].color_id)]
+            bfs_action = self._bfs_navigate_to(target_xy, allowed, forward_blocked_now)
+            if bfs_action is not None:
+                action = bfs_action
+                branch = "cached_bfs_navigate"
+                info["cache_target_x"] = float(target_xy[0])
+                info["cache_target_y"] = float(target_xy[1])
+            else:
+                # No path within depth — fall through to frontier.
+                action = self._frontier_action(allowed, forward_blocked_now)
+                branch = "frontier_after_bfs_fail"
+        # 3f. target hidden, no cache: frontier exploration.
         else:
             action = self._frontier_action(allowed, forward_blocked_now)
             branch = "frontier"
@@ -588,6 +602,68 @@ class GroundedAgent:
         self._mem_last_action = action
         self._mem_last_obs = obs.detach().clone()
         return action, info
+
+    def _bfs_navigate_to(
+        self,
+        target_xy: tuple[int, int],
+        allowed: tuple[int, ...],
+        forward_blocked_now: bool,
+        max_depth: int = 16,
+    ) -> int | None:
+        """Component B: BFS over (x, y, facing) state space to a cell adjacent
+        to `target_xy`. Returns the first action of the shortest path.
+
+        Why "adjacent" not "equal": in BabyAI GoTo, the goal terminates when
+        the agent stands in a cell ADJACENT to the target object and FACES
+        it. The target object's own cell is impassable. Once we reach an
+        adjacent cell, slot extraction will see the goal again and the
+        memory-mode curriculum branches (visible/facing/adjacent) take over
+        for the final approach.
+
+        Edge weights are uniform; transitions are TURN_LEFT, TURN_RIGHT
+        (free), FORWARD (only if cell ahead is not in `_mem_blocked` and
+        is not target_xy itself). Returns None if no path within depth —
+        caller should fall through to greedy frontier.
+        """
+        from collections import deque
+        FORWARD, TURN_LEFT, TURN_RIGHT = 2, 0, 1
+        tx, ty = target_xy
+        sx0, sy0, sf0 = self._mem_x, self._mem_y, self._mem_facing
+        # Already adjacent — let the next-step curriculum handle the final
+        # rotation/forward; cache shouldn't have fired (slot would show goal).
+        if abs(sx0 - tx) + abs(sy0 - ty) == 1:
+            return None
+        start = (sx0, sy0, sf0)
+        seen = {start}
+        queue = deque([(start, [])])
+        while queue:
+            (x, y, facing), path = queue.popleft()
+            # Goal: any state with (x, y) at manhattan 1 from target_xy.
+            if path and (abs(x - tx) + abs(y - ty) == 1):
+                return path[0]
+            if len(path) >= max_depth:
+                continue
+            # FORWARD: skip target cell itself (impassable object) and known-blocked.
+            if FORWARD in allowed:
+                fx, fy = self._step_xy(x, y, facing)
+                if (fx, fy) != target_xy and (fx, fy) not in self._mem_blocked:
+                    if not (len(path) == 0 and forward_blocked_now):
+                        new_state = (fx, fy, facing)
+                        if new_state not in seen:
+                            seen.add(new_state)
+                            queue.append((new_state, path + [FORWARD]))
+            # Turns are always free (just rotate in place).
+            if TURN_LEFT in allowed:
+                new_state = (x, y, (facing - 1) % 4)
+                if new_state not in seen:
+                    seen.add(new_state)
+                    queue.append((new_state, path + [TURN_LEFT]))
+            if TURN_RIGHT in allowed:
+                new_state = (x, y, (facing + 1) % 4)
+                if new_state not in seen:
+                    seen.add(new_state)
+                    queue.append((new_state, path + [TURN_RIGHT]))
+        return None  # no path within depth; caller falls through to frontier
 
     def _frontier_action(self, allowed: tuple[int, ...], forward_blocked_now: bool) -> int:
         """Pick action that drives the agent toward unvisited cells.
