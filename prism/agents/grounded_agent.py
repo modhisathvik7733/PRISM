@@ -382,124 +382,6 @@ class GroundedAgent:
         gt, gc = weighted_goal.type_id, weighted_goal.color_id
         return any(s.type_id == gt and s.color_id == gc for s in slots_list)
 
-    def _slot_geom_action(
-        self,
-        slots_list,
-        weighted_goal,
-        allowed: tuple[int, ...],
-        forward_blocked_now: bool,
-    ) -> tuple[int, str]:
-        """Pure slot-geometry action selection when the goal is in current view.
-
-        Slot frame: agent at (3, 6) facing up. Forward arc (predicate `facing`)
-        is y < 6 AND |x-3| <= 6-y. Adjacency (manhattan == 1) covers in-front
-        (3, 5) and side cells (2, 6) / (4, 6).
-
-        Decision tree:
-          adjacent + in front (3, 5): forward (env terminates)
-          adjacent + to side  (x ≠ 3): turn toward that side first
-          in forward arc + far: forward unless blocked
-          forward arc + blocked: turn (alternate sidesteps)
-          visible but not in arc: turn toward target's x side
-        """
-        FORWARD, TURN_LEFT, TURN_RIGHT = 2, 0, 1
-        ax, ay = AGENT_POS  # (3, 6)
-        gt, gc = weighted_goal.type_id, weighted_goal.color_id
-        cands = [s for s in slots_list if s.type_id == gt and s.color_id == gc]
-        target = min(cands, key=lambda s: abs(s.x - ax) + abs(s.y - ay))
-
-        rel_forward = ay - target.y     # >= 0 when target is in/at agent's row or ahead
-        rel_right = target.x - ax       # negative = left, positive = right
-
-        # Adjacent: target manhattan == 1 from agent.
-        if rel_forward == 1 and rel_right == 0:
-            # Directly in front — forward steps into goal cell, env terminates.
-            if FORWARD in allowed and not forward_blocked_now:
-                return FORWARD, "adjacent_forward"
-            # Forward blocked even at adjacent (rare): rotate to look around.
-            return (TURN_RIGHT if TURN_RIGHT in allowed else allowed[0]), "adjacent_blocked"
-        if rel_forward == 0 and abs(rel_right) == 1:
-            # To agent's left or right at agent row — rotate that way.
-            if rel_right > 0 and TURN_RIGHT in allowed:
-                return TURN_RIGHT, "adjacent_side"
-            if rel_right < 0 and TURN_LEFT in allowed:
-                return TURN_LEFT, "adjacent_side"
-
-        # In the forward arc (predicate `facing` would fire).
-        if rel_forward >= 1 and abs(rel_right) <= rel_forward:
-            if FORWARD in allowed and not forward_blocked_now:
-                return FORWARD, "facing_forward"
-            # Forward blocked but in arc — turn to find a sidestep around the
-            # blocker, then re-enter the slot logic next step.
-            if rel_right >= 0 and TURN_RIGHT in allowed:
-                return TURN_RIGHT, "facing_blocked"
-            if TURN_LEFT in allowed:
-                return TURN_LEFT, "facing_blocked"
-            return (TURN_RIGHT if TURN_RIGHT in allowed else allowed[0]), "facing_blocked"
-
-        # Visible but not in forward arc — rotate toward the target's side.
-        if rel_right > 0 and TURN_RIGHT in allowed:
-            return TURN_RIGHT, "rotate_to_face"
-        if rel_right < 0 and TURN_LEFT in allowed:
-            return TURN_LEFT, "rotate_to_face"
-        # rel_right == 0 (directly above/below in world) but not in arc — turn
-        # to scan, the next step will see it shifted.
-        return (TURN_RIGHT if TURN_RIGHT in allowed else allowed[0]), "rotate_to_face"
-
-    def _bfs_frontier_action(
-        self,
-        allowed: tuple[int, ...],
-        forward_blocked_now: bool,
-        max_depth: int = 14,
-    ) -> int:
-        """BFS over (pose, facing) state space to the nearest fresh cell.
-
-        State = (x, y, facing). Edges: forward (+1 cell in facing dir, only
-        if not known-blocked), turn_left, turn_right. Cost 1 per edge.
-        Returns the first action of the shortest path to any (x, y) that is
-        not in _mem_visited and not in _mem_blocked. Falls back to forward
-        (or turn if forward is currently blocked) when no fresh cell is
-        reachable within max_depth.
-        """
-        from collections import deque
-
-        FORWARD, TURN_LEFT, TURN_RIGHT = 2, 0, 1
-        start = (self._mem_x, self._mem_y, self._mem_facing)
-        seen = {start}
-        queue = deque([(start, [])])
-        while queue:
-            (x, y, facing), path = queue.popleft()
-            if path and (x, y) not in self._mem_visited and (x, y) not in self._mem_blocked:
-                return path[0]
-            if len(path) >= max_depth:
-                continue
-            # Forward — only if the cell ahead isn't known-blocked, and only
-            # from the start node if forward isn't currently blocked.
-            if FORWARD in allowed:
-                fx, fy = self._step_xy(x, y, facing)
-                if (fx, fy) not in self._mem_blocked:
-                    if not (len(path) == 0 and forward_blocked_now):
-                        new_state = (fx, fy, facing)
-                        if new_state not in seen:
-                            seen.add(new_state)
-                            queue.append((new_state, path + [FORWARD]))
-            if TURN_LEFT in allowed:
-                new_state = (x, y, (facing - 1) % 4)
-                if new_state not in seen:
-                    seen.add(new_state)
-                    queue.append((new_state, path + [TURN_LEFT]))
-            if TURN_RIGHT in allowed:
-                new_state = (x, y, (facing + 1) % 4)
-                if new_state not in seen:
-                    seen.add(new_state)
-                    queue.append((new_state, path + [TURN_RIGHT]))
-        # No fresh cell reachable — break out of local trap.
-        if FORWARD in allowed and not forward_blocked_now:
-            return FORWARD
-        if TURN_RIGHT in allowed:
-            return TURN_RIGHT
-        return allowed[0]
-
     def _slot_rotate_fallback(self, slots_list, weighted_goal,
                               allowed: tuple[int, ...],
                               forward_blocked_now: bool) -> int:
@@ -555,55 +437,6 @@ class GroundedAgent:
             return TURN_LEFT if TURN_LEFT in allowed else allowed[0]
         # diff == 2 (180°): rotate one step at a time toward target
         return TURN_RIGHT if TURN_RIGHT in allowed else allowed[0]
-
-    def attach_recurrent_policy(self, policy: torch.nn.Module, mission: torch.Tensor) -> None:
-        """Attach a trained RecurrentPolicy and the mission one-hot for the
-        current episode. The mission is a (mission_dim,) tensor; we add a
-        batch dim internally. Must be called after agent.reset() and before
-        the first select_action call when scoring_mode='recurrent'."""
-        self._rec_policy = policy.to(self.device).eval()
-        self._rec_mission = mission.to(self.device).unsqueeze(0).float()
-        self._rec_hidden = None
-        self._rec_prev_action = -1
-
-    @torch.no_grad()
-    def _recurrent_select(
-        self,
-        z_t: torch.Tensor,
-        allowed_actions: tuple[int, ...] | None,
-    ) -> tuple[int, dict[str, float]]:
-        """One step of the trained recurrent policy.
-
-        Maintains h_t and prev_action across calls. Mission is fixed per
-        episode (set via attach_recurrent_policy). The frozen JEPA encoder
-        already produced z_t — we just feed it through the GRU + head.
-
-        If a policy hasn't been attached, raise — callers must opt in.
-        """
-        if self._rec_policy is None or self._rec_mission is None:
-            raise RuntimeError(
-                "scoring_mode='recurrent' requires attach_recurrent_policy(...) "
-                "to be called after reset() and before select_action()"
-            )
-        if self._rec_hidden is None:
-            self._rec_hidden = self._rec_policy.init_hidden(1, self.device)
-        prev_a = torch.tensor([self._rec_prev_action], device=self.device, dtype=torch.long)
-        logits, h_next = self._rec_policy.step(
-            z_t, prev_a, self._rec_mission, self._rec_hidden
-        )
-        # Mask disallowed actions before argmax.
-        if allowed_actions is not None:
-            mask = torch.full_like(logits, float("-inf"))
-            for a in allowed_actions:
-                mask[0, a] = 0.0
-            logits = logits + mask
-        action = int(logits.argmax(dim=-1).item())
-        self._rec_hidden = h_next.detach()
-        self._rec_prev_action = action
-        info = {"chosen": action, "branch": "recurrent", "explored": 0.0, "max_score": 0.0}
-        for i in range(self.n_actions):
-            info[f"logit_a{i}"] = float(logits[0, i].item())
-        return action, info
 
     @torch.no_grad()
     def _memory_select(
@@ -697,21 +530,48 @@ class GroundedAgent:
         action = None
         branch = ""
 
-        # 3. Action selection — slot-geometry primary, BFS frontier fallback.
-        # When the goal is in the current view, slot extraction tells us its
-        # exact agent-frame position. We act on that geometrically (~100%
-        # precision) rather than on the model's noisy 1-step rotate prediction
-        # (turn F1 ≈ 0.57 → 43% of "rotate-to-face" picks are wrong).
-        # When the goal is NOT in view, BFS over (pose, facing) finds the
-        # shortest action sequence to reach a fresh frontier cell instead of
-        # a greedy local choice.
-        if goal_preds and self._goal_in_slots(slots_list, goal_preds[0]):
-            action, branch = self._slot_geom_action(
+        # 3. Action selection — curriculum hierarchy + frontier fallback.
+        # 3a. adjacent: forward
+        if p_adjacent > 0.5 and FORWARD in allowed and not forward_blocked_now:
+            action = FORWARD
+            branch = "adjacent"
+        # 3b. facing the goal AND not blocked: forward
+        elif p_facing > 0.5 and FORWARD in allowed and not forward_blocked_now:
+            action = FORWARD
+            branch = "facing"
+        # 3c. visible (but not facing / forward blocked): turn toward
+        elif p_visible > 0.5 and idx_facing is not None and (TURN_LEFT in allowed or TURN_RIGHT in allowed):
+            actions_t = torch.tensor([TURN_LEFT, TURN_RIGHT], device=self.device, dtype=torch.long)
+            expand_shape = (2,) + (-1,) * (z_t.ndim - 1)
+            z_rep = z_t.expand(*expand_shape)
+            z_next = self.jepa.predict(z_rep, actions_t)
+            next_probs = torch.sigmoid(self.probe(z_next))
+            p_face_left = float(next_probs[0, idx_facing].item())
+            p_face_right = float(next_probs[1, idx_facing].item())
+            action = TURN_LEFT if p_face_left >= p_face_right else TURN_RIGHT
+            branch = "rotate_to_face"
+        # 3d. predicate dipped < 0.5 but the goal is actually in the current
+        # slot extraction — fall back to slot-based rotate so we don't redirect
+        # via cache to a position we're already next to.
+        elif goal_preds and self._goal_in_slots(slots_list, goal_preds[0]):
+            action = self._slot_rotate_fallback(
                 slots_list, goal_preds[0], allowed, forward_blocked_now
             )
+            branch = "slot_fallback"
+        # 3e. cached_navigate is currently DISABLED. Empirically, navigating
+        # back to a cached world-frame target costs more than it saves in
+        # BabyAI-GoToLocal-v0: random spawns + partial-view mean the agent has
+        # often walked past the target by the time it loses sight, so going
+        # "back" to the cached position requires a 180° turn + retrace,
+        # whereas frontier exploration keeps moving forward and re-acquires
+        # the target via natural sweep. We keep _slot_to_world / _navigate_toward
+        # / _mem_objects in place for future experiments (e.g. using the cache
+        # as a *bias* on frontier choice rather than a hard target). The cache
+        # update still happens above so future approaches can use it.
+        # 3f. target hidden — frontier exploration.
         else:
-            action = self._bfs_frontier_action(allowed, forward_blocked_now)
-            branch = "bfs_frontier"
+            action = self._frontier_action(allowed, forward_blocked_now)
+            branch = "frontier"
 
         info["branch"] = branch
         info["chosen"] = action
@@ -767,6 +627,52 @@ class GroundedAgent:
         if TURN_RIGHT in allowed:
             return TURN_RIGHT
         return allowed[0]
+
+    def attach_recurrent_policy(self, policy: torch.nn.Module, mission: torch.Tensor) -> None:
+        """Attach a trained RecurrentPolicy and the mission one-hot for the
+        current episode. The mission is a (mission_dim,) tensor; we add a
+        batch dim internally. Must be called after agent.reset() and before
+        the first select_action call when scoring_mode='recurrent'."""
+        self._rec_policy = policy.to(self.device).eval()
+        self._rec_mission = mission.to(self.device).unsqueeze(0).float()
+        self._rec_hidden = None
+        self._rec_prev_action = -1
+
+    @torch.no_grad()
+    def _recurrent_select(
+        self,
+        z_t: torch.Tensor,
+        allowed_actions: tuple[int, ...] | None,
+    ) -> tuple[int, dict[str, float]]:
+        """One step of the trained recurrent policy.
+
+        Maintains h_t and prev_action across calls. Mission is fixed per
+        episode (set via attach_recurrent_policy). The frozen JEPA encoder
+        already produced z_t — we just feed it through the GRU + head.
+        """
+        if self._rec_policy is None or self._rec_mission is None:
+            raise RuntimeError(
+                "scoring_mode='recurrent' requires attach_recurrent_policy(...) "
+                "to be called after reset() and before select_action()"
+            )
+        if self._rec_hidden is None:
+            self._rec_hidden = self._rec_policy.init_hidden(1, self.device)
+        prev_a = torch.tensor([self._rec_prev_action], device=self.device, dtype=torch.long)
+        logits, h_next = self._rec_policy.step(
+            z_t, prev_a, self._rec_mission, self._rec_hidden
+        )
+        if allowed_actions is not None:
+            mask = torch.full_like(logits, float("-inf"))
+            for a in allowed_actions:
+                mask[0, a] = 0.0
+            logits = logits + mask
+        action = int(logits.argmax(dim=-1).item())
+        self._rec_hidden = h_next.detach()
+        self._rec_prev_action = action
+        info = {"chosen": action, "branch": "recurrent", "explored": 0.0, "max_score": 0.0}
+        for i in range(self.n_actions):
+            info[f"logit_a{i}"] = float(logits[0, i].item())
+        return action, info
 
     @torch.no_grad()
     def select_action(
