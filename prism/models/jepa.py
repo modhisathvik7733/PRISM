@@ -265,6 +265,7 @@ class JepaWorldModel(nn.Module):
         action_t: torch.Tensor,
         obs_tp1: torch.Tensor,
         predicates_t: torch.Tensor | None = None,
+        predicates_tp1: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         z_t = self.online_encoder(obs_t)
         z_pred = self.dynamics(z_t, action_t)
@@ -283,14 +284,32 @@ class JepaWorldModel(nn.Module):
             "loss_reg": l_reg.detach(),
         }
 
-        # Auxiliary predicate-supervised loss. Adds a BCE term that forces the
-        # encoder to preserve object-typed information.
+        # Auxiliary predicate-supervised loss. Two heads:
+        #   * On `z_t`        — forces encoder to preserve object structure.
+        #   * On `z_pred`     — closes the train/inference gap for the agent.
+        #     The agent runs `aux_head(dynamics(z_t, a))` at inference, so we
+        #     must train the head to read predicates from the dynamics output
+        #     (predicates_tp1) and not just from the encoder output (predicates_t).
+        # Without the second term, the head was only ever optimized on encoded
+        # observations — predicate readout from imagined states was a
+        # distribution-shift away, and the agent's score for `forward` actions
+        # came out wrong (capstone failure mode in v0.2).
         aux_w = getattr(self.cfg, "aux_predicate_weight", 0.0)
-        if aux_w > 0.0 and self.aux_predicate_head is not None and predicates_t is not None:
-            pred_logits = self.aux_predicate_head(z_t)
-            l_aux = F.binary_cross_entropy_with_logits(pred_logits, predicates_t)
-            total = total + aux_w * l_aux
-            out["loss_aux"] = l_aux.detach()
+        if aux_w > 0.0 and self.aux_predicate_head is not None:
+            if predicates_t is not None:
+                pred_logits_t = self.aux_predicate_head(z_t)
+                l_aux_t = F.binary_cross_entropy_with_logits(pred_logits_t, predicates_t)
+                total = total + aux_w * l_aux_t
+                out["loss_aux_t"] = l_aux_t.detach()
+                # Backward compat alias for callers that still log "loss_aux".
+                out["loss_aux"] = l_aux_t.detach()
+            if predicates_tp1 is not None:
+                pred_logits_tp1 = self.aux_predicate_head(z_pred)
+                l_aux_tp1 = F.binary_cross_entropy_with_logits(
+                    pred_logits_tp1, predicates_tp1
+                )
+                total = total + aux_w * l_aux_tp1
+                out["loss_aux_tp1"] = l_aux_tp1.detach()
 
         out["loss"] = total
         return out

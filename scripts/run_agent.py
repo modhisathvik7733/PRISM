@@ -22,7 +22,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
 import gymnasium as gym
 import minigrid  # noqa: F401  (registers BabyAI envs)
@@ -32,7 +31,37 @@ import torch
 from prism.agents import GroundedAgent, goal_predicates_for_mission
 from prism.envs.babyai import _encode_image
 from prism.models.jepa import JepaConfig, JepaWorldModel, upgrade_config
+from prism.perception import compute_predicates, extract_slots
 from prism.utils.seed import set_global_seed
+
+
+@torch.no_grad()
+def _diagnose_step(jepa, agent, raw_obs, encoded_obs, goal_preds, device, n_actions):
+    """Print a side-by-side of:
+        - ground-truth predicates from slots
+        - predicates the probe reads from encode(obs_t)
+        - predicates the probe reads from predict(z_t, a) for each a
+
+    Useful for spotting where the train/inference distribution gap shows up.
+    """
+    gt = compute_predicates(extract_slots(raw_obs))
+    z_t = jepa.encode(torch.from_numpy(encoded_obs).float().unsqueeze(0).to(device))
+    probe_t = torch.sigmoid(agent.probe(z_t)).squeeze(0).cpu().numpy()
+
+    actions = torch.arange(n_actions, device=device, dtype=torch.long)
+    z_next = jepa.predict(z_t.expand(n_actions, -1), actions)
+    probe_next = torch.sigmoid(agent.probe(z_next)).cpu().numpy()  # (n_actions, 96)
+
+    # Focus on the goal predicates only (less noise).
+    print("    [diag] goal predicates: name | gt | probe(z_t) | probe(predict(z_t, a)) for a in 0..6")
+    for g in goal_preds:
+        per_action = " ".join(f"{probe_next[a, g.flat_index]:.2f}" for a in range(n_actions))
+        print(
+            f"        {g.name:9s}({g.color_id},{g.type_id:>2d}) "
+            f"gt={gt[g.flat_index]:.0f} "
+            f"probe_t={probe_t[g.flat_index]:.2f}   "
+            f"after_a: {per_action}"
+        )
 
 
 def run_episode(
@@ -70,11 +99,17 @@ def run_episode(
     chosen_actions = []
     ep_reward = 0.0
     for step in range(max_steps):
-        encoded = _encode_image(obs["image"])  # (3, 7, 7) float32 normalized
+        raw = obs["image"]                     # (7, 7, 3) uint8
+        encoded = _encode_image(raw)           # (3, 7, 7) float32 normalized
         obs_t = torch.from_numpy(encoded).float()
         action, info = agent.select_action(obs_t, goal_preds)
         if verbose:
-            print(f"  step {step:2d} action={action} scores={[round(info[f'score_a{i}'], 2) for i in range(env.action_space.n)]}")
+            scores = [round(info[f"score_a{i}"], 2) for i in range(env.action_space.n)]
+            print(f"  step {step:2d} action={action} scores={scores}")
+            _diagnose_step(
+                agent.jepa, agent, raw, encoded, goal_preds, agent.device,
+                env.action_space.n,
+            )
         obs, r, term, trunc, _ = env.step(action)
         ep_reward += float(r)
         chosen_actions.append(action)

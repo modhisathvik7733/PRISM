@@ -50,25 +50,28 @@ def collect_random_transitions(
     obs around for slot extraction (only when with_predicates=True).
 
     Returns:
-        obs_t:      (n, 3, 7, 7) float32 normalized
-        actions:    (n,) int64
-        obs_tp1:    (n, 3, 7, 7) float32 normalized
-        predicates: (n, 96) float32 ground-truth predicate vectors, or None
-                    if with_predicates=False
+        obs_t:          (n, 3, 7, 7) float32 normalized
+        actions:        (n,) int64
+        obs_tp1:        (n, 3, 7, 7) float32 normalized
+        predicates_t:   (n, 96) float32, or None if with_predicates=False
+        predicates_tp1: (n, 96) float32, or None if with_predicates=False
     """
     env = gym.make(env_id)
-    obs_t_list, act_list, obs_tp1_list, pred_list = [], [], [], []
+    obs_t_list, act_list, obs_tp1_list = [], [], []
+    pred_t_list, pred_tp1_list = [], []
     obs, _ = env.reset(seed=int(rng.integers(0, 1_000_000)))
     while len(obs_t_list) < n:
         raw_t = obs["image"]                      # (7, 7, 3) uint8
         a = int(rng.integers(env.action_space.n))
         next_obs, _r, term, trunc, _ = env.step(a)
+        raw_tp1 = next_obs["image"]
 
-        obs_t_list.append(_encode_image(raw_t))   # (3, 7, 7) float32
+        obs_t_list.append(_encode_image(raw_t))
         act_list.append(a)
-        obs_tp1_list.append(_encode_image(next_obs["image"]))
+        obs_tp1_list.append(_encode_image(raw_tp1))
         if with_predicates:
-            pred_list.append(compute_predicates(extract_slots(raw_t)))
+            pred_t_list.append(compute_predicates(extract_slots(raw_t)))
+            pred_tp1_list.append(compute_predicates(extract_slots(raw_tp1)))
 
         if term or trunc:
             obs, _ = env.reset(seed=int(rng.integers(0, 1_000_000)))
@@ -78,7 +81,8 @@ def collect_random_transitions(
         np.stack(obs_t_list).astype(np.float32),
         np.array(act_list, dtype=np.int64),
         np.stack(obs_tp1_list).astype(np.float32),
-        np.stack(pred_list).astype(np.float32) if with_predicates else None,
+        np.stack(pred_t_list).astype(np.float32) if with_predicates else None,
+        np.stack(pred_tp1_list).astype(np.float32) if with_predicates else None,
     )
 
 
@@ -142,13 +146,15 @@ def main() -> int:
     )
 
     rng = np.random.default_rng(args.seed)
-    obs_t_buf = act_buf = obs_tp1_buf = pred_buf = None
+    obs_t_buf = act_buf = obs_tp1_buf = pred_t_buf = pred_tp1_buf = None
     loss_window = deque(maxlen=200)
     use_aux = args.aux_predicate_weight > 0.0
 
     for step in range(args.steps):
         if step % args.collect_every == 0:
-            obs_t_buf, act_buf, obs_tp1_buf, pred_buf = collect_random_transitions(
+            (
+                obs_t_buf, act_buf, obs_tp1_buf, pred_t_buf, pred_tp1_buf
+            ) = collect_random_transitions(
                 args.env_id, args.rollout_size, rng, with_predicates=use_aux
             )
 
@@ -157,10 +163,16 @@ def main() -> int:
         a_t = torch.from_numpy(act_buf[idx]).to(device)
         obs_tp1 = torch.from_numpy(obs_tp1_buf[idx]).to(device)
         preds_t = (
-            torch.from_numpy(pred_buf[idx]).to(device) if use_aux else None
+            torch.from_numpy(pred_t_buf[idx]).to(device) if use_aux else None
+        )
+        preds_tp1 = (
+            torch.from_numpy(pred_tp1_buf[idx]).to(device) if use_aux else None
         )
 
-        out = model.loss(obs_t, a_t, obs_tp1, predicates_t=preds_t)
+        out = model.loss(
+            obs_t, a_t, obs_tp1,
+            predicates_t=preds_t, predicates_tp1=preds_tp1,
+        )
         loss = out["loss"]
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -177,10 +189,14 @@ def main() -> int:
             writer.add_scalar("loss/reg", out["loss_reg"].item(), step)
             writer.add_scalar("loss/total_mean200", mean_loss, step)
             aux_str = ""
-            if "loss_aux" in out:
-                aux_val = out["loss_aux"].item()
-                writer.add_scalar("loss/aux_predicate", aux_val, step)
-                aux_str = f" aux={aux_val:.4f}"
+            if "loss_aux_t" in out:
+                aux_t_val = out["loss_aux_t"].item()
+                writer.add_scalar("loss/aux_t", aux_t_val, step)
+                aux_str += f" aux_t={aux_t_val:.4f}"
+            if "loss_aux_tp1" in out:
+                aux_tp1_val = out["loss_aux_tp1"].item()
+                writer.add_scalar("loss/aux_tp1", aux_tp1_val, step)
+                aux_str += f" aux_tp1={aux_tp1_val:.4f}"
             print(
                 f"[step {step:6d}] loss={loss.item():.4f} "
                 f"pred={out['loss_pred'].item():.4f} reg={out['loss_reg'].item():.4f}"
