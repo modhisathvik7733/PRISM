@@ -545,18 +545,17 @@ class GroundedAgent:
                 slots_list, goal_preds[0], allowed, forward_blocked_now
             )
             branch = "slot_fallback"
-        # 3e. target genuinely hidden but cached from a prior observation:
-        # navigate back to its last-known world-frame position.
-        elif (
-            goal_preds
-            and (goal_preds[0].type_id, goal_preds[0].color_id) in self._mem_objects
-        ):
-            target_xy = self._mem_objects[(goal_preds[0].type_id, goal_preds[0].color_id)]
-            action = self._navigate_toward(target_xy, allowed, forward_blocked_now)
-            branch = "cached_navigate"
-            info["cached_target_x"] = float(target_xy[0])
-            info["cached_target_y"] = float(target_xy[1])
-        # 3f. target hidden and never seen: frontier exploration.
+        # 3e. cached_navigate is currently DISABLED. Empirically, navigating
+        # back to a cached world-frame target costs more than it saves in
+        # BabyAI-GoToLocal-v0: random spawns + partial-view mean the agent has
+        # often walked past the target by the time it loses sight, so going
+        # "back" to the cached position requires a 180° turn + retrace,
+        # whereas frontier exploration keeps moving forward and re-acquires
+        # the target via natural sweep. We keep _slot_to_world / _navigate_toward
+        # / _mem_objects in place for future experiments (e.g. using the cache
+        # as a *bias* on frontier choice rather than a hard target). The cache
+        # update still happens above so future approaches can use it.
+        # 3f. target hidden — frontier exploration.
         else:
             action = self._frontier_action(allowed, forward_blocked_now)
             branch = "frontier"
