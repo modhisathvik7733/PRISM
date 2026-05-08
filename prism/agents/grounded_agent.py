@@ -224,7 +224,9 @@ class GroundedAgent:
         nA = self.n_actions
         nS = self.n_samples
         # Replicate (z_t, action) for every (action_id, sample_idx) pair.
-        z_t_rep = z_t.expand(nA * nS, -1)             # (nA*nS, embed_dim)
+        # Shape-agnostic: works for flat (1, D) and spatial (1, C, H, W) latents.
+        expand_shape = (nA * nS,) + (-1,) * (z_t.ndim - 1)
+        z_t_rep = z_t.expand(*expand_shape)
         first_actions = torch.arange(nA, device=self.device, dtype=torch.long)
         first_actions = first_actions.repeat_interleave(nS)  # [0,0,..,0, 1,1,..,1, ...]
         z_next = self.jepa.predict(z_t_rep, first_actions)
