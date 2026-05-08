@@ -57,7 +57,7 @@ def initial_cohort(gt_preds_t0: np.ndarray, goal_preds) -> str:
     return "hidden"
 
 
-def run_episode(env, agent, *, seed, max_steps):
+def run_episode(env, agent, *, seed, max_steps, recurrent_policy=None):
     obs, _ = env.reset(seed=seed)
     agent.reset()  # zeros curriculum exploration counter
     mission = obs["mission"]
@@ -66,6 +66,14 @@ def run_episode(env, agent, *, seed, max_steps):
         return None
     goal_preds, spec = parsed
     allowed = allowed_actions_for_spec(spec, env.action_space.n)
+
+    if recurrent_policy is not None:
+        from prism.perception.predicates import type_color_index
+        from prism.perception.slots import NUM_COLORS, OBJECT_TYPES
+        tc_idx = type_color_index(goal_preds[0].type_id, goal_preds[0].color_id)
+        mission_one_hot = torch.zeros(len(OBJECT_TYPES) * NUM_COLORS)
+        mission_one_hot[tc_idx] = 1.0
+        agent.attach_recurrent_policy(recurrent_policy, mission_one_hot)
 
     raw_t0 = obs["image"]
     gt_t0 = compute_predicates(extract_slots(raw_t0))
@@ -124,7 +132,10 @@ def main() -> int:
     parser.add_argument("--horizon", type=int, default=4)
     parser.add_argument("--n-samples", type=int, default=8)
     parser.add_argument("--scoring-mode", default="magnitude",
-                        choices=["magnitude", "binary", "distance", "curriculum", "memory"])
+                        choices=["magnitude", "binary", "distance", "curriculum",
+                                 "memory", "recurrent"])
+    parser.add_argument("--policy-checkpoint", default=None,
+                        help="path to RecurrentPolicy .pt for scoring-mode=recurrent")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -150,6 +161,23 @@ def main() -> int:
         f"scoring={args.scoring_mode}"
     )
 
+    recurrent_policy = None
+    if args.scoring_mode == "recurrent":
+        if args.policy_checkpoint is None:
+            raise SystemExit("--policy-checkpoint required for scoring-mode=recurrent")
+        from prism.models.recurrent_policy import RecurrentPolicy
+        pckpt = torch.load(args.policy_checkpoint, map_location=device, weights_only=False)
+        recurrent_policy = RecurrentPolicy(
+            latent_in_dim=pckpt["latent_in_dim"],
+            n_actions=pckpt["n_actions"],
+            mission_dim=pckpt["mission_dim"],
+            hidden_dim=pckpt["hidden_dim"],
+            latent_proj_dim=pckpt["latent_proj_dim"],
+        ).to(device)
+        recurrent_policy.load_state_dict(pckpt["policy_state_dict"])
+        recurrent_policy.eval()
+        print(f"[cohort] loaded recurrent policy from {args.policy_checkpoint}")
+
     env = gym.make(args.env_id)
 
     # Aggregate per cohort
@@ -160,6 +188,7 @@ def main() -> int:
             env, agent,
             seed=args.seed + ep * 7919,
             max_steps=args.max_steps,
+            recurrent_policy=recurrent_policy,
         )
         if result is None:
             n_skipped += 1

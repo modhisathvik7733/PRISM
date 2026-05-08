@@ -165,7 +165,9 @@ class GroundedAgent:
         self.device = device
         self.horizon = horizon
         self.n_samples = max(1, n_samples)
-        if scoring_mode not in ("magnitude", "binary", "distance", "curriculum", "memory"):
+        if scoring_mode not in (
+            "magnitude", "binary", "distance", "curriculum", "memory", "recurrent",
+        ):
             raise ValueError(f"unknown scoring_mode={scoring_mode!r}")
         self.scoring_mode = scoring_mode
         if scoring_mode == "distance":
@@ -212,6 +214,13 @@ class GroundedAgent:
         # Lets the agent navigate back to a target it saw and lost sight of
         # rather than falling into frontier exploration.
         self._mem_objects: dict[tuple[int, int], tuple[int, int]] = {}
+        # ----- Recurrent-policy state (Phase 3 step 2) ---------------------
+        # When scoring_mode='recurrent' is active, these get populated with a
+        # trained RecurrentPolicy and its hidden state h_t.
+        self._rec_policy = None
+        self._rec_hidden: torch.Tensor | None = None
+        self._rec_prev_action: int = -1
+        self._rec_mission: torch.Tensor | None = None
 
     def reset(self) -> None:
         """Call at the start of each episode so curriculum-mode exploration
@@ -227,6 +236,10 @@ class GroundedAgent:
         self._mem_last_action = None
         self._mem_last_obs = None
         self._mem_objects = {}
+        # Reset recurrent state — fresh GRU hidden + 'no previous action'.
+        self._rec_hidden = None
+        self._rec_prev_action = -1
+        self._rec_mission = None
 
     @torch.no_grad()
     def _curriculum_select(
@@ -424,6 +437,55 @@ class GroundedAgent:
             return TURN_LEFT if TURN_LEFT in allowed else allowed[0]
         # diff == 2 (180°): rotate one step at a time toward target
         return TURN_RIGHT if TURN_RIGHT in allowed else allowed[0]
+
+    def attach_recurrent_policy(self, policy: torch.nn.Module, mission: torch.Tensor) -> None:
+        """Attach a trained RecurrentPolicy and the mission one-hot for the
+        current episode. The mission is a (mission_dim,) tensor; we add a
+        batch dim internally. Must be called after agent.reset() and before
+        the first select_action call when scoring_mode='recurrent'."""
+        self._rec_policy = policy.to(self.device).eval()
+        self._rec_mission = mission.to(self.device).unsqueeze(0).float()
+        self._rec_hidden = None
+        self._rec_prev_action = -1
+
+    @torch.no_grad()
+    def _recurrent_select(
+        self,
+        z_t: torch.Tensor,
+        allowed_actions: tuple[int, ...] | None,
+    ) -> tuple[int, dict[str, float]]:
+        """One step of the trained recurrent policy.
+
+        Maintains h_t and prev_action across calls. Mission is fixed per
+        episode (set via attach_recurrent_policy). The frozen JEPA encoder
+        already produced z_t — we just feed it through the GRU + head.
+
+        If a policy hasn't been attached, raise — callers must opt in.
+        """
+        if self._rec_policy is None or self._rec_mission is None:
+            raise RuntimeError(
+                "scoring_mode='recurrent' requires attach_recurrent_policy(...) "
+                "to be called after reset() and before select_action()"
+            )
+        if self._rec_hidden is None:
+            self._rec_hidden = self._rec_policy.init_hidden(1, self.device)
+        prev_a = torch.tensor([self._rec_prev_action], device=self.device, dtype=torch.long)
+        logits, h_next = self._rec_policy.step(
+            z_t, prev_a, self._rec_mission, self._rec_hidden
+        )
+        # Mask disallowed actions before argmax.
+        if allowed_actions is not None:
+            mask = torch.full_like(logits, float("-inf"))
+            for a in allowed_actions:
+                mask[0, a] = 0.0
+            logits = logits + mask
+        action = int(logits.argmax(dim=-1).item())
+        self._rec_hidden = h_next.detach()
+        self._rec_prev_action = action
+        info = {"chosen": action, "branch": "recurrent", "explored": 0.0, "max_score": 0.0}
+        for i in range(self.n_actions):
+            info[f"logit_a{i}"] = float(logits[0, i].item())
+        return action, info
 
     @torch.no_grad()
     def _memory_select(
@@ -667,6 +729,8 @@ class GroundedAgent:
             return self._curriculum_select(z_t, baseline_probs, goal_preds, allowed_actions)
         if self.scoring_mode == "memory":
             return self._memory_select(obs, z_t, baseline_probs, goal_preds, allowed_actions)
+        if self.scoring_mode == "recurrent":
+            return self._recurrent_select(z_t, allowed_actions)
         # ----------------------------------------------------------------------
 
         # Multi-sample rollouts: for each candidate first action, simulate

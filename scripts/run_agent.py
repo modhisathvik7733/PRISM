@@ -76,6 +76,7 @@ def run_episode(
     seed: int,
     max_steps: int = 64,
     verbose: bool = False,
+    recurrent_policy=None,
 ) -> dict:
     obs, _ = env.reset(seed=seed)
     agent.reset()  # zeros curriculum exploration counter; no-op for other modes
@@ -103,6 +104,16 @@ def run_episode(
         }
     goal_preds, spec = parsed
     allowed = allowed_actions_for_spec(spec, env.action_space.n)
+
+    # If running the recurrent policy, attach it now (after agent.reset()) with
+    # the mission one-hot derived from the parsed goal.
+    if recurrent_policy is not None:
+        from prism.perception.predicates import type_color_index
+        from prism.perception.slots import NUM_COLORS, OBJECT_TYPES
+        tc_idx = type_color_index(goal_preds[0].type_id, goal_preds[0].color_id)
+        mission_one_hot = torch.zeros(len(OBJECT_TYPES) * NUM_COLORS)
+        mission_one_hot[tc_idx] = 1.0
+        agent.attach_recurrent_policy(recurrent_policy, mission_one_hot)
 
     chosen_actions = []
     ep_reward = 0.0
@@ -158,12 +169,15 @@ def main() -> int:
                         help="random follow-up samples per first action (variance "
                              "reduction). 8 keeps single-step latency negligible.")
     parser.add_argument("--scoring-mode", default="magnitude",
-                        choices=["magnitude", "binary", "distance", "curriculum", "memory"],
+                        choices=["magnitude", "binary", "distance", "curriculum",
+                                 "memory", "recurrent"],
                         help="magnitude (default) = raw prob diff. binary = score "
-                             "predicate FLIPS only. distance = use the 24-d "
-                             "continuous distance head (requires JEPA trained with "
-                             "--aux-distance-dim 24); score = base_dist − next_dist, "
-                             "smooth gradient even when no predicate flips.")
+                             "predicate FLIPS only. distance = continuous distance "
+                             "head. memory = pose tracking + frontier exploration. "
+                             "recurrent = learned GRU policy on frozen JEPA latents "
+                             "(requires --policy-checkpoint).")
+    parser.add_argument("--policy-checkpoint", default=None,
+                        help="path to RecurrentPolicy .pt for scoring-mode=recurrent")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--verbose", action="store_true",
@@ -205,6 +219,25 @@ def main() -> int:
         f"scoring={args.scoring_mode} n_actions={agent.n_actions}"
     )
 
+    # ------------------------------------------------------ optional: load
+    # the BC-trained recurrent policy when scoring-mode=recurrent.
+    recurrent_policy = None
+    if args.scoring_mode == "recurrent":
+        if args.policy_checkpoint is None:
+            raise SystemExit("--policy-checkpoint is required for scoring-mode=recurrent")
+        from prism.models.recurrent_policy import RecurrentPolicy
+        pckpt = torch.load(args.policy_checkpoint, map_location=device, weights_only=False)
+        recurrent_policy = RecurrentPolicy(
+            latent_in_dim=pckpt["latent_in_dim"],
+            n_actions=pckpt["n_actions"],
+            mission_dim=pckpt["mission_dim"],
+            hidden_dim=pckpt["hidden_dim"],
+            latent_proj_dim=pckpt["latent_proj_dim"],
+        ).to(device)
+        recurrent_policy.load_state_dict(pckpt["policy_state_dict"])
+        recurrent_policy.eval()
+        print(f"[agent] loaded recurrent policy from {args.policy_checkpoint}")
+
     # ------------------------------------------------------ env + run
     env = gym.make(args.env_id)
     rewards = []
@@ -216,6 +249,7 @@ def main() -> int:
             seed=args.seed + ep * 7919,  # spread seeds
             max_steps=args.max_steps,
             verbose=args.verbose and ep == 0,
+            recurrent_policy=recurrent_policy,
         )
         rewards.append(result["reward"])
         if result["parsed"]:
