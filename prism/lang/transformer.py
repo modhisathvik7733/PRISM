@@ -138,6 +138,11 @@ def padding_mask(token_ids: torch.Tensor, pad_id: int) -> torch.Tensor:
     """Build a (B, 1, 1, T) additive mask that blocks attention to PAD tokens.
 
     `token_ids` is (B, T) int64. PAD positions get -inf so softmax skips them.
+
+    NOTE: do NOT use `pad.float() * float("-inf")` — that produces NaN at
+    the non-PAD positions because 0.0 * -inf is NaN in IEEE-754, not 0.
     """
-    pad = (token_ids == pad_id).unsqueeze(1).unsqueeze(1)  # (B, 1, 1, T)
-    return pad.float() * float("-inf")
+    pad = (token_ids == pad_id).unsqueeze(1).unsqueeze(1)  # (B, 1, 1, T) bool
+    mask = torch.zeros(pad.shape, dtype=torch.float32, device=token_ids.device)
+    mask.masked_fill_(pad, float("-inf"))
+    return mask
