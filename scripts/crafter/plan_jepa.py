@@ -102,7 +102,12 @@ def load_jepa(path: str, device: torch.device):
 
     state_dim = getattr(cfg, "state_dim", 0)
     encoder = CrafterCNN(embed_dim=cfg.embed_dim, state_dim=state_dim).to(device)
-    encoder.load_state_dict(ckpt["online_encoder_state"])
+
+    # Remap old checkpoint key "fc.1.*" → "head.*" (renamed when state_dim was added).
+    enc_sd = ckpt["online_encoder_state"]
+    enc_sd = {k.replace("fc.1.", "head.", 1) if k.startswith("fc.1.") else k: v
+              for k, v in enc_sd.items()}
+    encoder.load_state_dict(enc_sd)
     for p in encoder.parameters():
         p.requires_grad_(False)
     encoder.eval()
