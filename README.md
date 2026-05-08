@@ -61,13 +61,23 @@ CUDA=cu124 bash setup.sh       # for RTX 4090 / A100
 
 ### 3. Phase 0: smoke test + baseline
 
+After `setup.sh`, activate the project venv (so commands resolve to it
+instead of any pre-existing `/venv/main` that the Vast.ai image may have
+shipped with):
+
+```bash
+source .venv/bin/activate
+```
+
+Then:
+
 ```bash
 # Smoke test — confirms env loads, GPU works, JEPA forward pass runs.
-uv run python -m scripts.smoke_test
+python -m scripts.smoke_test
 
 # Phase 0 baseline — vanilla PPO on the simplest BabyAI level.
 # Falsifier: mean reward stays ~0 after 1M steps → harness is broken.
-uv run python -m scripts.train_ppo_baseline \
+python -m scripts.train_ppo_baseline \
     --env-id BabyAI-GoToLocal-v0 \
     --total-timesteps 1_000_000 \
     --n-envs 8 \
@@ -79,7 +89,7 @@ TensorBoard is written under `runs/<run-name>/tb`.
 ### 4. Phase 1: JEPA pretraining
 
 ```bash
-uv run python -m scripts.train_jepa \
+python -m scripts.train_jepa \
     --env-id BabyAI-GoToLocal-v0 \
     --steps 200_000 \
     --batch-size 128 \
@@ -87,6 +97,20 @@ uv run python -m scripts.train_jepa \
 ```
 
 Checkpoints saved every 10k steps under `runs/<run-name>/`.
+
+### Troubleshooting: "ModuleNotFoundError: No module named 'torch'"
+
+Means `uv` installed torch into a different venv than the one your script is
+running from. Fix:
+
+```bash
+unset VIRTUAL_ENV
+source .venv/bin/activate
+uv pip install --index-url https://download.pytorch.org/whl/cu128 \
+    torch torchvision torchaudio
+```
+
+(Use `cu124` instead of `cu128` for RTX 30/40-series; `cu126` for H100.)
 
 ---
 

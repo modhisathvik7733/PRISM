@@ -25,8 +25,20 @@ fi
 log "uv: $(uv --version)"
 
 # --------------------------------------------------------------------- 2. python env
+# Vast.ai PyTorch templates pre-activate /venv/main. If we leave VIRTUAL_ENV
+# pointing there, `uv pip install` goes to /venv/main but `uv run` uses the
+# project's .venv/ — they diverge and torch goes missing. Clear the inherited
+# value and force everything through ./.venv.
+if [ -n "${VIRTUAL_ENV:-}" ]; then
+  log "Ignoring inherited VIRTUAL_ENV=$VIRTUAL_ENV (will use ./.venv instead)"
+  unset VIRTUAL_ENV
+fi
+
 log "Creating .venv with Python 3.11..."
 uv venv --python 3.11
+# shellcheck disable=SC1091
+source .venv/bin/activate
+log "Active venv: $VIRTUAL_ENV"
 
 # --------------------------------------------------------------------- 3. base deps
 log "Installing base dependencies (no torch yet)..."
@@ -71,8 +83,12 @@ uv pip install --index-url "https://download.pytorch.org/whl/${CUDA}" \
 
 # --------------------------------------------------------------------- 5. sanity
 log "Sanity check..."
-uv run python -c "
+# Use the venv's python directly — bypass `uv run` so we don't trigger any
+# additional sync that could swap to a different venv.
+.venv/bin/python -c "
+import sys
 import torch, gymnasium, minigrid
+print('python:', sys.executable)
 print('torch:', torch.__version__, 'cuda:', torch.cuda.is_available(), 'devices:', torch.cuda.device_count())
 if torch.cuda.is_available():
     print('device 0:', torch.cuda.get_device_name(0))
@@ -80,6 +96,7 @@ print('gymnasium:', gymnasium.__version__)
 print('minigrid:', minigrid.__version__)
 "
 
-log "Done. Activate with:  source .venv/bin/activate"
-log "Or run anything via:  uv run <cmd>"
-log "Smoke test:           uv run python -m scripts.smoke_test"
+log "Done."
+log "Activate the venv:    source .venv/bin/activate"
+log "Smoke test:           .venv/bin/python -m scripts.smoke_test"
+log "  (or after activate:  python -m scripts.smoke_test)"
