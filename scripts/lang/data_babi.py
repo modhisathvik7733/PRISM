@@ -53,10 +53,12 @@ BABI_TASK_NAMES: dict[int, str] = {
     20: "qa20_agents-motivations",
 }
 
-# Mirror of the original Weston tarball — multiple are floating around;
-# the dl.fbaipublicfiles one is most likely to stay alive.
-BABI_TARBALL_URL = (
-    "https://dl.fbaipublicfiles.com/babi/tasks_1-20_v1-2.tar.gz"
+# Mirrors of the original Weston tarball, tried in order. The FB one
+# returns 403 as of 2026; Keras has hosted the same archive on S3 for
+# years and tends to stay alive. Add more mirrors here if you find them.
+BABI_TARBALL_URLS = (
+    "https://s3.amazonaws.com/text-datasets/babi_tasks_1-20_v1-2.tar.gz",
+    "https://dl.fbaipublicfiles.com/babi/tasks_1-20_v1-2.tar.gz",
 )
 BABI_LOCAL_CACHE = Path.home() / ".cache" / "prism_lang" / "babi"
 
@@ -64,15 +66,28 @@ BABI_LOCAL_CACHE = Path.home() / ".cache" / "prism_lang" / "babi"
 def _download_and_extract(dest: Path) -> Path:
     """Download the bAbI tarball if not present and extract into `dest`.
     Returns the path to the `tasks_1-20_v1-2/en` directory (English,
-    1k-train variant)."""
+    1k-train variant). Tries each mirror in BABI_TARBALL_URLS until one
+    works — raises only if every mirror fails."""
     dest.mkdir(parents=True, exist_ok=True)
     en_dir = dest / "tasks_1-20_v1-2" / "en"
     if en_dir.exists():
         return en_dir
     tar_path = dest / "tasks_1-20_v1-2.tar.gz"
     if not tar_path.exists():
-        print(f"[babi] downloading {BABI_TARBALL_URL} → {tar_path}")
-        urllib.request.urlretrieve(BABI_TARBALL_URL, tar_path)
+        last_err: Exception | None = None
+        for url in BABI_TARBALL_URLS:
+            try:
+                print(f"[babi] downloading {url} → {tar_path}")
+                urllib.request.urlretrieve(url, tar_path)
+                last_err = None
+                break
+            except Exception as e:
+                print(f"[babi] mirror failed ({e!r})")
+                last_err = e
+                if tar_path.exists():
+                    tar_path.unlink()
+        if last_err is not None:
+            raise last_err
     print(f"[babi] extracting {tar_path}")
     with tarfile.open(tar_path, "r:gz") as tf:
         tf.extractall(dest)
@@ -117,9 +132,11 @@ def _try_hf_datasets(task_id: int, split: str
     # facebook/babi_qa exposes configs like "en-10k-qa1_single-supporting-fact".
     config = f"en-10k-{BABI_TASK_NAMES[task_id]}"
     try:
-        ds = load_dataset(
-            "facebook/babi_qa", config, split=split, trust_remote_code=True,
-        )
+        # `trust_remote_code` was removed in `datasets>=4`. The
+        # facebook/babi_qa repo is script-based, so it'll error in
+        # those versions; we let the error fall through to the
+        # synthetic / explicit-URL fallback path.
+        ds = load_dataset("facebook/babi_qa", config, split=split)
     except Exception:
         return None
     examples: list[tuple[str, str, str]] = []
