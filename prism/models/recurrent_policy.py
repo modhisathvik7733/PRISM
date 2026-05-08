@@ -51,6 +51,12 @@ class RecurrentPolicy(nn.Module):
         self.gru = nn.GRUCell(gru_in, hidden_dim)
         # Action head reads from h_t.
         self.policy_head = nn.Linear(hidden_dim, n_actions)
+        # Value head — added for PPO actor-critic. State-value V(h_t).
+        # Old BC checkpoints don't have these weights; loading them with
+        # strict=False leaves the value head random-initialized, which is
+        # exactly what we want for PPO fine-tune from BC: critic is learned
+        # fresh while policy is fine-tuned from BC.
+        self.value_head = nn.Linear(hidden_dim, 1)
 
     def init_hidden(self, batch_size: int, device: torch.device) -> torch.Tensor:
         return torch.zeros(batch_size, self.hidden_dim, device=device)
@@ -73,6 +79,28 @@ class RecurrentPolicy(nn.Module):
         h_next = self.gru(x, h_prev)
         logits = self.policy_head(h_next)
         return logits, h_next
+
+    def step_with_value(
+        self,
+        z: torch.Tensor,
+        prev_action: torch.Tensor,
+        mission: torch.Tensor,
+        h_prev: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One recurrent step that ALSO returns the state value.
+        Used by PPO. Returns (logits, value, h_next), where value has
+        shape (B,) — squeezed scalar.
+        """
+        idx = prev_action.clone()
+        idx[idx < 0] = self.no_action_index
+        ae = self.action_emb(idx)
+        me = self.mission_proj(mission)
+        ze = self.latent_proj(z)
+        x = torch.cat([ze, ae, me], dim=-1)
+        h_next = self.gru(x, h_prev)
+        logits = self.policy_head(h_next)
+        value = self.value_head(h_next).squeeze(-1)  # (B,)
+        return logits, value, h_next
 
     def forward(
         self,
