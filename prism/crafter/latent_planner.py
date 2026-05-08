@@ -82,36 +82,48 @@ class LatentPlanner:
         horizon: int = 15,
         beam_k: int = 10,
     ) -> List[int]:
-        """Beam search toward z_goal by cumulative cosine similarity.
+        """Beam search toward z_goal scored on the TERMINAL latent only.
+
+        Pruning at each intermediate step uses current cosine similarity to
+        keep the beam diverse, but the final ranking uses only the cos_sim of
+        the horizon-th predicted state to z_goal.  This avoids selecting plans
+        that pass near the goal early and then drift away.
 
         Returns the action sequence of the highest-scoring beam (len = horizon).
         """
         z_goal_n = F.normalize(z_goal.unsqueeze(0), dim=-1)  # (1, E)
 
-        beam_z      = z_start.unsqueeze(0)                    # (1, E)
-        beam_acts:  List[List[int]] = [[]]
-        beam_scores = torch.zeros(1, device=self.device)      # (K,)
+        beam_z     = z_start.unsqueeze(0)               # (1, E)
+        beam_acts: List[List[int]] = [[]]
+        # Pruning score: intermediate cosine similarity (keeps beams on track).
+        # We track this separately from the terminal score used for final ranking.
+        beam_prune = torch.zeros(1, device=self.device)  # (K,)
 
-        for _ in range(horizon):
+        for step in range(horizon):
             K      = len(beam_z)
-            z_next = self._expand(beam_z)                      # (K*n, E)
+            z_next = self._expand(beam_z)               # (K*n, E)
 
-            z_next_n   = F.normalize(z_next, dim=-1)           # (K*n, E)
-            step_score = (z_next_n * z_goal_n).sum(dim=-1)    # (K*n,)
+            z_next_n   = F.normalize(z_next, dim=-1)    # (K*n, E)
+            step_cos   = (z_next_n * z_goal_n).sum(dim=-1)  # (K*n,)
 
-            cum_scores = beam_scores.repeat_interleave(self.n_actions) + step_score  # (K*n,)
+            # Prune by cumulative intermediate similarity to keep beam alive.
+            prune_scores = beam_prune.repeat_interleave(self.n_actions) + step_cos
 
-            topk = min(beam_k, len(cum_scores))
-            top_vals, top_idx = cum_scores.topk(topk)
+            topk = min(beam_k, len(prune_scores))
+            _, top_idx = prune_scores.topk(topk)
 
-            parent = top_idx // self.n_actions   # (topk,)
-            action = top_idx  % self.n_actions   # (topk,)
+            parent = top_idx // self.n_actions
+            action = top_idx  % self.n_actions
 
-            beam_z      = z_next[top_idx]
-            beam_acts   = [beam_acts[int(parent[i])] + [int(action[i])] for i in range(topk)]
-            beam_scores = top_vals
+            beam_z     = z_next[top_idx]
+            beam_acts  = [beam_acts[int(parent[i])] + [int(action[i])] for i in range(topk)]
+            beam_prune = prune_scores[top_idx]
 
-        return beam_acts[0]  # best beam's action sequence
+        # Final ranking: cosine similarity of terminal state to goal only.
+        terminal_n    = F.normalize(beam_z, dim=-1)                 # (K, E)
+        terminal_cos  = (terminal_n * z_goal_n).sum(dim=-1)         # (K,)
+        best          = int(terminal_cos.argmax())
+        return beam_acts[best]
 
     @torch.no_grad()
     def novelty_plan(
