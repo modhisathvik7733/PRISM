@@ -47,6 +47,14 @@ class JepaConfig:
     # Used by the categorical encoder to recover integer codes from the
     # normalized [0, 1] obs that wrappers produce.
     channel_max: tuple[float, float, float] = (11.0, 6.0, 4.0)
+    # Auxiliary predicate-supervised loss weight. >0 attaches a small predicate
+    # readout head to the online encoder during training and adds BCE against
+    # ground-truth predicates to the total loss. This forces the encoder to
+    # preserve object-typed information that JEPA's pure predictive loss would
+    # otherwise discard (in BabyAI random rollouts, objects don't move, so the
+    # encoder can satisfy next-state prediction without encoding object types).
+    aux_predicate_weight: float = 0.0
+    aux_predicate_dim: int = 96  # PREDICATE_VECTOR_DIM — keep in sync
 
 
 class GridEncoder(nn.Module):
@@ -206,6 +214,15 @@ class JepaWorldModel(nn.Module):
         self.online_encoder = _make_encoder(self.cfg)
         self.target_encoder = _make_encoder(self.cfg)
         self.dynamics = LatentDynamics(self.cfg)
+        # Auxiliary predicate head — only created if the loss weight is > 0.
+        # Linear by design: if a deeper head is required, the encoder isn't
+        # actually preserving the structure, just providing material for the
+        # head to reconstruct it.
+        self.aux_predicate_head: nn.Linear | None = None
+        if getattr(self.cfg, "aux_predicate_weight", 0.0) > 0.0:
+            self.aux_predicate_head = nn.Linear(
+                self.cfg.embed_dim, self.cfg.aux_predicate_dim
+            )
         self._init_target_from_online()
 
     @torch.no_grad()
@@ -247,6 +264,7 @@ class JepaWorldModel(nn.Module):
         obs_t: torch.Tensor,
         action_t: torch.Tensor,
         obs_tp1: torch.Tensor,
+        predicates_t: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         z_t = self.online_encoder(obs_t)
         z_pred = self.dynamics(z_t, action_t)
@@ -258,8 +276,21 @@ class JepaWorldModel(nn.Module):
         # (LeWM uses an explicit KL; we approximate with mean+var penalty for stability.)
         mu, var = z_t.mean(0), z_t.var(0)
         l_reg = (mu.pow(2).mean() + (var - 1).pow(2).mean())
-        return {
-            "loss": l_pred + self.cfg.reg_weight * l_reg,
+
+        total = l_pred + self.cfg.reg_weight * l_reg
+        out = {
             "loss_pred": l_pred.detach(),
             "loss_reg": l_reg.detach(),
         }
+
+        # Auxiliary predicate-supervised loss. Adds a BCE term that forces the
+        # encoder to preserve object-typed information.
+        aux_w = getattr(self.cfg, "aux_predicate_weight", 0.0)
+        if aux_w > 0.0 and self.aux_predicate_head is not None and predicates_t is not None:
+            pred_logits = self.aux_predicate_head(z_t)
+            l_aux = F.binary_cross_entropy_with_logits(pred_logits, predicates_t)
+            total = total + aux_w * l_aux
+            out["loss_aux"] = l_aux.detach()
+
+        out["loss"] = total
+        return out

@@ -28,21 +28,48 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from prism.envs import make_babyai_env
+import gymnasium as gym
+import minigrid  # noqa: F401  (registers BabyAI envs)
+
+from prism.envs.babyai import _encode_image
 from prism.models.jepa import JepaConfig, JepaWorldModel
+from prism.perception import compute_predicates, extract_slots
 from prism.utils.seed import set_global_seed
 
 
-def collect_random_transitions(env, n: int, rng: np.random.Generator):
-    """Collect n one-step transitions under random policy. Returns CHW float32 arrays."""
-    obs_t_list, act_list, obs_tp1_list = [], [], []
+def collect_random_transitions(
+    env_id: str,
+    n: int,
+    rng: np.random.Generator,
+    *,
+    with_predicates: bool = False,
+):
+    """Collect n one-step transitions under random policy.
+
+    We bypass the PrismImageOnlyWrapper here so we can keep the raw uint8
+    obs around for slot extraction (only when with_predicates=True).
+
+    Returns:
+        obs_t:      (n, 3, 7, 7) float32 normalized
+        actions:    (n,) int64
+        obs_tp1:    (n, 3, 7, 7) float32 normalized
+        predicates: (n, 96) float32 ground-truth predicate vectors, or None
+                    if with_predicates=False
+    """
+    env = gym.make(env_id)
+    obs_t_list, act_list, obs_tp1_list, pred_list = [], [], [], []
     obs, _ = env.reset(seed=int(rng.integers(0, 1_000_000)))
     while len(obs_t_list) < n:
+        raw_t = obs["image"]                      # (7, 7, 3) uint8
         a = int(rng.integers(env.action_space.n))
         next_obs, _r, term, trunc, _ = env.step(a)
-        obs_t_list.append(obs["image"] if isinstance(obs, dict) else obs)
+
+        obs_t_list.append(_encode_image(raw_t))   # (3, 7, 7) float32
         act_list.append(a)
-        obs_tp1_list.append(next_obs["image"] if isinstance(next_obs, dict) else next_obs)
+        obs_tp1_list.append(_encode_image(next_obs["image"]))
+        if with_predicates:
+            pred_list.append(compute_predicates(extract_slots(raw_t)))
+
         if term or trunc:
             obs, _ = env.reset(seed=int(rng.integers(0, 1_000_000)))
         else:
@@ -51,6 +78,7 @@ def collect_random_transitions(env, n: int, rng: np.random.Generator):
         np.stack(obs_t_list).astype(np.float32),
         np.array(act_list, dtype=np.int64),
         np.stack(obs_tp1_list).astype(np.float32),
+        np.stack(pred_list).astype(np.float32) if with_predicates else None,
     )
 
 
@@ -72,42 +100,67 @@ def main() -> int:
              "preserves object identity for downstream linear predicate readout. "
              "flat is the legacy continuous-input encoder kept for backward compat."
     )
+    parser.add_argument(
+        "--aux-predicate-weight", type=float, default=0.0,
+        help="Weight on the auxiliary predicate-supervised BCE loss. >0 attaches "
+             "a small predicate readout head and forces the encoder to preserve "
+             "object-typed information that pure next-state prediction discards. "
+             "Try 1.0 as a starting point."
+    )
     args = parser.parse_args()
 
     set_global_seed(args.seed)
     device = torch.device(args.device)
 
-    run_name = args.run_name or f"jepa_{args.encoder_type}_{args.env_id}_seed{args.seed}"
+    aux_tag = f"_aux{args.aux_predicate_weight:g}" if args.aux_predicate_weight > 0 else ""
+    run_name = (
+        args.run_name
+        or f"jepa_{args.encoder_type}{aux_tag}_{args.env_id}_seed{args.seed}"
+    )
     out_dir = Path("runs") / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(out_dir / "tb")
     print(f"[train] writing to {out_dir}")
 
-    env = make_babyai_env(args.env_id, include_mission=False)
-    cfg = JepaConfig(n_actions=env.action_space.n, encoder_type=args.encoder_type)
+    # Probe the env once to get n_actions (we don't need a persistent env handle —
+    # collect_random_transitions creates its own each refresh).
+    _probe_env = gym.make(args.env_id)
+    n_actions = _probe_env.action_space.n
+    _probe_env.close()
+
+    cfg = JepaConfig(
+        n_actions=n_actions,
+        encoder_type=args.encoder_type,
+        aux_predicate_weight=args.aux_predicate_weight,
+    )
     model = JepaWorldModel(cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     print(
         f"[model] encoder={args.encoder_type} "
+        f"aux_predicate_weight={args.aux_predicate_weight} "
         f"params={sum(p.numel() for p in model.parameters()):,}"
     )
 
     rng = np.random.default_rng(args.seed)
-    obs_t_buf = act_buf = obs_tp1_buf = None
+    obs_t_buf = act_buf = obs_tp1_buf = pred_buf = None
     loss_window = deque(maxlen=200)
+    use_aux = args.aux_predicate_weight > 0.0
 
     for step in range(args.steps):
         if step % args.collect_every == 0:
-            obs_t_buf, act_buf, obs_tp1_buf = collect_random_transitions(
-                env, args.rollout_size, rng
+            obs_t_buf, act_buf, obs_tp1_buf, pred_buf = collect_random_transitions(
+                args.env_id, args.rollout_size, rng, with_predicates=use_aux
             )
 
         idx = rng.integers(0, args.rollout_size, size=args.batch_size)
         obs_t = torch.from_numpy(obs_t_buf[idx]).to(device)
         a_t = torch.from_numpy(act_buf[idx]).to(device)
         obs_tp1 = torch.from_numpy(obs_tp1_buf[idx]).to(device)
+        preds_t = (
+            torch.from_numpy(pred_buf[idx]).to(device) if use_aux else None
+        )
 
-        out = model.loss(obs_t, a_t, obs_tp1)
+        out = model.loss(obs_t, a_t, obs_tp1, predicates_t=preds_t)
         loss = out["loss"]
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -123,10 +176,15 @@ def main() -> int:
             writer.add_scalar("loss/pred", out["loss_pred"].item(), step)
             writer.add_scalar("loss/reg", out["loss_reg"].item(), step)
             writer.add_scalar("loss/total_mean200", mean_loss, step)
+            aux_str = ""
+            if "loss_aux" in out:
+                aux_val = out["loss_aux"].item()
+                writer.add_scalar("loss/aux_predicate", aux_val, step)
+                aux_str = f" aux={aux_val:.4f}"
             print(
                 f"[step {step:6d}] loss={loss.item():.4f} "
-                f"pred={out['loss_pred'].item():.4f} reg={out['loss_reg'].item():.4f} "
-                f"mean200={mean_loss:.4f}"
+                f"pred={out['loss_pred'].item():.4f} reg={out['loss_reg'].item():.4f}"
+                f"{aux_str} mean200={mean_loss:.4f}"
             )
 
         if step > 0 and step % 10_000 == 0:
