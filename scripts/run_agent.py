@@ -78,6 +78,7 @@ def run_episode(
     verbose: bool = False,
 ) -> dict:
     obs, _ = env.reset(seed=seed)
+    agent.reset()  # zeros curriculum exploration counter; no-op for other modes
     mission = obs["mission"]
     parsed = goal_predicates_for_mission(mission)
     if parsed is None:
@@ -157,7 +158,7 @@ def main() -> int:
                         help="random follow-up samples per first action (variance "
                              "reduction). 8 keeps single-step latency negligible.")
     parser.add_argument("--scoring-mode", default="magnitude",
-                        choices=["magnitude", "binary", "distance"],
+                        choices=["magnitude", "binary", "distance", "curriculum"],
                         help="magnitude (default) = raw prob diff. binary = score "
                              "predicate FLIPS only. distance = use the 24-d "
                              "continuous distance head (requires JEPA trained with "

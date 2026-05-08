@@ -59,6 +59,7 @@ def initial_cohort(gt_preds_t0: np.ndarray, goal_preds) -> str:
 
 def run_episode(env, agent, *, seed, max_steps):
     obs, _ = env.reset(seed=seed)
+    agent.reset()  # zeros curriculum exploration counter
     mission = obs["mission"]
     parsed = goal_predicates_for_mission(mission)
     if parsed is None:
@@ -123,7 +124,7 @@ def main() -> int:
     parser.add_argument("--horizon", type=int, default=4)
     parser.add_argument("--n-samples", type=int, default=8)
     parser.add_argument("--scoring-mode", default="magnitude",
-                        choices=["magnitude", "binary", "distance"])
+                        choices=["magnitude", "binary", "distance", "curriculum"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()

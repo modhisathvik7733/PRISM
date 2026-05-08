@@ -161,7 +161,7 @@ class GroundedAgent:
         self.device = device
         self.horizon = horizon
         self.n_samples = max(1, n_samples)
-        if scoring_mode not in ("magnitude", "binary", "distance"):
+        if scoring_mode not in ("magnitude", "binary", "distance", "curriculum"):
             raise ValueError(f"unknown scoring_mode={scoring_mode!r}")
         self.scoring_mode = scoring_mode
         if scoring_mode == "distance":
@@ -186,6 +186,117 @@ class GroundedAgent:
         self.jepa.eval()
         self.probe.eval()
         self.n_actions = jepa.cfg.n_actions
+        # Episode-local exploration step counter — used by curriculum mode to
+        # alternate forward/turn when the target is hidden so the agent doesn't
+        # walk into a wall and stall.
+        self._explore_step = 0
+
+    def reset(self) -> None:
+        """Call at the start of each episode so curriculum-mode exploration
+        cycle starts fresh. Calling this from run_agent's run_episode keeps
+        exploration deterministic across episodes for reproducibility."""
+        self._explore_step = 0
+
+    @torch.no_grad()
+    def _curriculum_select(
+        self,
+        z_t: torch.Tensor,
+        baseline_probs: torch.Tensor,
+        goal_preds: list[WeightedGoal],
+        allowed_actions: tuple[int, ...] | None,
+    ) -> tuple[int, dict[str, float]]:
+        """Predicate-curriculum policy: state recognition by current predicates,
+        dynamics used only for the binary 'which turn' decision.
+
+        Decision tree (preserved with weights so we can score-mask later):
+          adjacent(goal) → forward (terminates the episode)
+          facing(goal)   → forward (approach)
+          visible(goal)  → turn toward higher predicted facing-prob
+          else           → forward, with a turn every K steps to scan the room
+        """
+        nA = self.n_actions
+        if allowed_actions is None:
+            allowed = tuple(range(nA))
+        else:
+            allowed = allowed_actions
+
+        # Find the goal-targeted predicate indices. goal_preds is the 4-tuple
+        # for (visible/facing/near/adjacent) on the goal (type, color).
+        idx_visible = idx_facing = idx_adjacent = None
+        for g in goal_preds:
+            if g.name == "visible":
+                idx_visible = g.flat_index
+            elif g.name == "facing":
+                idx_facing = g.flat_index
+            elif g.name == "adjacent":
+                idx_adjacent = g.flat_index
+
+        p_visible = float(baseline_probs[idx_visible].item()) if idx_visible is not None else 0.0
+        p_facing = float(baseline_probs[idx_facing].item()) if idx_facing is not None else 0.0
+        p_adjacent = float(baseline_probs[idx_adjacent].item()) if idx_adjacent is not None else 0.0
+
+        info = {
+            "p_visible": p_visible,
+            "p_facing": p_facing,
+            "p_adjacent": p_adjacent,
+            "explored": 0.0,
+            "max_score": 0.0,
+        }
+
+        FORWARD = 2
+        TURN_LEFT = 0
+        TURN_RIGHT = 1
+
+        def _allowed_or_first(a: int) -> int:
+            return a if a in allowed else allowed[0]
+
+        # 1. adjacent: step in (env terminates)
+        if p_adjacent > 0.5 and FORWARD in allowed:
+            info["chosen"] = FORWARD
+            info["branch"] = "adjacent"
+            return FORWARD, info
+
+        # 2. facing the goal: forward
+        if p_facing > 0.5 and FORWARD in allowed:
+            info["chosen"] = FORWARD
+            info["branch"] = "facing"
+            return FORWARD, info
+
+        # 3. visible but not facing: pick the turn that maximizes predicted
+        # facing-prob. Uses 1-step dynamics for a binary choice — much more
+        # robust than scoring continuous magnitudes.
+        if p_visible > 0.5 and idx_facing is not None and (TURN_LEFT in allowed or TURN_RIGHT in allowed):
+            actions = torch.tensor([TURN_LEFT, TURN_RIGHT], device=self.device, dtype=torch.long)
+            expand_shape = (2,) + (-1,) * (z_t.ndim - 1)
+            z_rep = z_t.expand(*expand_shape)
+            z_next = self.jepa.predict(z_rep, actions)
+            next_probs = torch.sigmoid(self.probe(z_next))  # (2, P+D)
+            p_face_left = float(next_probs[0, idx_facing].item())
+            p_face_right = float(next_probs[1, idx_facing].item())
+            info["p_face_after_left"] = p_face_left
+            info["p_face_after_right"] = p_face_right
+            chosen = TURN_LEFT if p_face_left >= p_face_right else TURN_RIGHT
+            info["chosen"] = _allowed_or_first(chosen)
+            info["branch"] = "visible_rotate"
+            return info["chosen"], info
+
+        # 4. target hidden: explore. Forward most steps, turn occasionally so
+        # we scan the room. Mostly-forward exploration matches what works in
+        # BabyAI partial-view envs — turning rotates view but doesn't move you.
+        EXPLORE_TURN_EVERY = 4
+        self._explore_step += 1
+        if self._explore_step % EXPLORE_TURN_EVERY == 0 and TURN_RIGHT in allowed:
+            info["chosen"] = TURN_RIGHT
+            info["branch"] = "explore_turn"
+            return TURN_RIGHT, info
+        if FORWARD in allowed:
+            info["chosen"] = FORWARD
+            info["branch"] = "explore_forward"
+            return FORWARD, info
+        # Fallback if forward isn't allowed
+        info["chosen"] = allowed[0]
+        info["branch"] = "explore_fallback"
+        return allowed[0], info
 
     @torch.no_grad()
     def select_action(
@@ -226,6 +337,18 @@ class GroundedAgent:
         # Baseline predicate probabilities at the CURRENT state.
         baseline_logits = self.probe(z_t)             # (1, 96)
         baseline_probs = torch.sigmoid(baseline_logits).squeeze(0)  # (96,)
+
+        # ----- CURRICULUM SCORING ---------------------------------------------
+        # The advantage-based scoring approaches (magnitude/binary/distance) have
+        # all collapsed to uniform-random over allowed actions because turn-action
+        # noise (F1=0.57, distance MAE=0.17 when visible) dominates the 1-cell
+        # signal differences. Curriculum bypasses that by using only the most
+        # reliable signal — the current-state predicate readout, F1=0.998 — to
+        # pick the action class, and reduces dynamics use to a 1-bit decision
+        # (which way to turn when target visible but not facing).
+        if self.scoring_mode == "curriculum":
+            return self._curriculum_select(z_t, baseline_probs, goal_preds, allowed_actions)
+        # ----------------------------------------------------------------------
 
         # Multi-sample rollouts: for each candidate first action, simulate
         # `n_samples` independent random follow-up trajectories of length
