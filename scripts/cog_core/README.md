@@ -14,18 +14,35 @@ This phase implements **Stage 0 (pre-linguistic cognition)** only —
 embodied object/action/causality in BabyAI gridworld. Language stages
 (1-4) come later, AFTER Stage 0 emergence is verified.
 
-## Components built (5 of 8)
+## Components built (5 of 8 + Path B developmental trainer)
 
 | # | Module | What it does |
 |---|---|---|
 | 1 | `prism/cog_core/object_tracker.py` | Probe JEPA latents for persistent (type, color, pos) entities; greedy nearest-neighbor tracker maintains IDs across frames |
-| 2 | `prism/cog_core/world_model_rollout.py` | Wraps frozen v1.3 JEPA for multi-step rollouts (`encode`, `step`, `rollout`, `predicates`, `latent_diff`) |
+| 2 | `prism/cog_core/world_model_rollout.py` | Wraps a frozen JEPA for multi-step rollouts (`encode`, `step`, `rollout`, `predicates`, `latent_diff`) |
 | 3 | `prism/cog_core/counterfactual.py` | Compares (state, actual_action) vs (state, cf_action) rollouts → divergence metrics + predicate flips |
 | 4 | `prism/cog_core/operator_bank.py` | K-means clusters JEPA latent-deltas into operators; per-cluster purity + cross-env stability checks |
-| 7 | `prism/cog_core/curriculum.py` | ALP-bandit (Akakzia 2021): `value(task) = (1 - sr) × |LP|` |
+| 7 | `prism/cog_core/curriculum.py` | Per-task ALP-bandit (Akakzia 2021): `value(task) = (1 - sr) × |LP|` — used at PPO fine-tune level |
+| **JEPA-curriculum** | **`prism/cog_core/dev_curriculum.py`** | **Stage definitions (0a → 0b → 0c → 0d) + competence-gated transition logic for the JEPA itself** |
 
 Components 5 (memory), 6 (curiosity), 8 (language grounding) are
 explicitly **deferred** until Phase 1 emergence passes.
+
+## Path A vs Path B
+
+We deliberately built BOTH paths so the developmental-curriculum
+principle can be tested cleanly:
+
+| Path | What | Why |
+|---|---|---|
+| **A** (v1.3 reuse) | Reuse the v1.3 JEPA frozen, run all 5 emergence tests on it | Fast diagnostic (~4-5 hr). Tests whether emergence happens WITHOUT explicit curriculum (was random-rollout trained). |
+| **B** (this commit) | Re-train JEPA from scratch with strict stage progression | Honors the principle "treat as person who knows nothing." Tests whether developmental ordering produces stronger emergence than random ordering. |
+
+The **comparison between A and B** is the actual test of the
+"developmental curriculum is critical" claim. If B's emergence
+metrics are noticeably stronger than A's, the principle is empirically
+supported. If they're tied, the principle is decorative at this
+scale (and we still have a working Stage 0 substrate either way).
 
 ## Five emergence criteria (the gate to Phase 2)
 
@@ -40,7 +57,69 @@ explicitly **deferred** until Phase 1 emergence passes.
 If ALL 5 pass → Phase 2 (memory, curiosity, language grounding).
 If any fail → re-architect the failing component, do NOT add more.
 
-## Quickstart (~4-5 hours total compute)
+## Path B — train JEPA developmentally (the principled foundation)
+
+Train the JEPA itself with strict stage progression. Each stage has a
+competence-gate: don't graduate until 1-step latent cosine ≥ threshold
+on held-out data of THAT stage.
+
+```bash
+# Stages defined in prism/cog_core/dev_curriculum.DEFAULT_STAGES:
+#   0a  BabyAI-OneRoomS8-v0     basic movement + walls in 8x8 empty room
+#   0b  BabyAI-GoToObj-v0       single-object permanence
+#   0c  BabyAI-GoToLocal-v0     multi-object discrimination, small room
+#   0d  BabyAI-OneRoomS16-v0    larger spatial complexity (16x16)
+
+python -m scripts.cog_core.train_jepa_developmental \
+    --total-steps 80000 --batch-size 128 \
+    --encoder-type categorical_spatial --spatial-channels 64 \
+    --dynamics-type spatial_film --dynamics-hidden 256 --dynamics-layers 3 \
+    --aux-predicate-weight 3.0 --aux-distance-dim 24 --aux-distance-weight 0.5 \
+    --run-name jepa_dev_v0 --device cuda
+```
+
+Compute: ~3-5 hr on the 5070 Ti. Each stage logs cosine-sim every
+500 steps; stage transitions are auto-saved as
+`runs/jepa_dev_v0/jepa_after_<stage>.pt`. Final model at
+`runs/jepa_dev_v0/jepa_final.pt`.
+
+After this finishes, **re-run all the Phase 1 emergence tests pointing
+at the dev JEPA instead of v1.3**:
+
+```bash
+export DEV_JEPA="runs/jepa_dev_v0/jepa_final.pt"
+
+# Re-collect rollouts using DEV JEPA (we still need a v1.3-style policy
+# for action-generation; either reuse v1.3 or train a quick BC policy
+# on the dev-JEPA latents). For first comparison just reuse v1.3 policy:
+python -m scripts.cog_core.collect_rollouts \
+    --jepa-checkpoint $DEV_JEPA \
+    --policy-checkpoint $V13_POLICY \
+    --envs BabyAI-GoToLocal-v0 BabyAI-GoTo-v0 BabyAI-GoToObj-v0 \
+    --episodes-per-env 500 \
+    --output runs/cog_core_phase1_devB/rollouts.npz
+
+# All other steps from Path A's quickstart, but pointed at the new
+# rollouts + the new JEPA. This produces the second column of
+# emergence numbers for the head-to-head comparison.
+```
+
+**The headline result is the comparison table:**
+
+| Emergence test | Path A (v1.3 JEPA) | Path B (dev JEPA) |
+|---|---:|---:|
+| Object persistence accuracy | TBD | TBD |
+| World model 1-step / 4-step cos | TBD | TBD |
+| Counterfactual coherence | TBD | TBD |
+| # interpretable operators | TBD | TBD |
+| ALP curriculum lift | TBD | TBD |
+
+If Path B numbers beat Path A by ≥10%, **the developmental principle
+is empirically validated**. That's the v4.0 result for `EXPERIMENTS.md`.
+
+---
+
+## Quickstart (~4-5 hours total compute) — Path A (v1.3 emergence test)
 
 ```bash
 # 0. Set the v1.3 JEPA path (already trained)
