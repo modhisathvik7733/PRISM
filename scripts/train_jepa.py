@@ -66,22 +66,31 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--run-name", default=None)
+    parser.add_argument(
+        "--encoder-type", default="categorical", choices=["flat", "categorical"],
+        help="categorical (default) uses per-cell type/color/state embeddings — "
+             "preserves object identity for downstream linear predicate readout. "
+             "flat is the legacy continuous-input encoder kept for backward compat."
+    )
     args = parser.parse_args()
 
     set_global_seed(args.seed)
     device = torch.device(args.device)
 
-    run_name = args.run_name or f"jepa_{args.env_id}_seed{args.seed}"
+    run_name = args.run_name or f"jepa_{args.encoder_type}_{args.env_id}_seed{args.seed}"
     out_dir = Path("runs") / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(out_dir / "tb")
     print(f"[train] writing to {out_dir}")
 
     env = make_babyai_env(args.env_id, include_mission=False)
-    cfg = JepaConfig(n_actions=env.action_space.n)
+    cfg = JepaConfig(n_actions=env.action_space.n, encoder_type=args.encoder_type)
     model = JepaWorldModel(cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    print(f"[model] params={sum(p.numel() for p in model.parameters()):,}")
+    print(
+        f"[model] encoder={args.encoder_type} "
+        f"params={sum(p.numel() for p in model.parameters()):,}"
+    )
 
     rng = np.random.default_rng(args.seed)
     obs_t_buf = act_buf = obs_tp1_buf = None

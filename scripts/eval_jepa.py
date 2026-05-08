@@ -38,7 +38,7 @@ import numpy as np
 import torch
 
 from prism.envs import make_babyai_env
-from prism.models.jepa import JepaConfig, JepaWorldModel
+from prism.models.jepa import JepaConfig, JepaWorldModel, upgrade_config
 from prism.utils.seed import set_global_seed
 
 
@@ -184,7 +184,7 @@ def main() -> int:
     ckpt_path = Path(args.checkpoint)
     print(f"[eval] loading {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    cfg: JepaConfig = ckpt["cfg"]
+    cfg: JepaConfig = upgrade_config(ckpt["cfg"])  # backward compat
     model = JepaWorldModel(cfg).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()

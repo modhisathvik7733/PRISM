@@ -38,7 +38,7 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 from prism.envs.babyai import _encode_image
-from prism.models.jepa import JepaConfig, JepaWorldModel
+from prism.models.jepa import JepaConfig, JepaWorldModel, upgrade_config
 from prism.models.predicate_probe import make_probe
 from prism.perception import (
     NUM_PREDICATES,
@@ -143,16 +143,18 @@ def main() -> int:
         print(f"[probe] --use-raw-obs: probing on flattened raw obs (dim={embed_dim})")
     else:
         ckpt = torch.load(args.jepa_checkpoint, map_location=device, weights_only=False)
-        cfg = ckpt["cfg"]
+        cfg = upgrade_config(ckpt["cfg"])  # backward compat for pre-encoder_type ckpts
         embed_dim = cfg.embed_dim
         jepa = JepaWorldModel(cfg).to(device)
         jepa.load_state_dict(ckpt["model"])
         jepa.eval()
         for p in jepa.parameters():
             p.requires_grad_(False)
+        encoder_type = getattr(cfg, "encoder_type", "flat")
         print(
-            f"[probe] loaded JEPA: {sum(p.numel() for p in jepa.parameters()):,} "
-            f"params (frozen), embed_dim={embed_dim}"
+            f"[probe] loaded JEPA ({encoder_type} encoder): "
+            f"{sum(p.numel() for p in jepa.parameters()):,} params (frozen), "
+            f"embed_dim={embed_dim}"
         )
 
     # ------------------------------------------------------ data
