@@ -99,21 +99,49 @@ phase4_ppo_per_env() {
     done
 }
 
+phase4b_ppo_multienv() {
+    # One PPO run, 16 workers round-robin across all 4 envs. Per AMAGO-2 /
+    # BabyAI++ this is the variant that actually generalizes across levels.
+    # Each env gets 16/4 = 4 workers, so 32 envsteps/iter come from each.
+    echo "=== phase4b: multi-env PPO from multi-env BC warmstart ==="
+    python -m scripts.generalize.ppo_train_multienv \
+        --jepa-checkpoint "runs/${RUN_TAG}_jepa_universal/jepa_final.pt" \
+        --bc-checkpoint "runs/${RUN_TAG}_bc_multienv/policy_final.pt" \
+        --envs "${ENVS[@]}" \
+        --mem-feat-dim 5 \
+        --max-steps 128 --shaping-coef 0.1 \
+        --total-steps 2000000 \
+        --run-name "${RUN_TAG}_ppo_multienv" --device "$DEVICE"
+}
+
 phase5_capstone() {
-    # For each per-env PPO checkpoint, run the multi-env eval so we see both
-    # in-domain performance AND cross-env transfer.
-    echo "=== phase5: capstone — eval each per-env policy across all envs ==="
+    # For each per-env PPO checkpoint AND the multi-env one, run the
+    # multi-env eval so we see both in-domain performance AND cross-env
+    # transfer in a single comparable table.
+    echo "=== phase5: capstone — eval each policy across all envs ==="
     for env in BabyAI-Pickup-v0 BabyAI-GoTo-v0 BabyAI-Open-v0; do
         suffix="${env#BabyAI-}"; suffix="${suffix%-v0}"
         ckpt="runs/${RUN_TAG}_ppo_${suffix}/policy_final.pt"
-        echo "  --- eval $ckpt across all envs ---"
+        if [[ -f "$ckpt" ]]; then
+            echo "  --- eval $ckpt across all envs ---"
+            python -m scripts.generalize.ppo_eval_multi \
+                --jepa-checkpoint "runs/${RUN_TAG}_jepa_universal/jepa_final.pt" \
+                --policy-checkpoint "$ckpt" \
+                --envs "${ENVS[@]}" \
+                --episodes 1000 --max-steps 128 --device "$DEVICE" \
+                --per-cohort
+        fi
+    done
+    multi_ckpt="runs/${RUN_TAG}_ppo_multienv/policy_final.pt"
+    if [[ -f "$multi_ckpt" ]]; then
+        echo "  --- eval $multi_ckpt (multi-env) across all envs ---"
         python -m scripts.generalize.ppo_eval_multi \
             --jepa-checkpoint "runs/${RUN_TAG}_jepa_universal/jepa_final.pt" \
-            --policy-checkpoint "$ckpt" \
+            --policy-checkpoint "$multi_ckpt" \
             --envs "${ENVS[@]}" \
             --episodes 1000 --max-steps 128 --device "$DEVICE" \
             --per-cohort
-    done
+    fi
 }
 
 case "${1:-help}" in
@@ -122,6 +150,7 @@ case "${1:-help}" in
     phase2|jepa) phase2_universal_jepa ;;
     phase3|bc_train) phase3_bc_train ;;
     phase4|ppo) phase4_ppo_per_env ;;
+    phase4b|ppo_multi) phase4b_ppo_multienv ;;
     phase5|capstone) phase5_capstone ;;
     all)
         phase0_zeroshot
@@ -129,16 +158,18 @@ case "${1:-help}" in
         phase2_universal_jepa
         phase3_bc_train
         phase4_ppo_per_env
+        phase4b_ppo_multienv
         phase5_capstone
         ;;
     *)
-        echo "usage: $0 {phase0|phase1|phase2|phase3|phase4|phase5|all}"
-        echo "  phase0  zero-shot eval of v1.3 across new envs"
-        echo "  phase1  collect mixed BC data (~30 min)"
-        echo "  phase2  train universal JEPA (~30-60 min)"
-        echo "  phase3  BC-train recurrent policy on mixed data (~30 min)"
-        echo "  phase4  per-env PPO from multi-env BC (3 runs, ~3 hr)"
-        echo "  phase5  multi-env capstone eval per policy"
+        echo "usage: $0 {phase0|phase1|phase2|phase3|phase4|phase4b|phase5|all}"
+        echo "  phase0   zero-shot eval of v1.3 across new envs"
+        echo "  phase1   collect mixed BC data (~30 min)"
+        echo "  phase2   train universal JEPA (~30-60 min)"
+        echo "  phase3   BC-train recurrent policy on mixed data (~30 min)"
+        echo "  phase4   per-env PPO from multi-env BC (3 runs, ~3 hr)"
+        echo "  phase4b  multi-env PPO (one run, ~1.5 hr) — recommended"
+        echo "  phase5   multi-env capstone eval per policy"
         exit 1
         ;;
 esac

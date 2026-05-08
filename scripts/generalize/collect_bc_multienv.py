@@ -28,9 +28,10 @@ import minigrid  # noqa: F401  (registers BabyAI envs)
 import numpy as np
 import torch
 
-from prism.agents import GroundedAgent, goal_predicates_for_mission
+from prism.agents import GroundedAgent
 from prism.agents.grounded_agent import allowed_actions_for_spec
 from prism.envs.babyai import _encode_image, make_env_with_max_steps
+from prism.generalize.mission_parser_v2 import goal_predicates_for_mission_ext
 from prism.generalize.teacher_inject import InjectingTeacher
 from prism.models.jepa import JepaConfig, JepaWorldModel, upgrade_config
 from prism.perception.predicates import type_color_index
@@ -70,7 +71,7 @@ def collect_for_env(
         obs, _ = env.reset(seed=ep_seed)
         teacher.reset()
         mission = obs["mission"]
-        parsed = goal_predicates_for_mission(mission)
+        parsed = goal_predicates_for_mission_ext(mission)
         if parsed is None:
             continue
         goal_preds, spec = parsed

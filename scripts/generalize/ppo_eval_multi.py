@@ -27,11 +27,87 @@ import numpy as np
 import torch
 
 from prism.agents import GroundedAgent
-from prism.envs.babyai import make_env_with_max_steps
+from prism.agents.grounded_agent import allowed_actions_for_spec
+from prism.envs.babyai import _encode_image, make_env_with_max_steps
+from prism.generalize.mission_parser_v2 import goal_predicates_for_mission_ext
 from prism.models.jepa import JepaConfig, JepaWorldModel, upgrade_config
 from prism.models.recurrent_policy import RecurrentPolicy
+from prism.perception import compute_predicates, extract_slots
+from prism.perception.predicates import type_color_index
+from prism.perception.slots import NUM_COLORS, OBJECT_TYPES
 from prism.utils.seed import set_global_seed
-from scripts.eval_agent_cohorts import run_episode
+from scripts.eval_agent_cohorts import initial_cohort
+
+
+def run_episode_ext(env, agent, *, seed, max_steps, recurrent_policy=None):
+    """Drop-in replacement for `eval_agent_cohorts.run_episode` that uses
+    the v2 (extended) mission parser. Same return shape, so the multi-env
+    eval aggregator and per-cohort breakdown work unchanged."""
+    obs, _ = env.reset(seed=seed)
+    agent.reset()
+    mission = obs["mission"]
+    parsed = goal_predicates_for_mission_ext(mission)
+    if parsed is None:
+        return None
+    goal_preds, spec = parsed
+    allowed = allowed_actions_for_spec(spec, env.action_space.n)
+
+    if recurrent_policy is not None:
+        tc_idx = type_color_index(goal_preds[0].type_id, goal_preds[0].color_id)
+        mission_one_hot = torch.zeros(len(OBJECT_TYPES) * NUM_COLORS)
+        mission_one_hot[tc_idx] = 1.0
+        agent.attach_recurrent_policy(
+            recurrent_policy, mission_one_hot,
+            goal_type=goal_preds[0].type_id,
+            goal_color=goal_preds[0].color_id,
+        )
+
+    raw_t0 = obs["image"]
+    gt_t0 = compute_predicates(extract_slots(raw_t0))
+    cohort = initial_cohort(gt_t0, goal_preds)
+
+    actions_taken: list[int] = []
+    explored_steps = 0
+    max_scores: list[float] = []
+    became_visible = False
+    visible_idx = next((g.flat_index for g in goal_preds if g.name == "visible"), None)
+    if cohort != "hidden":
+        became_visible = True
+
+    ep_reward = 0.0
+    steps_to_first_visible = -1
+    for step in range(max_steps):
+        raw = obs["image"]
+        encoded = _encode_image(raw)
+        if not became_visible and visible_idx is not None:
+            gt_now = compute_predicates(extract_slots(raw))
+            if gt_now[visible_idx] > 0.5:
+                became_visible = True
+                steps_to_first_visible = step
+
+        obs_t = torch.from_numpy(encoded).float()
+        action, info = agent.select_action(obs_t, goal_preds, allowed_actions=allowed)
+        actions_taken.append(int(action))
+        if info.get("explored", 0.0):
+            explored_steps += 1
+        max_scores.append(info.get("max_score", 0.0))
+
+        obs, r, term, trunc, _ = env.step(action)
+        ep_reward += float(r)
+        if term or trunc:
+            break
+
+    return {
+        "mission": mission,
+        "cohort": cohort,
+        "reward": ep_reward,
+        "steps": len(actions_taken),
+        "actions": actions_taken,
+        "explored_rate": explored_steps / max(len(actions_taken), 1),
+        "max_score_mean": float(np.mean(max_scores)) if max_scores else 0.0,
+        "became_visible": became_visible,
+        "steps_to_first_visible": steps_to_first_visible,
+    }
 
 
 def evaluate_env(
@@ -47,7 +123,7 @@ def evaluate_env(
     by_cohort: dict[str, list[dict]] = defaultdict(list)
     n_skipped = 0
     for ep in range(n_episodes):
-        result = run_episode(
+        result = run_episode_ext(
             env, agent,
             seed=seed + ep * 7919,
             max_steps=max_steps,
