@@ -43,95 +43,132 @@ causal/operator/object-persistence structure emerges in the JEPA itself,
 and whether a strict child→adult curriculum produces stronger emergence
 than random-rollout training.
 
-| Test | Path A: v1.3 JEPA (no curriculum, 200k steps) | Path B: dev JEPA (4-stage curriculum, **32k steps**) |
+**Honest result: 3/5 substantive tests pass cleanly. Two real failures.**
+The earlier "4/5 PASS" claim was based on a partial measurement; once
+Path A's full eval was run + Path B's per-env stability + the
+curriculum scheduler test, real problems surfaced.
+
+| Test | Path A: v1.3 JEPA (200k steps, no curriculum) | Path B: dev JEPA (32k steps, 4-stage curriculum) |
 |------|------:|------:|
-| Object presence accuracy | **99.20%** | 98.02% |
-| Position MAE (cells) | **0.47** | 0.60 |
-| World model 1-step / 4-step cosine | (not measured A) | **0.999 / 0.966** |
-| Counterfactual coherence | (not measured A) | **0.98** |
-| Operator clusters interpretable | 7/8 | 8/8 |
+| 1. Object presence accuracy | **99.45%** ✓ | **97.8%** ✓ |
+| 2. World model 1-step / 4-step cosine | **0.270 / 0.138** ✗ | **0.999 / 0.966** ✓ |
+| 3. Counterfactual coherence | **0.99** ✓ | **0.99** ✓ |
+| 4a. Operator clusters interpretable | 7/8 ✓ | 7/8 ✓ |
+| **4b. Cross-env operator stability** | (not measured) | **mean cosine 0.45-0.56, 0/8 ≥0.8** ✗ |
+| **5. ALP curriculum vs random scheduler** | — | **ALP=0.576 vs Random=0.627** ✗ (random WINS) |
 | **JEPA training steps** | 200k | **32k (6× fewer)** |
 
 | Version | Tag | Result | Notes |
 |---------|-----|--------|-------|
-| **v4.0**| `v4.0-cog-core-phase1` | 4/5 emergence tests PASS on dev JEPA | Developmental curriculum produces equivalent-quality JEPA representations 6× faster than non-curriculum training. Test 5 (curriculum-vs-random PPO scheduler) was not run; 4 substrate-emergence tests all pass. |
+| **v4.0-partial** | `v4.0-partial-cog-core-phase1` | **3/5 substantive tests pass cleanly. Two real failures: cross-env operator stability (operators are env-specific, not universal primitives) AND curriculum scheduler (ALP-bandit actively hurts vs random). The earlier `v4.0-cog-core-phase1` tag was premature and is being retagged.** |
 
 ---
 
-## v4.0 — Cognitive core, Phase 1 (substrate emergence)
+## v4.0-partial — Cognitive core Phase 1 (substrate emergence — partial pass)
 
-**Date:** 2026-05-09
+**Date:** 2026-05-09 (results), 2026-05-10 (corrected after full data run)
 **Checkpoint (dev JEPA):** `runs/jepa_dev_v0/jepa_final.pt`
-**Object tracker probes:** `runs/cog_phase1_devB_objects/model_final.pt` (Path B), `runs/cog_phase1_v13_objects/model_final.pt` (Path A)
-**Operator banks:** `/tmp/dev_ops.npz` (Path B), `runs/cog_core_phase1/operators.npz` (Path A)
-**Emergence report:** `docs/EXPERIMENTS_phase1_devB.md`
+**Object tracker probes:** `runs/cog_phase1_devB_objects/` (Path B), `runs/cog_phase1_v13_objects/` (Path A)
+**Operator banks:** `runs/cog_core_phase1_devB/operators.npz` (Path B), `runs/cog_core_phase1/operators.npz` (Path A)
+**Curriculum-comparison policies:** `runs/cog_phase1_devB_alp/` (ALP) vs `runs/cog_phase1_devB_random/` (random)
+**Reports:** `docs/EXPERIMENTS_phase1_devB_FINAL.md`, `docs/EXPERIMENTS_phase1_pathA.md`
+
+### What I claimed earlier vs what's true
+The first eval run only had Path B's object-tracker + a single-env
+operator extraction + counterfactual eval. I declared 4/5 PASS based
+on that partial dataset. Once Path A's full eval ran + Path B's
+per-env operator stability + the actual curriculum-vs-random
+comparison, two real failures surfaced. Tagging is being corrected
+from `v4.0-cog-core-phase1` → `v4.0-partial-cog-core-phase1` to
+reflect the truth.
 
 ### Setup
-- **Path A (control):** the v1.3 JEPA (`runs/jepa_categorical_spatial_aux3_dist24_mix0.5_spat64_spatial_film_dyn3x256_BabyAI-GoToLocal-v0_seed0/jepa_final.pt`), trained on ~200k random-rollout transitions of GoToLocal-v0 with no curriculum.
-- **Path B (the developmental hypothesis):** a fresh JEPA, same architecture as v1.3, trained from scratch through a strict 4-stage curriculum:
-  1. **0a** — `BabyAI-OneRoomS8-v0` (basic movement + walls in 8×8 empty room) — graduated at step 2000, cosine 0.998
-  2. **0b** — `BabyAI-GoToObj-v0` (single-object permanence) — graduated at step 7000, cosine 0.999
-  3. **0c** — `BabyAI-GoToLocal-v0` (multi-object discrimination) — graduated at step 17000, cosine 0.998
-  4. **0d** — `BabyAI-OneRoomS16-v0` (larger spatial complexity) — graduated at step 32000, cosine 1.000
-- Each stage gates on `1-step latent cosine ≥ threshold` AND `min_steps reached`. Force-advance after `max_steps`.
-- Rollouts for emergence eval: 1500 episodes (500 each on 3 envs) using v1.3 PPO policy, encoded through whichever JEPA is being tested.
+- **Path A (control):** the v1.3 JEPA, trained on ~200k random-rollout transitions of GoToLocal-v0 with no curriculum.
+- **Path B (the developmental hypothesis):** fresh JEPA, same architecture as v1.3, trained from scratch through a strict 4-stage curriculum:
+  1. **0a** — `BabyAI-OneRoomS8-v0` — graduated at step 2000, cosine 0.998
+  2. **0b** — `BabyAI-GoToObj-v0` — graduated at step 7000, cosine 0.999
+  3. **0c** — `BabyAI-GoToLocal-v0` — graduated at step 17000, cosine 0.998
+  4. **0d** — `BabyAI-OneRoomS16-v0` — graduated at step 32000, cosine 1.000
 
-### Five emergence criteria (Path B / dev JEPA)
+### Five emergence criteria — actual results
 
-| # | Test | Value | Target | Pass? |
-|---|------|------:|-------:|:-----:|
-| 1 | Object persistence (probe accuracy on held-out frames) | **0.9815** | ≥0.85 | ✓ |
-| 2 | World model 1-step / 4-step cosine sim | **0.999 / 0.966** | ≥0.95 / ≥0.85 | ✓ |
-| 3 | Counterfactual coherence (% swaps producing real divergence) | **0.98** | ≥0.80 | ✓ |
-| 4 | Operator abstraction (≥4 interpretable K-means clusters, dominant action ≥80%) | **8 / 8 interpretable** | ≥4 | ✓ |
-| 5 | Curriculum scheduler (ALP vs random) | not measured | ALP ≥ random + 0.10 | — |
+| # | Test | Path A (v1.3) | Path B (dev) | Target | Pass? |
+|---|------|--------------:|-------------:|-------:|:-----:|
+| 1 | Object persistence | 0.9945 | 0.9780 | ≥0.85 | both ✓ |
+| 2 | World model 1-step / 4-step cosine | **0.270 / 0.138** | **0.999 / 0.966** | ≥0.95 / ≥0.85 | A ✗, B ✓ |
+| 3 | Counterfactual coherence | 0.99 | 0.99 | ≥0.80 | both ✓ |
+| 4a | Operator clusters interpretable | 7/8 | 7/8 | ≥4 | both ✓ |
+| 4b | **Cross-env operator stability** | — | **mean cosine 0.45-0.56, 0/8 ≥0.8** | mean ≥0.8 | **✗** |
+| 5 | **ALP curriculum vs random scheduler** | — | **ALP=0.576 vs Random=0.627** | ALP ≥ random + 0.10 | **✗** (random wins by 5pp) |
 
-### Headline conclusions
-- **Phase 1 substrate emergence is verified.** The dev JEPA produces
-  latents from which an MLP probe can recover object identity + position
-  with **98.0% accuracy** (≤0.6-cell positional error). Counterfactual
-  rollouts diverge meaningfully 98% of the time. K-means over latent
-  deltas finds 8/8 interpretable operator clusters.
-- **The developmental curriculum is empirically supported via sample
-  efficiency.** 32k JEPA steps to ~equivalent quality vs ~200k for v1.3
-  = **6× sample-efficient**. Curriculum loses ~1pp on absolute peak
-  (98.0% vs 99.2%) but the speedup is the meaningful number.
-- **Operator clustering depends on the rollout policy more than the
-  JEPA.** Path B's mega-cluster (87% of transitions in one cluster)
-  reflects the v1.3 policy's action distribution drift when run on
-  dev-JEPA latents (episodes averaged 120 steps for dev-JEPA vs 40
-  for v1.3-JEPA). The cluster-shape comparison isn't apples-to-apples
-  without a policy retrained per JEPA. The IMPORTANT question — are
-  there interpretable operators? — is "yes" for both.
-- **Test 5 (ALP-bandit vs random scheduling)** is independent of
-  substrate emergence; it tests whether a learned scheduler beats
-  random for picking which env to PPO-finetune on. Not blocking.
+### The genuine wins
+- **Path B's world model is dramatically better than Path A's** at predicting next-state.
+  Path A has 0.270 1-step cosine sim — that's barely above chance. Yet Path A's policy
+  hits 0.928 (98.7% success) on BabyAI-GoToLocal. **This is strong evidence v1.3 was
+  succeeding via memorization, not via a real world model.** Curriculum-trained Path B
+  has 0.999 cosine — actual predictive dynamics.
+- **Path B is 6× more sample-efficient** at JEPA training (32k steps vs 200k).
+- **Both encode objects well** (97.8-99.4% probe accuracy).
+- **Both have coherent counterfactuals** (0.99 — swapping actions produces
+  meaningfully different rollouts).
 
-### Honest caveats
-- **Cosine ~1.0 stage gates were too loose.** All 4 Path B stages
-  graduated at cosine 0.998+, suggesting the gates fired before
-  meaningful learning was forced. Future iterations should gate on
-  predicate-aux-head accuracy (substantive measure) rather than
-  cosine (sanity bound). The fact that emergence still passed is
-  reassuring — the JEPA learned despite loose gates — but a tighter
-  gate would likely close the 1pp gap to v1.3.
-- **Methodology note**: For a clean A-vs-B comparison we'd ideally
-  use a random policy or train fresh policies per JEPA. We re-used
-  the v1.3 policy on both, which biases the dev-JEPA's effective
-  action distribution.
+### The two real failures
 
-### What this enables (the bigger picture)
-With substrate emergence verified, the path forward is:
-- **Stage 1 (early grounded language)** — resume the previously paused
-  Path B language work (`prism/lang_pretrain/`) but now with the dev
-  JEPA as the cognitive substrate. The model speaks via AR I/O; its
-  middle layer reads/writes to the cognitive substrate (object tracker,
-  operators) instead of just doing token-level reasoning.
-- **Stage 2-4** as planned (compositional language → math → technical),
-  each gated on stage-1 emergence.
+**4b. Cross-env operator stability — FAIL**
+K-means clusters fit on GoTo data have mean cosine similarity of 0.45-0.56
+with K-means clusters fit on GoToLocal/GoToObj data — well below the 0.8
+target. Out of 8 operators, **0/8** stable across env pairs.
 
-The curriculum scheduler from Phase 1 (`prism/cog_core/curriculum.py`)
-controls stage transitions in Phase 2+, not just env selection.
+What this means: operators learned in one env don't transfer to another.
+The "compositional primitives" claim doesn't hold under the K-means
+extraction approach. Operators are env-specific, not universal
+abstractions. **This is a real architectural issue, not a tuning problem.**
+
+The fix in progress (`prism/cog_core/operator_bank_v2.py`): replace
+K-means with gradient-based mixture-of-experts (Mixture-of-World-Models
+recipe, arXiv 2602.01270). K shared dynamics heads with soft routing —
+operators ARE the dynamics, fit jointly across envs, so cross-env
+stability becomes structural.
+
+**5. ALP-bandit curriculum scheduler — FAIL**
+ALP scheduler (Akakzia formula `(1-sr)×|LP|`): 0.576 mean R across 3 envs
+Random scheduler: 0.627 mean R
+**Random wins by 5 percentage points.**
+
+Looking at the schedule history: ALP picked GoTo (the hardest env) 70-90%
+of the time because GoTo had low success rate. Spending too much budget
+on the inherently-hardest task neglected the other two, which regressed.
+The Akakzia formula's `(1-sr)` term creates a trap: anything with low
+success rate looks valuable, even if the gradient is essentially zero.
+
+What this means: the ALP-bandit doesn't reliably pick "the most
+learnable task." For Phase 2 onward, default to random scheduling unless
+a different bandit formula is validated.
+
+### Honest interpretation of the curriculum hypothesis
+- **At the JEPA-training level**: developmental curriculum WORKS. Path B
+  is dramatically better at world prediction (0.999 vs 0.270) at 6× less
+  training cost. The principle "build on prior concepts" is supported.
+- **At the policy-fine-tuning level**: developmental curriculum (via
+  ALP-bandit) DOESN'T WORK with the formula we tried. Random is better.
+  Either the formula is wrong (most likely) or curriculum doesn't help
+  at this layer (less likely, but possible).
+
+### What this means for Stage 1
+**Don't proceed to Stage 1 (grounded language) yet.** The cognitive
+substrate has a real compositionality problem (operators don't transfer
+across envs). Stage 1's "ground words to operators" requires operators
+to be stable cross-context, which we haven't shown.
+
+**Order of next work:**
+1. Build OperatorBankV2 (gradient-based MoE) — re-test cross-env stability
+2. If V2 fixes stability → continue to Stage 1 with V2 operators
+3. If V2 doesn't fix stability → the cognitive substrate needs a deeper
+   redesign (perhaps the JEPA itself needs an object-centric inductive
+   bias rather than the current spatial-CNN encoder)
+
+The ALP scheduler can be replaced with random for now; it's not
+blocking.
 
 ---
 
