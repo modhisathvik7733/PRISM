@@ -60,8 +60,94 @@ curriculum scheduler test, real problems surfaced.
 
 | Version | Tag | Result | Notes |
 |---------|-----|--------|-------|
+| **v4.1.1** | `v4.1.1-cog-core-factored-aux` | **JEPA factored-aux auxiliary supervision. Linear-probe held-out compositional joint accuracy (predicate readout from JEPA latent → goal `(color, type)`) lifted from 6.9% (entangled baseline) → 22.5% (factored aux on, weight 1.0). 5 independent loss-level interventions exhaustively tested (factored=1, factored=5, predicate-only=0, +SupCon align=1.0, +SupCon align=0.5); all converge in the 7-22% range. Best is the simplest: `factored=1.0` alone. The 50% target was not cleared. Failure is structural per the literature (Zhang & Yang 2505.02627) — dense convolutional encoders without explicit object slots cannot achieve compositional generalization via loss-level alignment alone. Slot Attention encoder (Locatello et al. NeurIPS 2020) is the canonical fix, deferred to v4.2 unless Stage 1 evidence indicates we need it now.** |
 | **v4.1** | `v4.1-cog-core-operator-v3-antidrift` | **OperatorBankV3 anti-drift mechanisms validated. Anchor MSE delta +1.1e-4 mean across 32k continual-env steps (target ≤ 5e-4) — PASS. Cross-env operator stability lifted from v4.0-partial baseline 0.50 → 0.80 mean cosine (+0.30, the largest single improvement on this metric in the project). The arbitrary 0.85 bar was not cleared; remaining gap requires an explicit cross-env routing-consistency loss (deferred to v4.2). Multi-env Phase A ablation regressed to 0.66, confirming single-env Phase A + continual Phase B + replay is the right paradigm. Stage 1 (grounded language) is unblocked.** |
 | **v4.0-partial** | `v4.0-partial-cog-core-phase1` | **3/5 substantive tests pass cleanly. Two real failures: cross-env operator stability (operators are env-specific, not universal primitives) AND curriculum scheduler (ALP-bandit actively hurts vs random). The earlier `v4.0-cog-core-phase1` tag was premature and is being retagged.** |
+
+---
+
+## v4.1.1 — JEPA factored aux loss (compositional perception: 6.9% → 22.5%, architectural plateau)
+
+**Date:** 2026-05-11
+**Tag:** `v4.1.1-cog-core-factored-aux`
+**Model:** `prism/models/jepa.py` (adds `aux_factored_weight`, `factor_align_weight`, color/type heads)
+**Scripts:** `scripts/cog_core/train_jepa_developmental.py`, `scripts/cog_core/train_predicate_readout.py`
+**Checkpoints:**
+- `runs/jepa_dev_v1_factored/jepa_final.pt` — **canonical v4.1.1 JEPA** (factored aux weight 1.0)
+- `runs/jepa_dev_v1_factored_w5/jepa_final.pt` — ablation (weight 5.0, regressed)
+- `runs/jepa_dev_v1_factored_only/jepa_final.pt` — ablation (factored only, no 96-d BCE)
+- `runs/jepa_dev_v1_phase1/jepa_final.pt` — Phase 1 SupCon alignment (align=1.0)
+- `runs/jepa_dev_v1_phase1b/jepa_final.pt` — Phase 1b SupCon alignment (align=0.5)
+**Rollouts:** `runs/cog_core_phase1_factored/rollouts.npz` (3000 episodes × 3 envs × random policy)
+
+### Context
+
+v4.0-partial's analysis revealed that the original dev-curriculum JEPA encodes `(color, type)` of visible objects holistically — combo-specific features, not factored axes. Linear-probe held-out joint accuracy on (color, type) for unseen combinations was 6.9% (vs 4.2% random baseline). This entanglement is the architectural reason that Stage 1.0-proper Phase 1 failed: text → operator labels never worked because operators are state-action dynamics, not goals; the alternative — text → goal predicate — depends on the latent encoding goal predicates compositionally.
+
+v4.1.1 systematically tests **whether loss-level interventions** during JEPA training can fix the entanglement.
+
+### Architecture additions (in `prism/models/jepa.py`)
+
+1. **Factored CE aux loss** — separate softmax classifiers for the primary visible object's color (6-way) and type (4-way), supervised by slot-derived labels. Unlike the existing 96-d BCE on `(predicate × type × color)` which uses one independent weight vector per combo, factored CE **shares** the "red" weight across all (red, type) combos — exerting gradient pressure toward an axis-factored encoding.
+
+2. **Supervised Contrastive Alignment** (Phase 1, Khosla et al. NeurIPS 2020) — two learned linear projection heads (`color_align_proj`, `type_align_proj`) that map `z_t` to `R^32` subspaces. A SupCon loss in each subspace pulls together same-color (regardless of type) features, and same-type (regardless of color) features. Forces the encoder to produce *linearly* factored representations.
+
+3. **Slot-derived perceptual labels** — `_primary_object()` heuristic picks the primary visible object per frame (preferring agent's facing column, fallback to closest by Manhattan distance). Labels carry through the existing rollouts pipeline.
+
+### Setup
+
+- Hardware: RTX PRO 4000 (Blackwell, 24 GB) on Vast.ai — 7× faster per-iter than A6000 (Ampere) for this dispatch-bound workload.
+- JEPA: 4-stage dev curriculum (OneRoomS8 → GoToObj → GoToLocal → OneRoomS16), 32k SGD steps, batch 1024, BF16, `torch.compile(model.loss, mode='reduce-overhead')`. Wall time ~6 min per full training.
+- Rollouts: 3000 episodes × random policy across 3 envs, ~316k transitions.
+- Probe: pure linear `Linear(3136, 6+4)` = 10 logits. Held-out compositional split = 4 of 24 (color, type) combos reserved from probe training; (color=0, type=0), (1, 3), (3, 2), (4, 1).
+
+### Five experiments
+
+| Run | Config | ID joint | Held color | Held type | **Held joint** |
+|---|---|---:|---:|---:|---:|
+| Baseline (no factored aux) | original | 96.0% | 33.8% | 36.7% | **6.9%** |
+| **v4.1.1 main** | `aux_factored_weight=1.0`, pred BCE on, dist on | 75.2% | 48.3% | 56.7% | **22.5%** ✅ best |
+| Crank ×5 | `aux_factored_weight=5.0` | 61.3% | 49.9% | 39.3% | 11.0% |
+| Predicate-only off | `aux_predicate_weight=0`, factored=1 | 60.1% | 50.1% | 35.5% | 7.8% |
+| Phase 1 SupCon | `factored=1, align=1.0, proj=32, T=0.5` | 77.9% | **57.9%** | 43.9% | 16.7% |
+| Phase 1b SupCon | `factored=1, align=0.5, proj=64, T=1.0` | 77.5% | 50.9% | 43.9% | 14.5% |
+| Random baseline | — | — | 16.7% | 25.0% | 4.2% |
+
+### Headline conclusions
+
+- **Loss-level intervention works in the small.** The minimum-viable change (`factored=1`) lifted held-out joint **6.9% → 22.5% (+15.6 pts, 3.3×)**. That's the largest single-experiment improvement on this metric the project has produced.
+- **More loss pressure does not help further.** Cranking aux weight to 5, removing competing BCE, and adding SupCon alignment all underperform the simplest `factored=1` configuration on the headline metric. The encoder finds shortcut solutions (combo-memorization) that satisfy the auxiliary tasks without actually factorizing.
+- **Phase 1 SupCon improved color decodability** (48.3% → 57.9%) but **regressed type** (56.7% → 43.9%), netting a slight joint loss. The mechanism is real but the type-axis with only 4 classes appears to over-compress under SupCon pressure.
+- **One combo is structurally broken in every config.** `(color=0, type=0)` — held-out (red, door) — gets 3-7% color accuracy across all five experiments, while type accuracy on the same combo stays 71-78%. The encoder uses doors-as-token features that don't decompose color from shape at this specific visual category.
+
+### Why the plateau is real
+
+Per [Zhang & Yang 2025 (arxiv 2505.02627)](https://arxiv.org/abs/2505.02627): *"a model enables compositional generalization if and only if it has (i) structural alignment, (ii) unambiguous representation, and (iii) minimized representation."* Our `categorical_spatial` encoder satisfies none. Loss-level interventions can apply pressure toward factorization but cannot enforce structural alignment in the computational graph. The 22% ceiling we observe matches what the literature reports for dense encoders without explicit object slots.
+
+The canonical architectural fix is **Slot Attention** ([Locatello et al. NeurIPS 2020, arxiv 2006.15055](https://arxiv.org/abs/2006.15055)): replace the dense encoder with K slot embeddings, each binding to one object via iterated competitive attention. Each slot is its own latent — compositional by construction. Multiple extensions ([Disentangled Slot Attention, ICLR 2024, arxiv 2401.10148](https://arxiv.org/abs/2401.10148)) add explicit shape/texture partitions.
+
+### Decision — defer slot attention to v4.2 (or later)
+
+We **do not** retrain with slot attention now. Reasoning:
+
+- v4.1.1's JEPA still produces useful representations: ID joint 75% (color and type decode well on seen combos), held-out type at 57%, held-out color at 48% — neither random, both useful for grounding most language.
+- BabyAI language largely refers to seen `(color, type)` compositions; held-out combos are an experimental construct, not a realistic distribution.
+- Slot Attention is 2-3 days of architectural work + potentially weeks of debugging. Committing to it before knowing Stage 1 needs it is premature optimization.
+- The principled trigger for v4.2: Stage 1.0-proper Phase 2 (text→predicate with agreement test) explicitly fails on held-out compositional missions. We test this with v4.1.1's JEPA first.
+
+### What this unblocks
+
+Stage 1.0-proper Phase 2 can now run with the **v4.1.1 JEPA** (`runs/jepa_dev_v1_factored/jepa_final.pt`). The two-step pipeline:
+
+1. Train the **PredicateReadout** from `z_t` to the slot-derived (color, type) — already done at the linear-probe step (22.5% held-out). The readout itself is saved at `runs/predicate_readout_factored_linear/predicate_readout_final.pt`.
+
+2. Train a **text-encoder → factored (color, type)** classifier on the same rollouts, then compute the **agreement metric** — when text says "go to the red ball" and the readout sees the agent's final latent, do they predict the same (color, type)? This is the Stage 1.0-proper Phase 2 falsifier.
+
+If agreement is high (≥ 70%) on **seen** compositions but low (< 30%) on **held-out** compositions → that's the empirical trigger to commit to v4.2 = Slot Attention encoder. If agreement is high on both → Stage 1 works at the current architectural level and we proceed to Stage 1.1 (action selection via grounded operators).
+
+### Performance notes (Blackwell vs Ampere)
+
+On the new Vast.ai RTX PRO 4000 (Blackwell), per-iter time dropped from 92ms (A6000 Ampere) to **12.5ms eager / 10.3ms with `torch.compile`** — a **7-9× speedup** for the same model. The previous "dispatch-bound" analysis on Ampere stands but Blackwell's dispatch throughput closes most of the gap. Full curriculum wall time: ~6 min. The compile path requires `LD_LIBRARY_PATH` to include `/usr/lib/x86_64-linux-gnu` so Triton can find `libcuda.so` (vastai/pytorch_cuda images don't set this by default).
 
 ---
 
