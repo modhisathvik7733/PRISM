@@ -271,7 +271,7 @@ def main() -> int:
 
         # Refresh rollout buffer if stage changed or interval hit.
         need_refresh = (
-            obs_t_buf is None
+            obs_t_gpu is None
             or last_collected_for != stage.env_id
             or step % args.collect_every == 0
         )
