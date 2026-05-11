@@ -80,6 +80,43 @@ def primary_object_label(slots) -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------- data
+def _process_frame_pair(
+    raw_t: np.ndarray,
+    raw_tp1: np.ndarray,
+    action_id: int,
+    obs_t_list: list,
+    act_list: list,
+    obs_tp1_list: list,
+    pred_t_list: list,
+    pred_tp1_list: list,
+    col_t_list: list,
+    typ_t_list: list,
+    col_tp1_list: list,
+    typ_tp1_list: list,
+    *,
+    with_predicates: bool,
+    augmented: bool,
+) -> None:
+    """Shared frame-pair processing — encode, slot extraction, predicate
+    computation, factored primary-object label. Used by both the single-env
+    and vectorized collection paths so they produce identical data."""
+    obs_t_list.append(_encode_image(raw_t))
+    act_list.append(action_id)
+    obs_tp1_list.append(_encode_image(raw_tp1))
+    slots_t = extract_slots(raw_t)
+    slots_tp1 = extract_slots(raw_tp1)
+    if with_predicates:
+        pred_fn = compute_augmented_predicates if augmented else compute_predicates
+        pred_t_list.append(pred_fn(slots_t))
+        pred_tp1_list.append(pred_fn(slots_tp1))
+    c_t, ty_t = primary_object_label(slots_t)
+    c_tp1, ty_tp1 = primary_object_label(slots_tp1)
+    col_t_list.append(c_t)
+    typ_t_list.append(ty_t)
+    col_tp1_list.append(c_tp1)
+    typ_tp1_list.append(ty_tp1)
+
+
 def collect_random_transitions(
     env_id: str,
     n: int,
@@ -87,47 +124,72 @@ def collect_random_transitions(
     *,
     with_predicates: bool = False,
     augmented: bool = False,
+    n_envs: int = 1,
 ):
-    """Collect n one-step transitions under random policy (same logic
-    as scripts/train_jepa.py but isolated here to avoid import-time
-    side effects). Validates env_id exists; if not, raises a clear
-    error so the curriculum can be edited."""
+    """Collect n one-step transitions under random policy.
+
+    When `n_envs == 1`, behaves identically to the original single-env
+    implementation. When `n_envs > 1`, runs N parallel BabyAI envs in the
+    same process (manual list of envs, matching the `EnvWorker` pattern
+    used elsewhere in PRISM, e.g. `scripts/ppo_train.py:90`). Each outer
+    iteration steps N envs and produces up to N transitions, amortizing
+    Python/loop overhead and (more importantly) removing the long single-
+    threaded blocking call that starves the GPU during rollout refresh.
+
+    Transitions crossing an episode boundary are valid: env.step's
+    returned `next_obs` is the terminal frame, which is the correct
+    `obs_tp1`; we then reset that env for the next iteration. This
+    matches the single-env path exactly so the science is unchanged.
+    """
+    if n_envs < 1:
+        raise ValueError(f"n_envs must be >= 1, got {n_envs}")
+
+    # Build N envs (lazily, so a bad env_id raises a clear single error).
     try:
-        env = gym.make(env_id)
+        envs = [gym.make(env_id) for _ in range(n_envs)]
     except Exception as e:
         raise SystemExit(
             f"\n[dev-jepa] env {env_id} unavailable in this minigrid build: {e}\n"
             "Edit prism/cog_core/dev_curriculum.DEFAULT_STAGES if needed."
         )
+    n_actions = envs[0].action_space.n
+
     obs_t_list, act_list, obs_tp1_list = [], [], []
     pred_t_list, pred_tp1_list = [], []
     col_t_list, typ_t_list, col_tp1_list, typ_tp1_list = [], [], [], []
-    obs, _ = env.reset(seed=int(rng.integers(0, 1_000_000)))
+
+    # Per-env "current obs" — initialized via reset with distinct seeds.
+    cur_obs: list = [None] * n_envs
+    for i in range(n_envs):
+        seed = int(rng.integers(0, 1_000_000)) + i * 7919
+        obs_i, _ = envs[i].reset(seed=seed)
+        cur_obs[i] = obs_i
+
     while len(obs_t_list) < n:
-        raw_t = obs["image"]
-        a = int(rng.integers(env.action_space.n))
-        next_obs, _r, term, trunc, _ = env.step(a)
-        raw_tp1 = next_obs["image"]
-        obs_t_list.append(_encode_image(raw_t))
-        act_list.append(a)
-        obs_tp1_list.append(_encode_image(raw_tp1))
-        slots_t = extract_slots(raw_t)
-        slots_tp1 = extract_slots(raw_tp1)
-        if with_predicates:
-            pred_fn = compute_augmented_predicates if augmented else compute_predicates
-            pred_t_list.append(pred_fn(slots_t))
-            pred_tp1_list.append(pred_fn(slots_tp1))
-        c_t, ty_t = primary_object_label(slots_t)
-        c_tp1, ty_tp1 = primary_object_label(slots_tp1)
-        col_t_list.append(c_t)
-        typ_t_list.append(ty_t)
-        col_tp1_list.append(c_tp1)
-        typ_tp1_list.append(ty_tp1)
-        if term or trunc:
-            obs, _ = env.reset(seed=int(rng.integers(0, 1_000_000)))
-        else:
-            obs = next_obs
-    env.close()
+        # Sample N actions in one numpy call (cheaper than per-env sampling).
+        actions = rng.integers(n_actions, size=n_envs)
+        for i in range(n_envs):
+            if len(obs_t_list) >= n:
+                break
+            raw_t = cur_obs[i]["image"]
+            a_i = int(actions[i])
+            next_obs, _r, term, trunc, _ = envs[i].step(a_i)
+            raw_tp1 = next_obs["image"]
+            _process_frame_pair(
+                raw_t, raw_tp1, a_i,
+                obs_t_list, act_list, obs_tp1_list,
+                pred_t_list, pred_tp1_list,
+                col_t_list, typ_t_list, col_tp1_list, typ_tp1_list,
+                with_predicates=with_predicates, augmented=augmented,
+            )
+            if term or trunc:
+                new_seed = int(rng.integers(0, 1_000_000))
+                cur_obs[i], _ = envs[i].reset(seed=new_seed)
+            else:
+                cur_obs[i] = next_obs
+
+    for env in envs:
+        env.close()
     return (
         np.stack(obs_t_list).astype(np.float32),
         np.array(act_list, dtype=np.int64),
@@ -153,7 +215,7 @@ def measure_stage_competence(
     """Held-out 1-step latent cosine similarity for the current stage's
     env. This is the metric the curriculum gate reads."""
     obs_t, actions, obs_tp1, _, _, _, _, _, _ = collect_random_transitions(
-        env_id, n_transitions, rng, with_predicates=False,
+        env_id, n_transitions, rng, with_predicates=False, n_envs=1,
     )
     obs_t_t = torch.from_numpy(obs_t).to(device)
     actions_t = torch.from_numpy(actions).to(device)
@@ -197,6 +259,11 @@ def main() -> int:
     parser.add_argument("--collect-every", type=int, default=500,
                         help="Refresh stage rollout buffer every N steps.")
     parser.add_argument("--rollout-size", type=int, default=5000)
+    parser.add_argument("--n-collect-envs", type=int, default=8,
+                        help="number of parallel BabyAI envs used during "
+                             "`collect_random_transitions`. 1 = the original "
+                             "single-env path; 8 = ~6-8× lower per-collect "
+                             "blocking time (the real GPU-idle bottleneck).")
     parser.add_argument("--gate-eval-every", type=int, default=500,
                         help="Measure competence (and consider stage-advance) "
                              "every N optimizer steps.")
@@ -250,6 +317,8 @@ def main() -> int:
     use_amp = args.bf16 and device.type == "cuda"
     if use_amp:
         print("[dev-jepa] BF16 autocast enabled")
+    print(f"[dev-jepa] collection: n_collect_envs={args.n_collect_envs}  "
+          f"rollout_size={args.rollout_size}  collect_every={args.collect_every}")
 
     # Per-stage rollout buffer (refreshed when stage changes OR
     # every collect_every steps within a stage). Kept on GPU after
@@ -282,6 +351,7 @@ def main() -> int:
              ) = collect_random_transitions(
                 stage.env_id, args.rollout_size, rng,
                 with_predicates=use_aux, augmented=use_distance,
+                n_envs=args.n_collect_envs,
             )
             # Move the entire buffer to GPU once; per-step sampling is then
             # pure GPU indexing — no CPU→GPU copies in the hot path.
@@ -347,9 +417,23 @@ def main() -> int:
             writer.add_scalar(f"train/{stage.name}/loss", loss_val, step)
             writer.add_scalar("train/loss_total", loss_val, step)
             writer.add_scalar("train/mean200", loss_val, step)
+            # Factored CE values from the latest batch (cheap; out is fresh).
+            fac_c = (
+                float(out["loss_fac_color_t"].item())
+                if "loss_fac_color_t" in out else None
+            )
+            fac_t = (
+                float(out["loss_fac_type_t"].item())
+                if "loss_fac_type_t" in out else None
+            )
+            fac_str = ""
+            if fac_c is not None and fac_t is not None:
+                writer.add_scalar("train/fac_color", fac_c, step)
+                writer.add_scalar("train/fac_type", fac_t, step)
+                fac_str = f" fac_c={fac_c:.3f} fac_t={fac_t:.3f}"
             print(f"[step {step:6d}] stage={stage.name:3s} "
                   f"({stage.env_id.replace('BabyAI-', '').replace('-v0', ''):20s}) "
-                  f"loss={loss_val:.4f} mean200={loss_val:.4f}")
+                  f"loss={loss_val:.4f}{fac_str}")
 
         # Stage-transition gate
         if (step + 1) % args.gate_eval_every == 0 or step == args.total_steps - 1:
