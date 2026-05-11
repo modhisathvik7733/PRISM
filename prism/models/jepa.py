@@ -496,11 +496,13 @@ class JepaWorldModel(nn.Module):
 
     @torch.no_grad()
     def update_target(self) -> None:
+        # Fused EMA across all target params in a single kernel.
+        # lerp_(start, end, w) -> start = (1-w)*start + w*end. We want
+        # target = m*target + (1-m)*online, so w = 1-m.
         m = self.cfg.ema_decay
-        for tp, op in zip(
-            self.target_encoder.parameters(), self.online_encoder.parameters(), strict=True
-        ):
-            tp.data.mul_(m).add_(op.data, alpha=1 - m)
+        target_list = [tp.data for tp in self.target_encoder.parameters()]
+        online_list = [op.data for op in self.online_encoder.parameters()]
+        torch._foreach_lerp_(target_list, online_list, 1.0 - m)
 
     def encode(self, obs: torch.Tensor) -> torch.Tensor:
         return self.online_encoder(obs)
@@ -591,9 +593,9 @@ class JepaWorldModel(nn.Module):
                     out["loss_dist_tp1"] = l_dist_tp1.detach()
 
         # Factored auxiliary supervision: shared-weight color and type
-        # softmax classifiers on the primary visible object. Labels of -1 are
-        # ignored (frames with no visible object). Applied on z_t for encoder
-        # supervision and on z_pred to close the train/inference gap.
+        # softmax classifiers on the primary visible object. Labels of -1
+        # (no visible object) are skipped via `ignore_index=-1`, which
+        # avoids the per-step CUDA sync of `valid.any().item()`.
         fac_w = getattr(self.cfg, "aux_factored_weight", 0.0)
         if (
             fac_w > 0.0
@@ -601,33 +603,29 @@ class JepaWorldModel(nn.Module):
             and self.aux_type_head is not None
         ):
             if color_label_t is not None and type_label_t is not None:
-                valid_t = (color_label_t >= 0) & (type_label_t >= 0)
-                if bool(valid_t.any().item()):
-                    c_logits_t = self.aux_color_head(z_t)
-                    t_logits_t = self.aux_type_head(z_t)
-                    l_fac_color_t = F.cross_entropy(
-                        c_logits_t[valid_t], color_label_t[valid_t],
-                    )
-                    l_fac_type_t = F.cross_entropy(
-                        t_logits_t[valid_t], type_label_t[valid_t],
-                    )
-                    total = total + fac_w * (l_fac_color_t + l_fac_type_t)
-                    out["loss_fac_color_t"] = l_fac_color_t.detach()
-                    out["loss_fac_type_t"] = l_fac_type_t.detach()
+                c_logits_t = self.aux_color_head(z_t)
+                t_logits_t = self.aux_type_head(z_t)
+                l_fac_color_t = F.cross_entropy(
+                    c_logits_t, color_label_t, ignore_index=-1,
+                )
+                l_fac_type_t = F.cross_entropy(
+                    t_logits_t, type_label_t, ignore_index=-1,
+                )
+                total = total + fac_w * (l_fac_color_t + l_fac_type_t)
+                out["loss_fac_color_t"] = l_fac_color_t.detach()
+                out["loss_fac_type_t"] = l_fac_type_t.detach()
             if color_label_tp1 is not None and type_label_tp1 is not None:
-                valid_tp1 = (color_label_tp1 >= 0) & (type_label_tp1 >= 0)
-                if bool(valid_tp1.any().item()):
-                    c_logits_tp1 = self.aux_color_head(z_pred)
-                    t_logits_tp1 = self.aux_type_head(z_pred)
-                    l_fac_color_tp1 = F.cross_entropy(
-                        c_logits_tp1[valid_tp1], color_label_tp1[valid_tp1],
-                    )
-                    l_fac_type_tp1 = F.cross_entropy(
-                        t_logits_tp1[valid_tp1], type_label_tp1[valid_tp1],
-                    )
-                    total = total + fac_w * (l_fac_color_tp1 + l_fac_type_tp1)
-                    out["loss_fac_color_tp1"] = l_fac_color_tp1.detach()
-                    out["loss_fac_type_tp1"] = l_fac_type_tp1.detach()
+                c_logits_tp1 = self.aux_color_head(z_pred)
+                t_logits_tp1 = self.aux_type_head(z_pred)
+                l_fac_color_tp1 = F.cross_entropy(
+                    c_logits_tp1, color_label_tp1, ignore_index=-1,
+                )
+                l_fac_type_tp1 = F.cross_entropy(
+                    t_logits_tp1, type_label_tp1, ignore_index=-1,
+                )
+                total = total + fac_w * (l_fac_color_tp1 + l_fac_type_tp1)
+                out["loss_fac_color_tp1"] = l_fac_color_tp1.detach()
+                out["loss_fac_type_tp1"] = l_fac_type_tp1.detach()
 
         out["loss"] = total
         return out

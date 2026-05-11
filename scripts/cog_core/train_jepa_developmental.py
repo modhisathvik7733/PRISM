@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections import deque
 from pathlib import Path
 
 import gymnasium as gym
@@ -251,13 +250,17 @@ def main() -> int:
     use_amp = args.bf16 and device.type == "cuda"
     if use_amp:
         print("[dev-jepa] BF16 autocast enabled")
-    loss_window: deque[float] = deque(maxlen=200)
 
     # Per-stage rollout buffer (refreshed when stage changes OR
-    # every collect_every steps within a stage).
-    obs_t_buf = act_buf = obs_tp1_buf = pred_t_buf = pred_tp1_buf = None
-    col_t_buf = typ_t_buf = col_tp1_buf = typ_tp1_buf = None
+    # every collect_every steps within a stage). Kept on GPU after
+    # collection so the train loop never blocks on CPU→GPU copies.
+    obs_t_gpu = act_gpu = obs_tp1_gpu = None
+    preds_t_gpu = preds_tp1_gpu = None
+    col_t_gpu = typ_t_gpu = col_tp1_gpu = typ_tp1_gpu = None
     last_collected_for: str | None = None
+    # GPU-side loss accumulator — synced to CPU only at log time.
+    loss_accum = torch.zeros((), device=device)
+    loss_count = 0
 
     for step in range(args.total_steps):
         if curr.is_done():
@@ -280,20 +283,33 @@ def main() -> int:
                 stage.env_id, args.rollout_size, rng,
                 with_predicates=use_aux, augmented=use_distance,
             )
+            # Move the entire buffer to GPU once; per-step sampling is then
+            # pure GPU indexing — no CPU→GPU copies in the hot path.
+            obs_t_gpu = torch.from_numpy(obs_t_buf).to(device)
+            act_gpu = torch.from_numpy(act_buf).to(device)
+            obs_tp1_gpu = torch.from_numpy(obs_tp1_buf).to(device)
+            preds_t_gpu = torch.from_numpy(pred_t_buf).to(device) if use_aux else None
+            preds_tp1_gpu = torch.from_numpy(pred_tp1_buf).to(device) if use_aux else None
+            col_t_gpu = torch.from_numpy(col_t_buf).to(device)
+            typ_t_gpu = torch.from_numpy(typ_t_buf).to(device)
+            col_tp1_gpu = torch.from_numpy(col_tp1_buf).to(device)
+            typ_tp1_gpu = torch.from_numpy(typ_tp1_buf).to(device)
             last_collected_for = stage.env_id
 
-        # Build batch
-        idx = rng.integers(0, args.rollout_size, size=args.batch_size)
-        obs_t = torch.from_numpy(obs_t_buf[idx]).to(device)
-        a_t = torch.from_numpy(act_buf[idx]).to(device)
-        obs_tp1 = torch.from_numpy(obs_tp1_buf[idx]).to(device)
-        preds_t = torch.from_numpy(pred_t_buf[idx]).to(device) if use_aux else None
-        preds_tp1 = torch.from_numpy(pred_tp1_buf[idx]).to(device) if use_aux else None
+        # GPU-side batch sampling — no CPU work, no PCIe transfer.
+        idx = torch.randint(
+            0, args.rollout_size, (args.batch_size,), device=device,
+        )
+        obs_t = obs_t_gpu[idx]
+        a_t = act_gpu[idx]
+        obs_tp1 = obs_tp1_gpu[idx]
+        preds_t = preds_t_gpu[idx] if use_aux else None
+        preds_tp1 = preds_tp1_gpu[idx] if use_aux else None
         if use_factored:
-            col_t = torch.from_numpy(col_t_buf[idx]).to(device)
-            typ_t = torch.from_numpy(typ_t_buf[idx]).to(device)
-            col_tp1 = torch.from_numpy(col_tp1_buf[idx]).to(device)
-            typ_tp1 = torch.from_numpy(typ_tp1_buf[idx]).to(device)
+            col_t = col_t_gpu[idx]
+            typ_t = typ_t_gpu[idx]
+            col_tp1 = col_tp1_gpu[idx]
+            typ_tp1 = typ_tp1_gpu[idx]
         else:
             col_t = typ_t = col_tp1 = typ_tp1 = None
 
@@ -319,16 +335,21 @@ def main() -> int:
         opt.step()
         model.update_target()
         curr.increment_step()
-        loss_window.append(float(loss.item()))
+
+        # Accumulate loss on GPU — sync only every 100 steps for the log.
+        loss_accum = loss_accum + loss.detach()
+        loss_count += 1
 
         if step % 100 == 0:
-            mean_loss = float(np.mean(loss_window)) if loss_window else float("nan")
-            writer.add_scalar(f"train/{stage.name}/loss", float(loss.item()), step)
-            writer.add_scalar("train/loss_total", float(loss.item()), step)
-            writer.add_scalar("train/mean200", mean_loss, step)
+            loss_val = float(loss_accum.item() / max(loss_count, 1))
+            loss_accum = torch.zeros((), device=device)
+            loss_count = 0
+            writer.add_scalar(f"train/{stage.name}/loss", loss_val, step)
+            writer.add_scalar("train/loss_total", loss_val, step)
+            writer.add_scalar("train/mean200", loss_val, step)
             print(f"[step {step:6d}] stage={stage.name:3s} "
                   f"({stage.env_id.replace('BabyAI-', '').replace('-v0', ''):20s}) "
-                  f"loss={float(loss.item()):.4f} mean200={mean_loss:.4f}")
+                  f"loss={loss_val:.4f} mean200={loss_val:.4f}")
 
         # Stage-transition gate
         if (step + 1) % args.gate_eval_every == 0 or step == args.total_steps - 1:
