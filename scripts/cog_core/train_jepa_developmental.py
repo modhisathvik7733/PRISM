@@ -48,7 +48,36 @@ from prism.models.jepa import JepaConfig, JepaWorldModel
 from prism.perception import (
     compute_augmented_predicates, compute_predicates, extract_slots,
 )
+from prism.perception.slots import AGENT_POS, OBJECT_TYPES
 from prism.utils.seed import set_global_seed
+
+
+# ---- primary-object (color, type) label for factored aux supervision ----
+_TYPE_TO_IDX = {t: i for i, t in enumerate(OBJECT_TYPES)}
+
+
+def primary_object_label(slots) -> tuple[int, int]:
+    """Return (color_id, type_idx) of the most-prominent visible object,
+    or (-1, -1) if no recognized object is in view.
+
+    Heuristic: prefer slots in the agent's facing column (x=AGENT_POS[0])
+    with smallest y (closest in front); fall back to the slot with smallest
+    Manhattan distance to AGENT_POS."""
+    if not slots:
+        return -1, -1
+    ax, ay = AGENT_POS
+    in_col = [s for s in slots if int(s.x) == ax]
+    if in_col:
+        s = min(in_col, key=lambda s: int(s.y))
+    else:
+        s = min(
+            slots,
+            key=lambda s: abs(int(s.x) - ax) + abs(int(s.y) - ay),
+        )
+    t_id = int(s.type_id)
+    if t_id not in _TYPE_TO_IDX:
+        return -1, -1
+    return int(s.color_id), _TYPE_TO_IDX[t_id]
 
 
 # ---------------------------------------------------------------- data
@@ -73,6 +102,7 @@ def collect_random_transitions(
         )
     obs_t_list, act_list, obs_tp1_list = [], [], []
     pred_t_list, pred_tp1_list = [], []
+    col_t_list, typ_t_list, col_tp1_list, typ_tp1_list = [], [], [], []
     obs, _ = env.reset(seed=int(rng.integers(0, 1_000_000)))
     while len(obs_t_list) < n:
         raw_t = obs["image"]
@@ -82,10 +112,18 @@ def collect_random_transitions(
         obs_t_list.append(_encode_image(raw_t))
         act_list.append(a)
         obs_tp1_list.append(_encode_image(raw_tp1))
+        slots_t = extract_slots(raw_t)
+        slots_tp1 = extract_slots(raw_tp1)
         if with_predicates:
             pred_fn = compute_augmented_predicates if augmented else compute_predicates
-            pred_t_list.append(pred_fn(extract_slots(raw_t)))
-            pred_tp1_list.append(pred_fn(extract_slots(raw_tp1)))
+            pred_t_list.append(pred_fn(slots_t))
+            pred_tp1_list.append(pred_fn(slots_tp1))
+        c_t, ty_t = primary_object_label(slots_t)
+        c_tp1, ty_tp1 = primary_object_label(slots_tp1)
+        col_t_list.append(c_t)
+        typ_t_list.append(ty_t)
+        col_tp1_list.append(c_tp1)
+        typ_tp1_list.append(ty_tp1)
         if term or trunc:
             obs, _ = env.reset(seed=int(rng.integers(0, 1_000_000)))
         else:
@@ -97,6 +135,10 @@ def collect_random_transitions(
         np.stack(obs_tp1_list).astype(np.float32),
         np.stack(pred_t_list).astype(np.float32) if with_predicates else None,
         np.stack(pred_tp1_list).astype(np.float32) if with_predicates else None,
+        np.array(col_t_list, dtype=np.int64),
+        np.array(typ_t_list, dtype=np.int64),
+        np.array(col_tp1_list, dtype=np.int64),
+        np.array(typ_tp1_list, dtype=np.int64),
     )
 
 
@@ -111,7 +153,7 @@ def measure_stage_competence(
 ) -> float:
     """Held-out 1-step latent cosine similarity for the current stage's
     env. This is the metric the curriculum gate reads."""
-    obs_t, actions, obs_tp1, _, _ = collect_random_transitions(
+    obs_t, actions, obs_tp1, _, _, _, _, _, _ = collect_random_transitions(
         env_id, n_transitions, rng, with_predicates=False,
     )
     obs_t_t = torch.from_numpy(obs_t).to(device)
@@ -135,6 +177,11 @@ def main() -> int:
     parser.add_argument("--aux-predicate-weight", type=float, default=3.0)
     parser.add_argument("--aux-distance-dim", type=int, default=24)
     parser.add_argument("--aux-distance-weight", type=float, default=0.5)
+    parser.add_argument("--aux-factored-weight", type=float, default=0.0,
+                        help="factored (color, type) softmax CE on the "
+                             "primary visible object. Forces shared-weight "
+                             "color and type axes in the latent — required "
+                             "for compositional predicate readout. Try 1.0.")
     parser.add_argument("--dynamics-hidden", type=int, default=256)
     parser.add_argument("--dynamics-layers", type=int, default=3)
     parser.add_argument("--dynamics-type", default="spatial_film",
@@ -173,6 +220,7 @@ def main() -> int:
         aux_predicate_weight=args.aux_predicate_weight,
         aux_distance_dim=args.aux_distance_dim,
         aux_distance_weight=args.aux_distance_weight,
+        aux_factored_weight=args.aux_factored_weight,
         dynamics_hidden_dim=args.dynamics_hidden,
         dynamics_layers=args.dynamics_layers,
         dynamics_type=args.dynamics_type,
@@ -197,11 +245,13 @@ def main() -> int:
     eval_rng = np.random.default_rng(args.seed + 7)
     use_aux = args.aux_predicate_weight > 0.0
     use_distance = args.aux_distance_dim > 0
+    use_factored = args.aux_factored_weight > 0.0
     loss_window: deque[float] = deque(maxlen=200)
 
     # Per-stage rollout buffer (refreshed when stage changes OR
     # every collect_every steps within a stage).
     obs_t_buf = act_buf = obs_tp1_buf = pred_t_buf = pred_tp1_buf = None
+    col_t_buf = typ_t_buf = col_tp1_buf = typ_tp1_buf = None
     last_collected_for: str | None = None
 
     for step in range(args.total_steps):
@@ -218,7 +268,9 @@ def main() -> int:
             or step % args.collect_every == 0
         )
         if need_refresh:
-            (obs_t_buf, act_buf, obs_tp1_buf, pred_t_buf, pred_tp1_buf
+            (obs_t_buf, act_buf, obs_tp1_buf,
+             pred_t_buf, pred_tp1_buf,
+             col_t_buf, typ_t_buf, col_tp1_buf, typ_tp1_buf
              ) = collect_random_transitions(
                 stage.env_id, args.rollout_size, rng,
                 with_predicates=use_aux, augmented=use_distance,
@@ -232,9 +284,19 @@ def main() -> int:
         obs_tp1 = torch.from_numpy(obs_tp1_buf[idx]).to(device)
         preds_t = torch.from_numpy(pred_t_buf[idx]).to(device) if use_aux else None
         preds_tp1 = torch.from_numpy(pred_tp1_buf[idx]).to(device) if use_aux else None
+        if use_factored:
+            col_t = torch.from_numpy(col_t_buf[idx]).to(device)
+            typ_t = torch.from_numpy(typ_t_buf[idx]).to(device)
+            col_tp1 = torch.from_numpy(col_tp1_buf[idx]).to(device)
+            typ_tp1 = torch.from_numpy(typ_tp1_buf[idx]).to(device)
+        else:
+            col_t = typ_t = col_tp1 = typ_tp1 = None
 
         out = model.loss(
-            obs_t, a_t, obs_tp1, predicates_t=preds_t, predicates_tp1=preds_tp1,
+            obs_t, a_t, obs_tp1,
+            predicates_t=preds_t, predicates_tp1=preds_tp1,
+            color_label_t=col_t, type_label_t=typ_t,
+            color_label_tp1=col_tp1, type_label_tp1=typ_tp1,
         )
         loss = out["loss"]
         opt.zero_grad(set_to_none=True)

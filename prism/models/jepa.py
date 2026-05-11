@@ -66,6 +66,16 @@ class JepaConfig:
     # 96-d-only checkpoints.
     aux_distance_dim: int = 0
     aux_distance_weight: float = 1.0  # MSE scale relative to BCE
+    # Factored auxiliary supervision: separate softmax CE for the primary
+    # visible object's color (6-way) and type (4-way). Unlike `aux_predicate_*`
+    # (96 independent BCEs that allow per-(color,type) features), factored CE
+    # *shares* the "red" weight across (red, ball)/(red, key)/(red, box)/...
+    # — forcing the encoder to develop a color axis and a type axis as
+    # linearly-readable, separable features. This is what enables compositional
+    # generalization at the perception level. >0 enables.
+    aux_factored_weight: float = 0.0
+    aux_n_colors: int = 6
+    aux_n_types: int = 4
     # LatentDynamics capacity. Defaults reproduce the original 3-linear-layer
     # MLP (Linear(in,h)-GELU-Linear(h,h)-GELU-Linear(h,out)). dynamics_layers
     # counts the (Linear+GELU) blocks before the output projection — so 2 = current.
@@ -453,6 +463,27 @@ class JepaWorldModel(nn.Module):
                 )
             else:
                 self.aux_predicate_head = nn.Linear(self.cfg.embed_dim, out_dim)
+        # Factored auxiliary heads: separate softmax classifiers for primary
+        # object color and type. Forces shared "color-axis" and "type-axis"
+        # features in the latent (the 96-d BCE does not, because per-combo
+        # weights are independent).
+        self.aux_color_head: nn.Module | None = None
+        self.aux_type_head: nn.Module | None = None
+        if getattr(self.cfg, "aux_factored_weight", 0.0) > 0.0:
+            nc = self.cfg.aux_n_colors
+            nt = self.cfg.aux_n_types
+            if _is_spatial_encoder(self.cfg):
+                C = getattr(self.cfg, "spatial_channels", 64)
+                in_dim = C * self.cfg.obs_h * self.cfg.obs_w
+                self.aux_color_head = nn.Sequential(
+                    nn.Flatten(), nn.Linear(in_dim, nc),
+                )
+                self.aux_type_head = nn.Sequential(
+                    nn.Flatten(), nn.Linear(in_dim, nt),
+                )
+            else:
+                self.aux_color_head = nn.Linear(self.cfg.embed_dim, nc)
+                self.aux_type_head = nn.Linear(self.cfg.embed_dim, nt)
         self._init_target_from_online()
 
     @torch.no_grad()
@@ -496,6 +527,10 @@ class JepaWorldModel(nn.Module):
         obs_tp1: torch.Tensor,
         predicates_t: torch.Tensor | None = None,
         predicates_tp1: torch.Tensor | None = None,
+        color_label_t: torch.Tensor | None = None,
+        type_label_t: torch.Tensor | None = None,
+        color_label_tp1: torch.Tensor | None = None,
+        type_label_tp1: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         z_t = self.online_encoder(obs_t)
         z_pred = self.dynamics(z_t, action_t)
@@ -554,6 +589,45 @@ class JepaWorldModel(nn.Module):
                     l_dist_tp1 = F.mse_loss(dist_pred_tp1, predicates_tp1[:, P:P + D])
                     total = total + aux_w * d_w * l_dist_tp1
                     out["loss_dist_tp1"] = l_dist_tp1.detach()
+
+        # Factored auxiliary supervision: shared-weight color and type
+        # softmax classifiers on the primary visible object. Labels of -1 are
+        # ignored (frames with no visible object). Applied on z_t for encoder
+        # supervision and on z_pred to close the train/inference gap.
+        fac_w = getattr(self.cfg, "aux_factored_weight", 0.0)
+        if (
+            fac_w > 0.0
+            and self.aux_color_head is not None
+            and self.aux_type_head is not None
+        ):
+            if color_label_t is not None and type_label_t is not None:
+                valid_t = (color_label_t >= 0) & (type_label_t >= 0)
+                if bool(valid_t.any().item()):
+                    c_logits_t = self.aux_color_head(z_t)
+                    t_logits_t = self.aux_type_head(z_t)
+                    l_fac_color_t = F.cross_entropy(
+                        c_logits_t[valid_t], color_label_t[valid_t],
+                    )
+                    l_fac_type_t = F.cross_entropy(
+                        t_logits_t[valid_t], type_label_t[valid_t],
+                    )
+                    total = total + fac_w * (l_fac_color_t + l_fac_type_t)
+                    out["loss_fac_color_t"] = l_fac_color_t.detach()
+                    out["loss_fac_type_t"] = l_fac_type_t.detach()
+            if color_label_tp1 is not None and type_label_tp1 is not None:
+                valid_tp1 = (color_label_tp1 >= 0) & (type_label_tp1 >= 0)
+                if bool(valid_tp1.any().item()):
+                    c_logits_tp1 = self.aux_color_head(z_pred)
+                    t_logits_tp1 = self.aux_type_head(z_pred)
+                    l_fac_color_tp1 = F.cross_entropy(
+                        c_logits_tp1[valid_tp1], color_label_tp1[valid_tp1],
+                    )
+                    l_fac_type_tp1 = F.cross_entropy(
+                        t_logits_tp1[valid_tp1], type_label_tp1[valid_tp1],
+                    )
+                    total = total + fac_w * (l_fac_color_tp1 + l_fac_type_tp1)
+                    out["loss_fac_color_tp1"] = l_fac_color_tp1.detach()
+                    out["loss_fac_type_tp1"] = l_fac_type_tp1.detach()
 
         out["loss"] = total
         return out
