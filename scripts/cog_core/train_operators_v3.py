@@ -107,6 +107,8 @@ def main() -> int:
     parser.add_argument("--entropy-coef", type=float, default=0.01)
     parser.add_argument("--lambda-ema", type=float, default=0.1)
     parser.add_argument("--lambda-anchor", type=float, default=1.0)
+    parser.add_argument("--lambda-load-balance", type=float, default=0.1)
+    parser.add_argument("--lambda-sharpness", type=float, default=0.05)
     parser.add_argument("--ema-tau", type=float, default=0.995)
     parser.add_argument("--anchor-size", type=int, default=64)
     parser.add_argument("--anchor-seed-step", type=int, default=16000,
@@ -161,6 +163,8 @@ def main() -> int:
             ema_tau=args.ema_tau,
             lambda_ema=args.lambda_ema,
             lambda_anchor=args.lambda_anchor,
+            lambda_load_balance=args.lambda_load_balance,
+            lambda_sharpness=args.lambda_sharpness,
             anchor_size=args.anchor_size,
         ).to(device)
         print("[v3] fresh bank initialized")
@@ -172,6 +176,8 @@ def main() -> int:
         bank.entropy_coef = args.entropy_coef
         bank.lambda_ema = args.lambda_ema
         bank.lambda_anchor = args.lambda_anchor
+        bank.lambda_load_balance = args.lambda_load_balance
+        bank.lambda_sharpness = args.lambda_sharpness
         bank.ema_tau = args.ema_tau
         print(f"[v3] continued from {args.load}")
         print(f"     anchors valid for ops: "
@@ -229,14 +235,21 @@ def main() -> int:
             writer.add_scalar("train/ema_loss", float(out["ema_loss"].item()), step)
             writer.add_scalar("train/anchor_loss",
                               float(out["anchor_loss"].item()), step)
-            writer.add_scalar("train/entropy", float(out["entropy"].item()), step)
+            writer.add_scalar("train/load_balance",
+                              float(out["load_balance"].item()), step)
+            writer.add_scalar("train/sharpness",
+                              float(out["sharpness"].item()), step)
+            writer.add_scalar("train/batch_entropy",
+                              float(out["batch_entropy"].item()), step)
             print(f"[step {step:6d}/{args.steps}] "
                   f"loss={float(out['loss'].item()):.4f} "
                   f"mse={float(out['mse'].item()):.4f} "
                   f"ema={float(out['ema_loss'].item()):.4f} "
-                  f"anchor={float(out['anchor_loss'].item()):.4f} "
-                  f"ent={float(out['entropy'].item()):.3f} "
-                  f"mean100={mean_loss:.4f}")
+                  f"anc={float(out['anchor_loss'].item()):.4f} "
+                  f"lb={float(out['load_balance'].item()):.3f} "
+                  f"sharp={float(out['sharpness'].item()):.3f} "
+                  f"H_batch={float(out['batch_entropy'].item()):.3f} "
+                  f"m100={mean_loss:.4f}")
 
     # ----- final report -----
     print("\n=== final per-op stats (eval set) ===")

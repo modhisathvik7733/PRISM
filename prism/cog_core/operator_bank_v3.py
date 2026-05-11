@@ -70,8 +70,10 @@ class OperatorBankV3(nn.Module):
         ema_tau: float = 0.995,
         lambda_ema: float = 0.1,
         lambda_anchor: float = 1.0,
+        lambda_load_balance: float = 0.1,
+        lambda_sharpness: float = 0.05,
         anchor_size: int = 64,
-        hard_routing: bool = True,
+        hard_routing: bool = False,
         gumbel_tau: float = 1.0,
     ):
         super().__init__()
@@ -82,6 +84,8 @@ class OperatorBankV3(nn.Module):
         self.ema_tau = ema_tau
         self.lambda_ema = lambda_ema
         self.lambda_anchor = lambda_anchor
+        self.lambda_load_balance = lambda_load_balance
+        self.lambda_sharpness = lambda_sharpness
         self.anchor_size = anchor_size
         self.hard_routing = hard_routing
         self.gumbel_tau = gumbel_tau
@@ -96,6 +100,12 @@ class OperatorBankV3(nn.Module):
             nn.GELU(),
             nn.Linear(hidden, n_ops),
         )
+        # Break symmetry: small per-op bias spread so routing logits are
+        # differentiated at step 0 instead of converging to the same value
+        # for every op.
+        with torch.no_grad():
+            final = self.routing[-1]
+            final.bias.copy_(torch.linspace(-0.5, 0.5, n_ops))
 
         self.ops = nn.ModuleList([
             nn.Sequential(
@@ -140,12 +150,21 @@ class OperatorBankV3(nn.Module):
     def _flatten(self, z: torch.Tensor) -> torch.Tensor:
         return z.flatten(1) if z.dim() > 2 else z
 
-    def _route(self, x: torch.Tensor) -> torch.Tensor:
-        """Return routing weights (B, K). Hard if `hard_routing`, else soft."""
+    def _route_components(
+        self, x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (routing_used, routing_soft).
+
+        `routing_used` is what the forward pass uses for blending op outputs
+        (hard one-hot via Gumbel if hard_routing+training, else softmax).
+        `routing_soft` is always the softmax — used for load-balancing /
+        sharpness losses and diagnostics."""
         logits = self.routing(x)
+        soft = F.softmax(logits, dim=-1)
         if self.hard_routing and self.training:
-            return F.gumbel_softmax(logits, tau=self.gumbel_tau, hard=True, dim=-1)
-        return F.softmax(logits, dim=-1)
+            hard = F.gumbel_softmax(logits, tau=self.gumbel_tau, hard=True, dim=-1)
+            return hard, soft
+        return soft, soft
 
     def forward(
         self,
@@ -156,10 +175,27 @@ class OperatorBankV3(nn.Module):
         a_emb = self.action_emb(action)
         x = torch.cat([z_flat, a_emb], dim=-1)
 
-        routing = self._route(x)
+        routing_used, _routing_soft = self._route_components(x)
         op_preds = torch.stack([op(x) for op in self.ops], dim=1)
-        delta_pred = (routing.unsqueeze(-1) * op_preds).sum(dim=1)
-        return delta_pred, routing, op_preds
+        delta_pred = (routing_used.unsqueeze(-1) * op_preds).sum(dim=1)
+        # Return routing_used as the second element to keep backward
+        # compatibility with callers; soft version available via routing_soft.
+        return delta_pred, routing_used, op_preds
+
+    def _forward_with_soft(
+        self,
+        z_t: torch.Tensor,
+        action: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Variant returning soft probs too — used inside `loss`."""
+        z_flat = self._flatten(z_t)
+        a_emb = self.action_emb(action)
+        x = torch.cat([z_flat, a_emb], dim=-1)
+
+        routing_used, routing_soft = self._route_components(x)
+        op_preds = torch.stack([op(x) for op in self.ops], dim=1)
+        delta_pred = (routing_used.unsqueeze(-1) * op_preds).sum(dim=1)
+        return delta_pred, routing_used, routing_soft, op_preds
 
     # ------------------------------------------------------------------
     # EMA target bank
@@ -289,10 +325,30 @@ class OperatorBankV3(nn.Module):
         z_tp1_flat = self._flatten(z_tp1)
         delta_actual = z_tp1_flat - z_t_flat
 
-        delta_pred, routing, _ = self.forward(z_t, action)
+        delta_pred, routing_used, routing_soft, _ = self._forward_with_soft(
+            z_t, action,
+        )
         mse = F.mse_loss(delta_pred, delta_actual)
 
-        entropy = -(routing * (routing + 1e-9).log()).sum(dim=-1).mean()
+        # ---- routing diagnostics on soft probs ---
+        per_sample_entropy = -(
+            routing_soft * (routing_soft + 1e-9).log()
+        ).sum(dim=-1).mean()
+        avg_routing = routing_soft.mean(dim=0)                # (K,)
+        batch_entropy = -(avg_routing * (avg_routing + 1e-9).log()).sum()
+
+        # ---- Switch-Transformer-style load-balancing loss ----
+        # f_k = fraction of samples whose argmax is op k (hard usage)
+        # P_k = mean softmax prob for op k over the batch
+        # aux = K * sum(f_k * P_k). Minimized when uniform usage AND sharp.
+        with torch.no_grad():
+            hard_idx = routing_soft.argmax(dim=-1)
+            f = F.one_hot(hard_idx, num_classes=self.n_ops).float().mean(dim=0)
+        P = avg_routing
+        load_balance_loss = self.n_ops * (f * P).sum()
+
+        # Sharpness term: minimize per-sample entropy (sharp routing).
+        sharpness_loss = per_sample_entropy
 
         if use_ema and self._ema_init:
             delta_ema = self._ema_forward(z_t, action)
@@ -309,15 +365,19 @@ class OperatorBankV3(nn.Module):
             mse
             + self.lambda_ema * ema_loss
             + self.lambda_anchor * anchor_loss
-            - self.entropy_coef * entropy
+            + self.lambda_load_balance * load_balance_loss
+            + self.lambda_sharpness * sharpness_loss
         )
         return {
             "loss": total,
             "mse": mse.detach(),
             "ema_loss": ema_loss.detach(),
             "anchor_loss": anchor_loss.detach(),
-            "entropy": entropy.detach(),
-            "routing": routing.detach(),
+            "load_balance": load_balance_loss.detach(),
+            "sharpness": sharpness_loss.detach(),
+            "per_sample_entropy": per_sample_entropy.detach(),
+            "batch_entropy": batch_entropy.detach(),
+            "routing": routing_used.detach(),
         }
 
     # ------------------------------------------------------------------
