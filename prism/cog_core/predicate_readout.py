@@ -1,0 +1,86 @@
+"""PredicateReadout — map a JEPA latent to a vector of predicate logits.
+
+Domain-general by design: the cognition core stores a readout from
+latent → predicate space. The *semantics* of each predicate slot is
+defined by the supervisory signal that env adapters provide (slot
+extractors, sensor parsers, compiler outputs, etc.). The readout itself
+is just a function `z → R^P`.
+
+Two roles:
+
+* **Training**: env adapter labels each frame with a target predicate
+  vector (e.g., from BabyAI's slot extraction, or from a robotics
+  proprioception parser, or from compiler output parsing). The readout
+  is supervised toward that target.
+
+* **Inference**: cognition reads predicates from latents to answer
+  "what's true about the current state?" without re-running the
+  env-specific extractor. This is what enables language grounding,
+  planning, predicate-conditioned policies, etc.
+
+Architecture is a small MLP. The intentional smallness keeps it from
+"learning" predicates that aren't really in the latent — if a target
+predicate can be linearly or near-linearly read out, it's encoded in z.
+If not, the JEPA's representation lacks that signal (and that's a
+useful diagnostic — fix the JEPA, not the readout).
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+
+class PredicateReadout(nn.Module):
+    def __init__(
+        self,
+        latent_dim: int,
+        n_predicates: int,
+        hidden: int = 512,
+        n_layers: int = 2,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.n_predicates = n_predicates
+
+        layers: list[nn.Module] = [nn.Linear(latent_dim, hidden), nn.GELU()]
+        for _ in range(max(0, n_layers - 1)):
+            layers.extend([nn.Linear(hidden, hidden), nn.GELU()])
+        layers.append(nn.Linear(hidden, n_predicates))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """z: (B, latent_dim) or (B, ...). Returns logits (B, n_predicates)."""
+        if z.dim() > 2:
+            z = z.flatten(1)
+        return self.net(z)
+
+    def save(self, path: str) -> None:
+        torch.save(
+            {
+                "state_dict": self.state_dict(),
+                "latent_dim": self.latent_dim,
+                "n_predicates": self.n_predicates,
+            },
+            path,
+        )
+
+    @classmethod
+    def load(
+        cls,
+        path: str,
+        device: torch.device,
+        *,
+        hidden: int = 512,
+        n_layers: int = 2,
+    ) -> "PredicateReadout":
+        ckpt = torch.load(path, map_location=device, weights_only=False)
+        m = cls(
+            latent_dim=ckpt["latent_dim"],
+            n_predicates=ckpt["n_predicates"],
+            hidden=hidden,
+            n_layers=n_layers,
+        )
+        m.load_state_dict(ckpt["state_dict"])
+        m.to(device)
+        return m
