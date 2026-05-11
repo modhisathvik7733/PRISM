@@ -111,6 +111,7 @@ def main() -> int:
     all_lengths: list[int] = []
     all_env_ids: list[str] = []
     all_slots: list[list[list[dict]]] = []
+    all_missions: list[str] = []
 
     for env_id in args.envs:
         env = make_env_with_max_steps(env_id, args.max_steps)
@@ -181,6 +182,7 @@ def main() -> int:
             all_lengths.append(len(ep_actions))
             all_env_ids.append(env_id)
             all_slots.append(ep_slots)
+            all_missions.append(mission)
             kept += 1
 
             if kept % 100 == 0:
@@ -216,6 +218,7 @@ def main() -> int:
         latents=lat_padded,
         ep_lengths=np.array(all_lengths, dtype=np.int64),
         env_ids=np.array(all_env_ids),
+        missions=np.array(all_missions),
         T_max=T_max,
     )
     # Slots are ragged (variable count per frame) — save separately as pickle.
