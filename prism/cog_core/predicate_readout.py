@@ -42,6 +42,8 @@ class PredicateReadout(nn.Module):
         super().__init__()
         self.latent_dim = latent_dim
         self.n_predicates = n_predicates
+        self.hidden = hidden
+        self.n_layers = n_layers
 
         # `hidden = 0` (or n_layers = 0) is interpreted as a pure linear
         # probe: Linear(latent_dim, n_predicates) with no hidden layer or
@@ -68,6 +70,8 @@ class PredicateReadout(nn.Module):
                 "state_dict": self.state_dict(),
                 "latent_dim": self.latent_dim,
                 "n_predicates": self.n_predicates,
+                "hidden": self.hidden,
+                "n_layers": self.n_layers,
             },
             path,
         )
@@ -78,16 +82,49 @@ class PredicateReadout(nn.Module):
         path: str,
         device: torch.device,
         *,
-        hidden: int = 512,
-        n_layers: int = 2,
+        hidden: int | None = None,
+        n_layers: int | None = None,
     ) -> "PredicateReadout":
+        """Load a saved readout.
+
+        If `hidden` / `n_layers` are None, they're read from the checkpoint
+        so the constructed module exactly matches the saved state dict.
+        Pass explicit overrides only if loading an old checkpoint that
+        didn't save these fields.
+        """
         ckpt = torch.load(path, map_location=device, weights_only=False)
+        sd = ckpt["state_dict"]
+        # Auto-detect hidden/n_layers from state_dict for old checkpoints
+        # that didn't save these fields. A pure linear probe has exactly two
+        # keys: net.0.weight and net.0.bias. Anything else is an MLP.
+        if hidden is None or n_layers is None:
+            if "hidden" in ckpt and "n_layers" in ckpt:
+                ck_hidden = ckpt["hidden"]
+                ck_layers = ckpt["n_layers"]
+            else:
+                keys = sorted(sd.keys())
+                # Pure linear probe: only one Linear layer (idx 0).
+                if set(keys) == {"net.0.weight", "net.0.bias"}:
+                    ck_hidden = 0
+                    ck_layers = 0
+                else:
+                    # Fall back to the original defaults; if state-dict
+                    # mismatch persists, the caller will see a clear error.
+                    ck_hidden = 512
+                    ck_layers = 2
+            if hidden is not None:
+                ck_hidden = hidden
+            if n_layers is not None:
+                ck_layers = n_layers
+        else:
+            ck_hidden = hidden
+            ck_layers = n_layers
         m = cls(
             latent_dim=ckpt["latent_dim"],
             n_predicates=ckpt["n_predicates"],
-            hidden=hidden,
-            n_layers=n_layers,
+            hidden=ck_hidden,
+            n_layers=ck_layers,
         )
-        m.load_state_dict(ckpt["state_dict"])
+        m.load_state_dict(sd)
         m.to(device)
         return m
