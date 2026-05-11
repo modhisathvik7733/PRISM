@@ -245,6 +245,13 @@ def main() -> int:
                              "for compositional predicate readout. Try 1.0.")
     parser.add_argument("--bf16", action="store_true",
                         help="bf16 autocast on the forward/loss pass")
+    parser.add_argument("--compile", action="store_true",
+                        help="wrap model.loss with torch.compile. The model "
+                             "is dispatch-bound (30-40 small ops per step at "
+                             "~1-2ms Python overhead each = ~35ms forward + "
+                             "~50ms backward) so compilation typically gives "
+                             "2-3x speedup by fusing ops into fewer kernels. "
+                             "First step is slow (~10-30s compile time).")
     parser.add_argument("--dynamics-hidden", type=int, default=256)
     parser.add_argument("--dynamics-layers", type=int, default=3)
     parser.add_argument("--dynamics-type", default="spatial_film",
@@ -319,6 +326,18 @@ def main() -> int:
         print("[dev-jepa] BF16 autocast enabled")
     print(f"[dev-jepa] collection: n_collect_envs={args.n_collect_envs}  "
           f"rollout_size={args.rollout_size}  collect_every={args.collect_every}")
+    # `loss_fn` is what the training loop actually calls. With --compile,
+    # torch.compile fuses the 30-40 small ops in `model.loss` into a much
+    # smaller set of generated kernels. mode="reduce-overhead" enables CUDA
+    # graphs, the largest win for dispatch-bound small models. fullgraph=False
+    # allows graph breaks at the dict-return / optional-label branches.
+    loss_fn = model.loss
+    if args.compile:
+        print("[dev-jepa] torch.compile(model.loss, mode='reduce-overhead') — "
+              "first step will be slow (~10-30s) while compiling")
+        loss_fn = torch.compile(
+            model.loss, mode="reduce-overhead", fullgraph=False,
+        )
 
     # Per-stage rollout buffer (refreshed when stage changes OR
     # every collect_every steps within a stage). Kept on GPU after
@@ -385,14 +404,14 @@ def main() -> int:
 
         if use_amp:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                out = model.loss(
+                out = loss_fn(
                     obs_t, a_t, obs_tp1,
                     predicates_t=preds_t, predicates_tp1=preds_tp1,
                     color_label_t=col_t, type_label_t=typ_t,
                     color_label_tp1=col_tp1, type_label_tp1=typ_tp1,
                 )
         else:
-            out = model.loss(
+            out = loss_fn(
                 obs_t, a_t, obs_tp1,
                 predicates_t=preds_t, predicates_tp1=preds_tp1,
                 color_label_t=col_t, type_label_t=typ_t,
