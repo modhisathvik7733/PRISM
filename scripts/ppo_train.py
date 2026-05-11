@@ -266,7 +266,7 @@ def compute_gae(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--jepa-checkpoint", required=True)
-    parser.add_argument("--bc-checkpoint", required=True,
+    parser.add_argument("--bc-checkpoint", default=None,
                         help="path to RecurrentPolicy .pt to initialize from")
     parser.add_argument("--env-id", default="BabyAI-GoToLocal-v0")
     parser.add_argument("--total-steps", type=int, default=500_000,
@@ -310,6 +310,16 @@ def main() -> int:
     parser.add_argument("--run-name", default="ppo_v1")
     parser.add_argument("--save-every-iters", type=int, default=20)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    # From-scratch policy initialization. Useful for ablations like Stage 1.2
+    # where we don't have a BC checkpoint and want a clean apples-to-apples
+    # comparison between two PPO runs. Slower convergence than warm-starting
+    # from BC, but acceptable for short comparison runs.
+    parser.add_argument("--no-bc", action="store_true",
+                        help="skip loading --bc-checkpoint; initialize the "
+                             "policy from random with the architecture params "
+                             "given below.")
+    parser.add_argument("--policy-hidden-dim", type=int, default=256)
+    parser.add_argument("--policy-latent-proj-dim", type=int, default=128)
     # Stage 1.2 — replace the rule-based mission parser's (type, color)
     # extraction with a trained text→(color, type) classifier. spec /
     # allowed_actions still come from the rule parser. With "rule" (default)
@@ -330,6 +340,10 @@ def main() -> int:
                 "--goal-source lang requires both --lang-checkpoint and "
                 "--vocab-checkpoint"
             )
+    if not args.no_bc and args.bc_checkpoint is None:
+        parser.error(
+            "--bc-checkpoint is required unless --no-bc is set"
+        )
 
     set_global_seed(args.seed)
     device = torch.device(args.device)
@@ -348,26 +362,51 @@ def main() -> int:
     print(f"[ppo] frozen JEPA: encoder={cfg.encoder_type} latent_dim={latent_dim} n_actions={n_actions}")
 
     # ---------- recurrent policy ----------
-    bc = torch.load(args.bc_checkpoint, map_location=device, weights_only=False)
-    # mem_feat_dim is a CLI knob: when starting from an old checkpoint that
-    # didn't have a residual, mem_proj is added and zero-init so the loaded
-    # weights produce identical step-0 behavior. The checkpoint's own
-    # mem_feat_dim (if present) only sets the floor — CLI can override to
-    # match a new tracker layout.
-    mem_feat_dim = max(int(args.mem_feat_dim), int(bc.get("mem_feat_dim", 0) or 0))
-    policy = RecurrentPolicy(
-        latent_in_dim=bc["latent_in_dim"],
-        n_actions=bc["n_actions"],
-        mission_dim=bc["mission_dim"],
-        hidden_dim=bc["hidden_dim"],
-        latent_proj_dim=bc["latent_proj_dim"],
-        mem_feat_dim=mem_feat_dim,
-    ).to(device)
-    # strict=False so the value_head (newly added) loads with random init.
-    missing, unexpected = policy.load_state_dict(bc["policy_state_dict"], strict=False)
-    print(f"[ppo] BC weights loaded: missing={missing} unexpected={unexpected}")
-    if bc["latent_in_dim"] != latent_dim:
-        raise SystemExit("BC policy / JEPA latent_dim mismatch")
+    if args.no_bc:
+        mem_feat_dim = int(args.mem_feat_dim)
+        policy_latent_in_dim = latent_dim
+        policy_n_actions = n_actions
+        policy_mission_dim = mission_dim
+        policy_hidden_dim = args.policy_hidden_dim
+        policy_latent_proj_dim = args.policy_latent_proj_dim
+        policy = RecurrentPolicy(
+            latent_in_dim=policy_latent_in_dim,
+            n_actions=policy_n_actions,
+            mission_dim=policy_mission_dim,
+            hidden_dim=policy_hidden_dim,
+            latent_proj_dim=policy_latent_proj_dim,
+            mem_feat_dim=mem_feat_dim,
+        ).to(device)
+        print(f"[ppo] policy initialized from scratch (no BC): "
+              f"hidden={policy_hidden_dim} "
+              f"latent_proj={policy_latent_proj_dim} "
+              f"mem={mem_feat_dim}")
+    else:
+        bc = torch.load(args.bc_checkpoint, map_location=device, weights_only=False)
+        # mem_feat_dim is a CLI knob: when starting from an old checkpoint that
+        # didn't have a residual, mem_proj is added and zero-init so the loaded
+        # weights produce identical step-0 behavior. The checkpoint's own
+        # mem_feat_dim (if present) only sets the floor — CLI can override to
+        # match a new tracker layout.
+        mem_feat_dim = max(int(args.mem_feat_dim), int(bc.get("mem_feat_dim", 0) or 0))
+        policy_latent_in_dim = bc["latent_in_dim"]
+        policy_n_actions = bc["n_actions"]
+        policy_mission_dim = bc["mission_dim"]
+        policy_hidden_dim = bc["hidden_dim"]
+        policy_latent_proj_dim = bc["latent_proj_dim"]
+        policy = RecurrentPolicy(
+            latent_in_dim=policy_latent_in_dim,
+            n_actions=policy_n_actions,
+            mission_dim=policy_mission_dim,
+            hidden_dim=policy_hidden_dim,
+            latent_proj_dim=policy_latent_proj_dim,
+            mem_feat_dim=mem_feat_dim,
+        ).to(device)
+        # strict=False so the value_head (newly added) loads with random init.
+        missing, unexpected = policy.load_state_dict(bc["policy_state_dict"], strict=False)
+        print(f"[ppo] BC weights loaded: missing={missing} unexpected={unexpected}")
+        if bc["latent_in_dim"] != latent_dim:
+            raise SystemExit("BC policy / JEPA latent_dim mismatch")
     n_params = sum(p.numel() for p in policy.parameters())
     print(f"[ppo] policy params: {n_params:,}  (value head random-init)")
     print(f"[ppo] mem_feat_dim={mem_feat_dim}  "
@@ -626,14 +665,16 @@ def main() -> int:
             ckpt_path = out_dir / f"policy_iter{it+1}.pt"
             torch.save({
                 "policy_state_dict": policy.state_dict(),
-                "latent_in_dim": bc["latent_in_dim"],
-                "n_actions": bc["n_actions"],
-                "mission_dim": bc["mission_dim"],
-                "hidden_dim": bc["hidden_dim"],
-                "latent_proj_dim": bc["latent_proj_dim"],
+                "latent_in_dim": policy_latent_in_dim,
+                "n_actions": policy_n_actions,
+                "mission_dim": policy_mission_dim,
+                "hidden_dim": policy_hidden_dim,
+                "latent_proj_dim": policy_latent_proj_dim,
                 "mem_feat_dim": mem_feat_dim,
                 "jepa_checkpoint": args.jepa_checkpoint,
                 "bc_checkpoint": args.bc_checkpoint,
+                "goal_source": args.goal_source,
+                "lang_checkpoint": args.lang_checkpoint,
                 "iteration": it + 1,
                 "env_steps": total_env_steps,
                 "window_mean_reward": float(np.mean(ep_reward_window)) if ep_reward_window else 0.0,
@@ -644,14 +685,16 @@ def main() -> int:
     final_path = out_dir / "policy_final.pt"
     torch.save({
         "policy_state_dict": policy.state_dict(),
-        "latent_in_dim": bc["latent_in_dim"],
-        "n_actions": bc["n_actions"],
-        "mission_dim": bc["mission_dim"],
-        "hidden_dim": bc["hidden_dim"],
-        "latent_proj_dim": bc["latent_proj_dim"],
+        "latent_in_dim": policy_latent_in_dim,
+        "n_actions": policy_n_actions,
+        "mission_dim": policy_mission_dim,
+        "hidden_dim": policy_hidden_dim,
+        "latent_proj_dim": policy_latent_proj_dim,
         "mem_feat_dim": mem_feat_dim,
         "jepa_checkpoint": args.jepa_checkpoint,
         "bc_checkpoint": args.bc_checkpoint,
+        "goal_source": args.goal_source,
+        "lang_checkpoint": args.lang_checkpoint,
         "env_steps": total_env_steps,
         "window_mean_reward": float(np.mean(ep_reward_window)) if ep_reward_window else 0.0,
     }, final_path)
