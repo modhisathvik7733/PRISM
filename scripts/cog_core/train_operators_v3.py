@@ -70,24 +70,26 @@ def collate(npz_path: Path
     return L_t, L_tp1, np.array(A, dtype=np.int64), np.array(E)
 
 
-def sample_batch(
-    L_t: np.ndarray, L_tp1: np.ndarray, A: np.ndarray,
-    rng: np.random.Generator, bs: int,
-    replay: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+def sample_batch_gpu(
+    L_t: torch.Tensor, L_tp1: torch.Tensor, A: torch.Tensor,
+    bs: int,
+    replay: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     replay_frac: float = 0.5,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """GPU-resident sampling — index a tensor already on the GPU."""
+    device = L_t.device
     if replay is None:
-        idx = rng.integers(0, len(L_t), size=bs)
+        idx = torch.randint(0, L_t.shape[0], (bs,), device=device)
         return L_t[idx], L_tp1[idx], A[idx]
     n_old = int(bs * replay_frac)
     n_new = bs - n_old
     Lr, Lr1, Ar = replay
-    i_new = rng.integers(0, len(L_t), size=n_new)
-    i_old = rng.integers(0, len(Lr), size=n_old)
+    i_new = torch.randint(0, L_t.shape[0], (n_new,), device=device)
+    i_old = torch.randint(0, Lr.shape[0], (n_old,), device=device)
     return (
-        np.concatenate([L_t[i_new], Lr[i_old]], axis=0),
-        np.concatenate([L_tp1[i_new], Lr1[i_old]], axis=0),
-        np.concatenate([A[i_new], Ar[i_old]], axis=0),
+        torch.cat([L_t[i_new], Lr[i_old]], dim=0),
+        torch.cat([L_tp1[i_new], Lr1[i_old]], dim=0),
+        torch.cat([A[i_new], Ar[i_old]], dim=0),
     )
 
 
@@ -114,10 +116,17 @@ def main() -> int:
     parser.add_argument("--anchor-seed-step", type=int, default=16000,
                         help="step at which to seed anchors (fresh mode)")
     parser.add_argument("--steps", type=int, default=32000)
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--max-transitions", type=int, default=100_000)
+    parser.add_argument("--max-transitions", type=int, default=300_000)
     parser.add_argument("--replay-frac", type=float, default=0.5)
+    parser.add_argument("--bf16", action="store_true",
+                        help="use bf16 autocast for the forward/loss")
+    parser.add_argument("--ema-every", type=int, default=4,
+                        help="only run the EMA-consistency forward every "
+                             "N steps (the EMA accumulator still updates "
+                             "every step; this just skips the expensive "
+                             "EMA forward most of the time)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--device",
@@ -150,6 +159,28 @@ def main() -> int:
         replay = (Lr, Lr1, Ar)
         print(f"[v3] replay buffer: {len(Lr):,} transitions, "
               f"frac={args.replay_frac}")
+
+    # ---- move data to GPU once (huge speedup vs per-step numpy->cuda copy) ----
+    L_t_gpu = torch.from_numpy(L_t).to(device)
+    L_tp1_gpu = torch.from_numpy(L_tp1).to(device)
+    A_gpu = torch.from_numpy(A).to(device)
+    replay_gpu = None
+    if replay is not None:
+        Lr, Lr1, Ar = replay
+        replay_gpu = (
+            torch.from_numpy(Lr).to(device),
+            torch.from_numpy(Lr1).to(device),
+            torch.from_numpy(Ar).to(device),
+        )
+    gpu_bytes = (
+        L_t_gpu.element_size() * L_t_gpu.nelement() +
+        L_tp1_gpu.element_size() * L_tp1_gpu.nelement() +
+        A_gpu.element_size() * A_gpu.nelement()
+    )
+    if replay_gpu is not None:
+        for t in replay_gpu:
+            gpu_bytes += t.element_size() * t.nelement()
+    print(f"[v3] dataset on GPU: {gpu_bytes / 1e9:.2f} GB")
 
     # ----- model -----
     if args.mode == "fresh":
@@ -200,20 +231,29 @@ def main() -> int:
             print(f"  op {k}: {pre_anchor_mse[k]:.6f}")
 
     # ----- training -----
+    use_amp = args.bf16 and device.type == "cuda"
+    if use_amp:
+        print(f"[v3] BF16 autocast enabled")
+
     loss_window: deque[float] = deque(maxlen=100)
     for step in range(args.steps):
-        b_t, b_tp1, b_a = sample_batch(
-            L_t, L_tp1, A, rng, args.batch_size,
-            replay=replay, replay_frac=args.replay_frac,
+        z_t, z_tp1, a = sample_batch_gpu(
+            L_t_gpu, L_tp1_gpu, A_gpu, args.batch_size,
+            replay=replay_gpu, replay_frac=args.replay_frac,
         )
-        z_t = torch.from_numpy(b_t).to(device)
-        z_tp1 = torch.from_numpy(b_tp1).to(device)
-        a = torch.from_numpy(b_a).to(device)
 
         use_anchor = bool(bank.anchor_valid.any().item())
-        use_ema = bank._ema_init
+        # Only run the heavy EMA-consistency forward every N steps; the
+        # EMA accumulator itself updates every step regardless.
+        use_ema = bank._ema_init and (step % args.ema_every == 0)
 
-        out = bank.loss(z_t, a, z_tp1, use_ema=use_ema, use_anchor=use_anchor)
+        if use_amp:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                out = bank.loss(z_t, a, z_tp1,
+                                use_ema=use_ema, use_anchor=use_anchor)
+        else:
+            out = bank.loss(z_t, a, z_tp1,
+                            use_ema=use_ema, use_anchor=use_anchor)
         opt.zero_grad(set_to_none=True)
         out["loss"].backward()
         torch.nn.utils.clip_grad_norm_(bank.parameters(), 1.0)
@@ -253,9 +293,8 @@ def main() -> int:
 
     # ----- final report -----
     print("\n=== final per-op stats (eval set) ===")
-    z_t_eval = torch.from_numpy(L_t[:5000]).to(device)
-    a_eval = torch.from_numpy(A[:5000]).to(device)
-    stats = bank.analyze(z_t_eval, a_eval)
+    n_eval = min(5000, L_t_gpu.shape[0])
+    stats = bank.analyze(L_t_gpu[:n_eval], A_gpu[:n_eval])
     print(f"{'op':>3} {'activation':>10} {'dom_a':>6} {'purity':>7} "
           f"{'anchor_mse':>11} {'anchor?':>7}")
     for s in sorted(stats, key=lambda s: -s.activation_rate):
@@ -289,9 +328,10 @@ def main() -> int:
             mask = E == env_id
             if int(mask.sum()) < 100:
                 continue
+            mask_t = torch.from_numpy(mask).to(device)
             per_env[env_id] = (
-                torch.from_numpy(L_t[mask][:5000]).to(device),
-                torch.from_numpy(A[mask][:5000]).to(device),
+                L_t_gpu[mask_t][:5000],
+                A_gpu[mask_t][:5000],
             )
         stab = bank.cross_env_stability(per_env, threshold=0.8)
         print(f"  envs: {list(per_env.keys())}")
