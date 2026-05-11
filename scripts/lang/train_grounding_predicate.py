@@ -89,17 +89,25 @@ class TinyTransformerPredicateHead(nn.Module):
         return self.head(pooled)
 
 
-def build_episode_data(npz_path: Path
-                       ) -> tuple[
-                           np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """One row per episode. Returns (z_last, color_label, type_label, mission).
+def build_episode_data(
+    npz_path: Path,
+    *,
+    slots_path: Path | None = None,
+    require_goal_visible: bool = False,
+):
+    """One row per episode. Returns (z, color_label, type_label, mission).
 
-    Labels come from parsing the mission ("go to the red ball" → (red, ball)).
-    z_last is the latent at the final step of the episode. With random
-    rollouts the agent often did NOT reach the goal, so z_last and the
-    mission may not agree on what's in view — that's expected; the
-    grounding test cares whether *T* and *R* each work independently and
-    whether they agree when they happen to.
+    By default, `z` is the latent at the *final* frame of the episode and
+    the labels come from parsing the mission ("go to the red ball" →
+    (red, ball)). With random rollouts the agent often did NOT reach the
+    goal, so z_last and the mission may not agree on what's in view.
+
+    If `require_goal_visible=True` and `slots_path` is given, `z` is
+    instead the latent at the *latest* frame where the mission's target
+    `(color, type)` is actually visible in slots. Episodes where the
+    target never appears in view are skipped. This isolates the
+    perception question (does the JEPA encode the goal predicate when
+    visible?) from the policy question (does the agent reach the goal?).
     """
     d = np.load(npz_path)
     if "missions" not in d.files:
@@ -109,7 +117,21 @@ def build_episode_data(npz_path: Path
     missions = d["missions"]
     type_to_idx = {t: i for i, t in enumerate(OBJECT_TYPES)}
 
+    slots_all = None
+    if require_goal_visible:
+        if slots_path is None:
+            raise SystemExit("--require-goal-visible needs --slots path")
+        import pickle as _pickle
+        with open(slots_path, "rb") as f:
+            slots_all = _pickle.load(f)
+        if len(slots_all) != latents.shape[0]:
+            raise SystemExit(
+                f"slot count {len(slots_all)} != episode count "
+                f"{latents.shape[0]}"
+            )
+
     Z, C, T, M = [], [], [], []
+    skipped = 0
     for i in range(len(lengths)):
         L = int(lengths[i])
         if L < 1:
@@ -120,10 +142,34 @@ def build_episode_data(npz_path: Path
         gp = parsed[0][0]
         if gp.type_id not in type_to_idx:
             continue
-        Z.append(latents[i, L - 1])                    # last frame
-        C.append(int(gp.color_id))
-        T.append(type_to_idx[gp.type_id])
+        goal_color = int(gp.color_id)
+        goal_type_id = int(gp.type_id)
+        goal_type_idx = type_to_idx[gp.type_id]
+
+        if require_goal_visible:
+            # Find the latest frame index where the goal target is visible.
+            ep_slots = slots_all[i]
+            visible_t = -1
+            for t in range(min(L, len(ep_slots))):
+                for s in ep_slots[t]:
+                    if (int(s["type_id"]) == goal_type_id
+                            and int(s["color_id"]) == goal_color):
+                        visible_t = t
+                        break
+            if visible_t < 0:
+                skipped += 1
+                continue
+            Z.append(latents[i, visible_t])
+        else:
+            Z.append(latents[i, L - 1])
+
+        C.append(goal_color)
+        T.append(goal_type_idx)
         M.append(str(missions[i]))
+
+    if require_goal_visible:
+        print(f"[ground-p]   goal-visible filter: kept {len(Z)}, "
+              f"skipped {skipped} episodes where goal never appeared")
 
     Z = np.stack(Z).astype(np.float32)
     if Z.ndim > 2:
@@ -141,6 +187,14 @@ def main() -> int:
     p.add_argument("--rollouts", required=True)
     p.add_argument("--readout", required=True,
                    help="trained PredicateReadout checkpoint from Phase 1")
+    p.add_argument("--slots", default=None,
+                   help="path to rollouts.slots.pkl; required when "
+                        "--require-goal-visible is set")
+    p.add_argument("--require-goal-visible", action="store_true",
+                   help="use the latest frame where the mission target is "
+                        "actually visible in slots, instead of z_last. "
+                        "Isolates the perception question from the policy "
+                        "question — proper test for v4.1.1 JEPA grounding.")
     p.add_argument("--steps", type=int, default=500)
     p.add_argument("--batch-size", type=int, default=1024)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -158,7 +212,11 @@ def main() -> int:
 
     # ---- data ----
     print(f"[ground-p] loading rollouts: {args.rollouts}")
-    Z, C, T, M = build_episode_data(Path(args.rollouts))
+    Z, C, T, M = build_episode_data(
+        Path(args.rollouts),
+        slots_path=Path(args.slots) if args.slots else None,
+        require_goal_visible=args.require_goal_visible,
+    )
     print(f"[ground-p]   {len(Z):,} episodes, latent_dim={Z.shape[-1]}")
     print(f"[ground-p]   color hist: "
           f"{dict(sorted(Counter(C.tolist()).items()))}")
