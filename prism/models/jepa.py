@@ -76,6 +76,20 @@ class JepaConfig:
     aux_factored_weight: float = 0.0
     aux_n_colors: int = 6
     aux_n_types: int = 4
+    # Phase 1 — Modular Compositional Bias via supervised contrastive
+    # alignment in factor subspaces. The factored aux loss alone is solvable
+    # by combo-memorization (encoder learns 24 distinct combo directions and
+    # the linear aux head decodes each). To force *axis* factorization, add
+    # supervised contrastive losses that pull together same-color pairs in a
+    # learned color-subspace projection, and same-type pairs in a learned
+    # type-subspace projection — forcing the encoder to produce features
+    # invariant within each factor.
+    # Reference: Khosla et al. NeurIPS 2020 (Supervised Contrastive Learning);
+    # mechanism from Modular Compositional Bias (arxiv 2510.21402).
+    # >0 enables both color and type alignment losses.
+    factor_align_weight: float = 0.0
+    factor_proj_dim: int = 32
+    factor_temperature: float = 0.5
     # LatentDynamics capacity. Defaults reproduce the original 3-linear-layer
     # MLP (Linear(in,h)-GELU-Linear(h,h)-GELU-Linear(h,out)). dynamics_layers
     # counts the (Linear+GELU) blocks before the output projection — so 2 = current.
@@ -423,6 +437,49 @@ def _make_dynamics(cfg: JepaConfig) -> nn.Module:
     )
 
 
+def _sup_con_loss(
+    features: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float = 0.5,
+    ignore_index: int = -1,
+) -> torch.Tensor:
+    """Supervised contrastive loss (Khosla et al. 2020).
+
+    `features`: (B, D), `labels`: (B,) int. Samples with the same label form
+    positive pairs. Samples with `ignore_index` label are excluded entirely.
+
+    L_i = -log(  sum_p exp(z_i · z_p / tau) / sum_a exp(z_i · z_a / tau) )
+
+    averaged over anchors `i` that have at least one positive. Self-similarity
+    is masked out. Features are L2-normalized so dot product = cosine.
+    """
+    valid = labels != ignore_index
+    features = features[valid]
+    labels = labels[valid]
+    n = features.shape[0]
+    if n < 2:
+        return torch.tensor(0.0, device=features.device)
+
+    features = F.normalize(features, dim=1)
+    sim = features @ features.t() / max(temperature, 1e-6)            # (n, n)
+    # Mask self-similarity to -inf so it never appears in softmax.
+    eye = torch.eye(n, device=features.device, dtype=torch.bool)
+    sim = sim.masked_fill(eye, float("-inf"))
+
+    same = labels.unsqueeze(0) == labels.unsqueeze(1)
+    pos_mask = same & ~eye                                            # (n, n)
+
+    # Log-softmax across all non-self anchors.
+    log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
+
+    # Average log-prob over positives per anchor; anchors with no positives
+    # contribute zero (weighted average to avoid CUDA syncs).
+    n_pos = pos_mask.float().sum(dim=1)                               # (n,)
+    pos_log_prob = (log_prob * pos_mask.float()).sum(dim=1) / n_pos.clamp(min=1)
+    weight = (n_pos > 0).float()
+    return -(pos_log_prob * weight).sum() / weight.sum().clamp(min=1)
+
+
 class JepaWorldModel(nn.Module):
     """Online encoder + EMA target encoder + latent dynamics.
 
@@ -484,6 +541,26 @@ class JepaWorldModel(nn.Module):
             else:
                 self.aux_color_head = nn.Linear(self.cfg.embed_dim, nc)
                 self.aux_type_head = nn.Linear(self.cfg.embed_dim, nt)
+        # Factor-alignment projection heads (Phase 1). Linear-only — if the
+        # encoder needed a nonlinear projection to factorize, that nonlinearity
+        # would just hide the entanglement; the whole point is to enforce
+        # *linear* factorization of the encoder's output.
+        self.color_align_proj: nn.Module | None = None
+        self.type_align_proj: nn.Module | None = None
+        if getattr(self.cfg, "factor_align_weight", 0.0) > 0.0:
+            pd = self.cfg.factor_proj_dim
+            if _is_spatial_encoder(self.cfg):
+                C = getattr(self.cfg, "spatial_channels", 64)
+                in_dim = C * self.cfg.obs_h * self.cfg.obs_w
+                self.color_align_proj = nn.Sequential(
+                    nn.Flatten(), nn.Linear(in_dim, pd),
+                )
+                self.type_align_proj = nn.Sequential(
+                    nn.Flatten(), nn.Linear(in_dim, pd),
+                )
+            else:
+                self.color_align_proj = nn.Linear(self.cfg.embed_dim, pd)
+                self.type_align_proj = nn.Linear(self.cfg.embed_dim, pd)
         self._init_target_from_online()
 
     @torch.no_grad()
@@ -591,6 +668,31 @@ class JepaWorldModel(nn.Module):
                     l_dist_tp1 = F.mse_loss(dist_pred_tp1, predicates_tp1[:, P:P + D])
                     total = total + aux_w * d_w * l_dist_tp1
                     out["loss_dist_tp1"] = l_dist_tp1.detach()
+
+        # Factor-alignment loss (Phase 1 — Modular Compositional Bias).
+        # SupCon-style pull-together loss in learned color- and type-subspace
+        # projections, supervised by (color_label_t, type_label_t). Forces
+        # same-color samples (regardless of type) to cluster in the color
+        # projection, and same-type samples (regardless of color) to cluster
+        # in the type projection. The encoder must produce features where
+        # this is possible via a *linear* projection — i.e. it must
+        # factorize.
+        fa_w = getattr(self.cfg, "factor_align_weight", 0.0)
+        if (
+            fa_w > 0.0
+            and self.color_align_proj is not None
+            and self.type_align_proj is not None
+            and color_label_t is not None
+            and type_label_t is not None
+        ):
+            c_feat = self.color_align_proj(z_t)
+            t_feat = self.type_align_proj(z_t)
+            tau = float(getattr(self.cfg, "factor_temperature", 0.5))
+            l_color_align = _sup_con_loss(c_feat, color_label_t, tau)
+            l_type_align = _sup_con_loss(t_feat, type_label_t, tau)
+            total = total + fa_w * (l_color_align + l_type_align)
+            out["loss_color_align"] = l_color_align.detach()
+            out["loss_type_align"] = l_type_align.detach()
 
         # Factored auxiliary supervision: shared-weight color and type
         # softmax classifiers on the primary visible object. Labels of -1

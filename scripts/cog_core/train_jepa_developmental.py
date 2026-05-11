@@ -243,6 +243,16 @@ def main() -> int:
                              "primary visible object. Forces shared-weight "
                              "color and type axes in the latent — required "
                              "for compositional predicate readout. Try 1.0.")
+    parser.add_argument("--factor-align-weight", type=float, default=0.0,
+                        help="Phase 1 fix: SupCon-style alignment in learned "
+                             "color- and type-subspace projections of z_t. "
+                             "Pulls same-color (regardless of type) features "
+                             "together and same-type (regardless of color) "
+                             "together — directly enforcing axis "
+                             "factorization. Try 1.0; pair with "
+                             "--aux-factored-weight 1.0.")
+    parser.add_argument("--factor-proj-dim", type=int, default=32)
+    parser.add_argument("--factor-temperature", type=float, default=0.5)
     parser.add_argument("--bf16", action="store_true",
                         help="bf16 autocast on the forward/loss pass")
     parser.add_argument("--compile", action="store_true",
@@ -296,6 +306,9 @@ def main() -> int:
         aux_distance_dim=args.aux_distance_dim,
         aux_distance_weight=args.aux_distance_weight,
         aux_factored_weight=args.aux_factored_weight,
+        factor_align_weight=args.factor_align_weight,
+        factor_proj_dim=args.factor_proj_dim,
+        factor_temperature=args.factor_temperature,
         dynamics_hidden_dim=args.dynamics_hidden,
         dynamics_layers=args.dynamics_layers,
         dynamics_type=args.dynamics_type,
@@ -450,6 +463,13 @@ def main() -> int:
                 writer.add_scalar("train/fac_color", fac_c, step)
                 writer.add_scalar("train/fac_type", fac_t, step)
                 fac_str = f" fac_c={fac_c:.3f} fac_t={fac_t:.3f}"
+            # Factor-alignment SupCon losses (Phase 1).
+            if "loss_color_align" in out and "loss_type_align" in out:
+                lca = float(out["loss_color_align"].item())
+                lta = float(out["loss_type_align"].item())
+                writer.add_scalar("train/align_color", lca, step)
+                writer.add_scalar("train/align_type", lta, step)
+                fac_str += f" align_c={lca:.3f} align_t={lta:.3f}"
             print(f"[step {step:6d}] stage={stage.name:3s} "
                   f"({stage.env_id.replace('BabyAI-', '').replace('-v0', ''):20s}) "
                   f"loss={loss_val:.4f}{fac_str}")
