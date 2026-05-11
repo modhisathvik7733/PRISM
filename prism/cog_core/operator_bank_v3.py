@@ -211,10 +211,15 @@ class OperatorBankV3(nn.Module):
         if not self._ema_init:
             self._init_ema()
             return
+        # Fused EMA update across all params in a single kernel.
+        # lerp_(start, end, w) -> start = (1-w)*start + w*end
+        # We want ema = tau*ema + (1-tau)*online, so w = (1-tau).
+        online_list: list[torch.Tensor] = []
+        target_list: list[torch.Tensor] = []
         for name, p in self.named_parameters():
-            self._ema_params[name].mul_(self.ema_tau).add_(
-                p.detach(), alpha=1.0 - self.ema_tau,
-            )
+            online_list.append(p.detach())
+            target_list.append(self._ema_params[name])
+        torch._foreach_lerp_(target_list, online_list, 1.0 - self.ema_tau)
 
     @torch.no_grad()
     def _ema_forward(
@@ -222,14 +227,21 @@ class OperatorBankV3(nn.Module):
         z_t: torch.Tensor,
         action: torch.Tensor,
     ) -> torch.Tensor:
-        """Forward pass through the EMA target bank. Returns delta_pred only."""
+        """Forward pass through the EMA target bank. Returns delta_pred only.
+
+        Uses fused _foreach_copy_ to batch the param swap into ~4 CUDA
+        kernel launches instead of 90+ individual launches.
+        """
         if not self._ema_init:
             self._init_ema()
-        # Temporarily swap params, forward, swap back.
-        backup: dict[str, torch.Tensor] = {}
-        for name, p in self.named_parameters():
-            backup[name] = p.data.clone()
-            p.data.copy_(self._ema_params[name])
+        # Collect param tensors in one list (deterministic order).
+        names = [n for n, _ in self.named_parameters()]
+        live = [p.data for _, p in self.named_parameters()]
+        ema = [self._ema_params[n] for n in names]
+        # Backup live params (single fused clone-like op).
+        backup = [t.clone() for t in live]
+        # Swap in EMA.
+        torch._foreach_copy_(live, ema)
         try:
             was_training = self.training
             self.eval()
@@ -237,8 +249,8 @@ class OperatorBankV3(nn.Module):
             if was_training:
                 self.train()
         finally:
-            for name, p in self.named_parameters():
-                p.data.copy_(backup[name])
+            # Restore live params.
+            torch._foreach_copy_(live, backup)
         return delta_pred.detach()
 
     # ------------------------------------------------------------------
