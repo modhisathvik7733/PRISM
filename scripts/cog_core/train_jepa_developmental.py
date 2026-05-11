@@ -252,6 +252,13 @@ def main() -> int:
                              "~50ms backward) so compilation typically gives "
                              "2-3x speedup by fusing ops into fewer kernels. "
                              "First step is slow (~10-30s compile time).")
+    parser.add_argument("--min-steps-scale", type=float, default=1.0,
+                        help="multiply every stage's min_steps and max_steps "
+                             "by this factor. Use < 1.0 when running with a "
+                             "much larger --batch-size so the curriculum "
+                             "doesn't over-train (e.g. with batch=4096 vs "
+                             "the default 128, try --min-steps-scale 0.0625 "
+                             "for an equivalent total data exposure).")
     parser.add_argument("--dynamics-hidden", type=int, default=256)
     parser.add_argument("--dynamics-layers", type=int, default=3)
     parser.add_argument("--dynamics-type", default="spatial_film",
@@ -306,7 +313,28 @@ def main() -> int:
     print(f"[dev-jepa] model: encoder={cfg.encoder_type} dyn={cfg.dynamics_type} "
           f"params={sum(p.numel() for p in model.parameters()):,}")
 
-    curr = DevelopmentalCurriculum(stages=list(DEFAULT_STAGES))
+    # Apply --min-steps-scale so the curriculum doesn't over-train when the
+    # user passes a much larger --batch-size. Each stage's min_steps/max_steps
+    # is scaled by the factor; transition_cos and env_id are unchanged.
+    if abs(args.min_steps_scale - 1.0) > 1e-9:
+        scale = args.min_steps_scale
+        scaled_stages = [
+            DevStage(
+                name=s.name,
+                env_id=s.env_id,
+                description=s.description,
+                min_steps=max(1, int(round(s.min_steps * scale))),
+                max_steps=max(1, int(round(s.max_steps * scale))),
+                transition_cos=s.transition_cos,
+            )
+            for s in DEFAULT_STAGES
+        ]
+        print(f"[dev-jepa] curriculum min_steps scaled by {scale} "
+              f"(was sum={sum(s.min_steps for s in DEFAULT_STAGES)}, "
+              f"now sum={sum(s.min_steps for s in scaled_stages)})")
+        curr = DevelopmentalCurriculum(stages=scaled_stages)
+    else:
+        curr = DevelopmentalCurriculum(stages=list(DEFAULT_STAGES))
     print("[dev-jepa] curriculum stages:")
     for s in curr.stages:
         print(f"  {s}")

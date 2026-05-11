@@ -93,9 +93,19 @@ def profile_training_step(args):
     opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[profile] model params: {n_params:,}")
-    print(f"[profile] device: {device}  bf16: {args.bf16}")
-    print(f"[profile] batch_size: {args.batch_size}")
+    print(f"[profile] device:       {device}")
+    print(f"[profile] bf16:         {args.bf16}")
+    print(f"[profile] compile:      {args.compile}")
+    print(f"[profile] batch_size:   {args.batch_size}")
     print()
+
+    # `loss_fn` mirrors what train_jepa_developmental.py wires up.
+    loss_fn = model.loss
+    if args.compile:
+        print("[profile] compiling model.loss with mode='reduce-overhead' …")
+        loss_fn = torch.compile(
+            model.loss, mode="reduce-overhead", fullgraph=False,
+        )
 
     # IMPORTANT: BabyAI categorical encoder expects the raw obs in a specific
     # range. The dummy data uses rand which may not exercise the embedding
