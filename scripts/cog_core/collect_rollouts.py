@@ -49,7 +49,13 @@ from prism.utils.seed import set_global_seed
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--jepa-checkpoint", required=True)
-    parser.add_argument("--policy-checkpoint", required=True)
+    parser.add_argument("--policy-checkpoint", default=None,
+                        help="omit and pass --random-policy to use uniform "
+                             "random actions")
+    parser.add_argument("--random-policy", action="store_true",
+                        help="sample actions uniformly from the action space "
+                             "(no policy needed; fine for operator-bank "
+                             "training, not for performance evals)")
     parser.add_argument("--envs", nargs="+",
                         default=["BabyAI-GoToLocal-v0",
                                  "BabyAI-GoTo-v0",
@@ -61,6 +67,10 @@ def main() -> int:
     parser.add_argument("--device",
                         default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+    if not args.random_policy and args.policy_checkpoint is None:
+        parser.error(
+            "--policy-checkpoint is required unless --random-policy is set"
+        )
 
     set_global_seed(args.seed)
     device = torch.device(args.device)
@@ -75,21 +85,25 @@ def main() -> int:
     print(f"[collect] frozen JEPA loaded: encoder={jepa_cfg.encoder_type}")
 
     # --- policy ---
-    pckpt = torch.load(args.policy_checkpoint, map_location=device, weights_only=False)
-    ckpt_mem_dim = int(pckpt.get("mem_feat_dim", 0) or 0)
-    policy = RecurrentPolicy(
-        latent_in_dim=pckpt["latent_in_dim"],
-        n_actions=pckpt["n_actions"],
-        mission_dim=pckpt["mission_dim"],
-        hidden_dim=pckpt["hidden_dim"],
-        latent_proj_dim=pckpt["latent_proj_dim"],
-        mem_feat_dim=ckpt_mem_dim,
-    ).to(device)
-    policy.load_state_dict(pckpt["policy_state_dict"])
-    policy.eval()
-    print(f"[collect] policy loaded: {args.policy_checkpoint} (mem_dim={ckpt_mem_dim})")
-
-    agent = GroundedAgent(jepa, device, scoring_mode="recurrent")
+    if args.random_policy:
+        policy = None
+        agent = None
+        print("[collect] random-policy mode: actions sampled uniformly")
+    else:
+        pckpt = torch.load(args.policy_checkpoint, map_location=device, weights_only=False)
+        ckpt_mem_dim = int(pckpt.get("mem_feat_dim", 0) or 0)
+        policy = RecurrentPolicy(
+            latent_in_dim=pckpt["latent_in_dim"],
+            n_actions=pckpt["n_actions"],
+            mission_dim=pckpt["mission_dim"],
+            hidden_dim=pckpt["hidden_dim"],
+            latent_proj_dim=pckpt["latent_proj_dim"],
+            mem_feat_dim=ckpt_mem_dim,
+        ).to(device)
+        policy.load_state_dict(pckpt["policy_state_dict"])
+        policy.eval()
+        print(f"[collect] policy loaded: {args.policy_checkpoint} (mem_dim={ckpt_mem_dim})")
+        agent = GroundedAgent(jepa, device, scoring_mode="recurrent")
 
     all_obs: list[np.ndarray] = []
     all_actions: list[np.ndarray] = []
@@ -108,7 +122,8 @@ def main() -> int:
             ep_seed = args.seed + len(all_obs) * 7919 + attempted * 13
             attempted += 1
             obs, _ = env.reset(seed=ep_seed)
-            agent.reset()
+            if agent is not None:
+                agent.reset()
             mission = obs["mission"]
             parsed = goal_predicates_for_mission(mission)
             if parsed is None:
@@ -116,14 +131,17 @@ def main() -> int:
             goal_preds, spec = parsed
             allowed = allowed_actions_for_spec(spec, env.action_space.n)
 
-            tc_idx = type_color_index(goal_preds[0].type_id, goal_preds[0].color_id)
-            mission_oh = torch.zeros(len(OBJECT_TYPES) * NUM_COLORS)
-            mission_oh[tc_idx] = 1.0
-            agent.attach_recurrent_policy(
-                policy, mission_oh,
-                goal_type=goal_preds[0].type_id,
-                goal_color=goal_preds[0].color_id,
-            )
+            if agent is not None:
+                tc_idx = type_color_index(
+                    goal_preds[0].type_id, goal_preds[0].color_id,
+                )
+                mission_oh = torch.zeros(len(OBJECT_TYPES) * NUM_COLORS)
+                mission_oh[tc_idx] = 1.0
+                agent.attach_recurrent_policy(
+                    policy, mission_oh,
+                    goal_type=goal_preds[0].type_id,
+                    goal_color=goal_preds[0].color_id,
+                )
 
             ep_obs: list[np.ndarray] = []
             ep_actions: list[int] = []
@@ -146,9 +164,12 @@ def main() -> int:
                 ep_latents.append(z.squeeze(0).cpu().numpy())
 
                 obs_t = torch.from_numpy(encoded).float()
-                action, _info = agent.select_action(
-                    obs_t, goal_preds, allowed_actions=allowed,
-                )
+                if agent is None:
+                    action = int(env.action_space.sample())
+                else:
+                    action, _info = agent.select_action(
+                        obs_t, goal_preds, allowed_actions=allowed,
+                    )
                 ep_actions.append(int(action))
                 obs, _r, term, trunc, _ = env.step(action)
                 if term or trunc:
