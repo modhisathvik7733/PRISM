@@ -95,7 +95,8 @@ class EnvWorker:
                  mission_dim: int, n_actions: int,
                  max_steps: int = 64, shaping_coef: float = 0.0,
                  use_pose_tracker: bool = False,
-                 goal_provider=None):
+                 goal_provider=None,
+                 held_out_combos: set[tuple[int, int]] | None = None):
         # Pass max_episode_steps to gym.make AND apply set_max_steps post-
         # construction for belt-and-suspenders coverage. Print the diagnostic
         # only on the first worker so we don't spam 16 lines.
@@ -126,17 +127,39 @@ class EnvWorker:
         # the resulting `allowed_actions`. With goal_provider=None, this
         # is bit-identical to the original rule-only PPO.
         self.goal_provider = goal_provider
+        # Stage 1.3 — when set, episodes whose mission target's
+        # (color_id, type_id) is in this set are re-rolled (new seed)
+        # until they fall outside. Used to train PPO with specific
+        # compositional combos held out, then eval on those held-out
+        # combos to measure compositional generalization at the policy
+        # level.
+        self.held_out_combos = held_out_combos or set()
         self._reset_episode()
 
     def _reset_episode(self):
         seed = self.base_seed + self.worker_id * 1_000_003 + self.episode_idx * 7919
         self.episode_idx += 1
         obs, _ = self.env.reset(seed=seed)
-        # Re-seed loop until we get a parseable mission (rare to fail).
-        for _ in range(5):
+        # Re-seed loop. Two conditions to satisfy:
+        # 1. Mission must be parseable.
+        # 2. If --held-out-combos is set, mission target's (color, type)
+        #    must NOT be in the held-out set.
+        # Up to 50 attempts before giving up (effectively never for go-to
+        # envs with 24 combos and ~4 held out → 5/6 chance per draw).
+        for _ in range(50):
             parsed = goal_predicates_for_mission(obs["mission"])
             if parsed is not None:
-                break
+                goal_preds, _spec = parsed
+                if not goal_preds:
+                    in_held_out = False
+                else:
+                    key = (
+                        int(goal_preds[0].color_id),
+                        int(goal_preds[0].type_id),
+                    )
+                    in_held_out = key in self.held_out_combos
+                if not in_held_out:
+                    break
             seed += 13
             obs, _ = self.env.reset(seed=seed)
             self.episode_idx += 1
@@ -333,6 +356,16 @@ def main() -> int:
     parser.add_argument("--vocab-checkpoint", default=None,
                         help="WhitespaceVocab checkpoint; required when "
                              "--goal-source lang")
+    # Stage 1.3 — hold out specific (color, type_idx) combos from training.
+    # Each entry is "color_id,type_idx" where type_idx is the position in
+    # OBJECT_TYPES (0=door, 1=key, 2=ball, 3=box). Episodes whose mission
+    # target matches any held-out combo are re-rolled until they don't.
+    parser.add_argument("--held-out-combos", nargs="*", default=[],
+                        help="space-separated 'color_id,type_idx' pairs to "
+                             "exclude from PPO training. Used for Stage 1.3 "
+                             "compositional generalization. type_idx is the "
+                             "position in OBJECT_TYPES (0=DOOR 1=KEY 2=BALL "
+                             "3=BOX). Example: --held-out-combos 0,2 1,1")
     args = parser.parse_args()
     if args.goal_source == "lang":
         if args.lang_checkpoint is None or args.vocab_checkpoint is None:
@@ -344,6 +377,24 @@ def main() -> int:
         parser.error(
             "--bc-checkpoint is required unless --no-bc is set"
         )
+    # Parse --held-out-combos "color,type_idx" strings into (color, type_id)
+    # tuples (type_id = OBJECT_TYPES[type_idx]).
+    held_out_combos: set[tuple[int, int]] = set()
+    for s in args.held_out_combos:
+        try:
+            c_str, t_str = s.split(",")
+            c_id = int(c_str)
+            t_idx = int(t_str)
+        except ValueError:
+            parser.error(
+                f"--held-out-combos entry {s!r} must be 'color_id,type_idx'"
+            )
+        if not (0 <= t_idx < len(OBJECT_TYPES)):
+            parser.error(
+                f"--held-out-combos type_idx {t_idx} out of range "
+                f"[0, {len(OBJECT_TYPES)})"
+            )
+        held_out_combos.add((c_id, int(OBJECT_TYPES[t_idx])))
 
     set_global_seed(args.seed)
     device = torch.device(args.device)
@@ -439,12 +490,16 @@ def main() -> int:
               f"(lang={args.lang_checkpoint}, vocab={args.vocab_checkpoint})")
     else:
         print(f"[ppo] goal source = rule (regex parser)")
+    if held_out_combos:
+        print(f"[ppo] held-out combos ({len(held_out_combos)}): "
+              f"{sorted(held_out_combos)}  (rejected during training)")
     workers = [
         EnvWorker(
             args.env_id, args.seed, i, mission_dim, n_actions,
             max_steps=args.max_steps, shaping_coef=args.shaping_coef,
             use_pose_tracker=use_pose_tracker,
             goal_provider=goal_provider,
+            held_out_combos=held_out_combos,
         )
         for i in range(args.n_envs)
     ]
@@ -675,6 +730,7 @@ def main() -> int:
                 "bc_checkpoint": args.bc_checkpoint,
                 "goal_source": args.goal_source,
                 "lang_checkpoint": args.lang_checkpoint,
+                "held_out_combos": sorted(held_out_combos),
                 "iteration": it + 1,
                 "env_steps": total_env_steps,
                 "window_mean_reward": float(np.mean(ep_reward_window)) if ep_reward_window else 0.0,
