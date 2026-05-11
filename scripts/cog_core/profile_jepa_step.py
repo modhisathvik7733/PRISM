@@ -280,6 +280,9 @@ def main() -> int:
     p.add_argument("--batch-size", type=int, default=1024)
     p.add_argument("--bf16", action="store_true", default=True)
     p.add_argument("--no-bf16", action="store_false", dest="bf16")
+    p.add_argument("--compile", action="store_true",
+                   help="wrap model.loss with torch.compile "
+                        "(mode='reduce-overhead'). First iter is slow.")
     p.add_argument("--n-iters", type=int, default=50)
     p.add_argument("--collect-n", type=int, default=2000,
                    help="transitions per collection profile run")
