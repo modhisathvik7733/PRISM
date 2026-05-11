@@ -182,6 +182,8 @@ def main() -> int:
                              "primary visible object. Forces shared-weight "
                              "color and type axes in the latent — required "
                              "for compositional predicate readout. Try 1.0.")
+    parser.add_argument("--bf16", action="store_true",
+                        help="bf16 autocast on the forward/loss pass")
     parser.add_argument("--dynamics-hidden", type=int, default=256)
     parser.add_argument("--dynamics-layers", type=int, default=3)
     parser.add_argument("--dynamics-type", default="spatial_film",
@@ -246,6 +248,9 @@ def main() -> int:
     use_aux = args.aux_predicate_weight > 0.0
     use_distance = args.aux_distance_dim > 0
     use_factored = args.aux_factored_weight > 0.0
+    use_amp = args.bf16 and device.type == "cuda"
+    if use_amp:
+        print("[dev-jepa] BF16 autocast enabled")
     loss_window: deque[float] = deque(maxlen=200)
 
     # Per-stage rollout buffer (refreshed when stage changes OR
@@ -292,12 +297,21 @@ def main() -> int:
         else:
             col_t = typ_t = col_tp1 = typ_tp1 = None
 
-        out = model.loss(
-            obs_t, a_t, obs_tp1,
-            predicates_t=preds_t, predicates_tp1=preds_tp1,
-            color_label_t=col_t, type_label_t=typ_t,
-            color_label_tp1=col_tp1, type_label_tp1=typ_tp1,
-        )
+        if use_amp:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                out = model.loss(
+                    obs_t, a_t, obs_tp1,
+                    predicates_t=preds_t, predicates_tp1=preds_tp1,
+                    color_label_t=col_t, type_label_t=typ_t,
+                    color_label_tp1=col_tp1, type_label_tp1=typ_tp1,
+                )
+        else:
+            out = model.loss(
+                obs_t, a_t, obs_tp1,
+                predicates_t=preds_t, predicates_tp1=preds_tp1,
+                color_label_t=col_t, type_label_t=typ_t,
+                color_label_tp1=col_tp1, type_label_tp1=typ_tp1,
+            )
         loss = out["loss"]
         opt.zero_grad(set_to_none=True)
         loss.backward()
