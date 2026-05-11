@@ -43,10 +43,17 @@ class PredicateReadout(nn.Module):
         self.latent_dim = latent_dim
         self.n_predicates = n_predicates
 
-        layers: list[nn.Module] = [nn.Linear(latent_dim, hidden), nn.GELU()]
-        for _ in range(max(0, n_layers - 1)):
-            layers.extend([nn.Linear(hidden, hidden), nn.GELU()])
-        layers.append(nn.Linear(hidden, n_predicates))
+        # `hidden = 0` (or n_layers = 0) is interpreted as a pure linear
+        # probe: Linear(latent_dim, n_predicates) with no hidden layer or
+        # nonlinearity. Useful for testing whether features are linearly
+        # decodable from z, separate from MLP capacity.
+        if hidden == 0 or n_layers == 0:
+            layers: list[nn.Module] = [nn.Linear(latent_dim, n_predicates)]
+        else:
+            layers = [nn.Linear(latent_dim, hidden), nn.GELU()]
+            for _ in range(max(0, n_layers - 1)):
+                layers.extend([nn.Linear(hidden, hidden), nn.GELU()])
+            layers.append(nn.Linear(hidden, n_predicates))
         self.net = nn.Sequential(*layers)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
