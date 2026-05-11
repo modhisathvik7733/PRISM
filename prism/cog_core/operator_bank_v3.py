@@ -143,9 +143,10 @@ class OperatorBankV3(nn.Module):
             "anchor_valid",
             torch.zeros(n_ops, dtype=torch.bool),
         )
-        # Python-level flag to avoid a CUDA sync (anchor_valid.any().item())
-        # in the hot path. Updated only when seed_anchors is called.
+        # Python-level state to avoid CUDA syncs in the hot path. Both are
+        # updated only when seed_anchors is called.
         self._has_anchors: bool = False
+        self._valid_op_ids: list[int] = []
 
     # ------------------------------------------------------------------
     # core forward
@@ -296,6 +297,9 @@ class OperatorBankV3(nn.Module):
             self.anchor_valid[k] = True
             stored[k] = take
         self._has_anchors = True
+        # Cache valid op ids as a Python list so _anchor_loss can iterate
+        # without any per-step CUDA syncs.
+        self._valid_op_ids = sorted(stored.keys())
         return stored
 
     def _anchor_loss(self) -> torch.Tensor:
@@ -304,27 +308,26 @@ class OperatorBankV3(nn.Module):
 
         We force the routing to operator k for anchor[k] (no gradient through
         routing for this term — the point is the *dynamics head k* must keep
-        producing the right delta)."""
-        if not bool(self.anchor_valid.any().item()):
+        producing the right delta).
+
+        Hot-path note: this is called every step after anchors are seeded,
+        so all per-op checks use the cached Python list `_valid_op_ids`
+        instead of `.item()` calls on the GPU buffer.
+        """
+        if not self._has_anchors:
             return torch.tensor(0.0, device=self.anchor_z_t.device)
 
-        device = self.anchor_z_t.device
-        total = torch.tensor(0.0, device=device)
-        n_valid = 0
-        for k in range(self.n_ops):
-            if not bool(self.anchor_valid[k].item()):
-                continue
-            z_t = self.anchor_z_t[k]          # (anchor_size, latent_dim)
-            a = self.anchor_a[k]              # (anchor_size,)
+        total = torch.tensor(0.0, device=self.anchor_z_t.device)
+        for k in self._valid_op_ids:
+            z_t = self.anchor_z_t[k]
+            a = self.anchor_a[k]
             z_tp1 = self.anchor_z_tp1[k]
             a_emb = self.action_emb(a)
             x = torch.cat([z_t, a_emb], dim=-1)
-            # Direct call to dynamics head k — bypasses routing.
             delta_pred_k = self.ops[k](x)
             delta_true = z_tp1 - z_t
             total = total + F.mse_loss(delta_pred_k, delta_true)
-            n_valid += 1
-        return total / max(n_valid, 1)
+        return total / max(len(self._valid_op_ids), 1)
 
     # ------------------------------------------------------------------
     # loss
@@ -551,8 +554,10 @@ class OperatorBankV3(nn.Module):
         bank._ema_params = {
             k: v.to(device) for k, v in ckpt.get("ema_params", {}).items()
         }
-        # Restore Python anchor flag from the buffer state (no sync needed
-        # at load time, but avoids a per-step .any().item() during training).
-        bank._has_anchors = bool(bank.anchor_valid.any().item())
+        # Restore Python anchor state from the buffer (one sync at load time
+        # so the train loop never has to sync during the hot path).
+        valid_mask = bank.anchor_valid.cpu().numpy().tolist()
+        bank._valid_op_ids = [i for i, v in enumerate(valid_mask) if v]
+        bank._has_anchors = bool(bank._valid_op_ids)
         bank.to(device)
         return bank
