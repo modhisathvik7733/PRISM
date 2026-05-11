@@ -143,6 +143,9 @@ class OperatorBankV3(nn.Module):
             "anchor_valid",
             torch.zeros(n_ops, dtype=torch.bool),
         )
+        # Python-level flag to avoid a CUDA sync (anchor_valid.any().item())
+        # in the hot path. Updated only when seed_anchors is called.
+        self._has_anchors: bool = False
 
     # ------------------------------------------------------------------
     # core forward
@@ -292,6 +295,7 @@ class OperatorBankV3(nn.Module):
                 self.anchor_z_tp1[k, take:] = 0.0
             self.anchor_valid[k] = True
             stored[k] = take
+        self._has_anchors = True
         return stored
 
     def _anchor_loss(self) -> torch.Tensor:
@@ -547,5 +551,8 @@ class OperatorBankV3(nn.Module):
         bank._ema_params = {
             k: v.to(device) for k, v in ckpt.get("ema_params", {}).items()
         }
+        # Restore Python anchor flag from the buffer state (no sync needed
+        # at load time, but avoids a per-step .any().item() during training).
+        bank._has_anchors = bool(bank.anchor_valid.any().item())
         bank.to(device)
         return bank

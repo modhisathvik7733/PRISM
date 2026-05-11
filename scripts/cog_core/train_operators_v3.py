@@ -34,7 +34,6 @@ Usage (Phase 2: continual on env B, no forgetting expected):
 from __future__ import annotations
 
 import argparse
-from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -235,14 +234,18 @@ def main() -> int:
     if use_amp:
         print(f"[v3] BF16 autocast enabled")
 
-    loss_window: deque[float] = deque(maxlen=100)
+    # GPU-side loss accumulator — synced to CPU only at log time so the
+    # train loop never blocks on .item() per step.
+    loss_accum = torch.zeros((), device=device)
+    loss_count = 0
     for step in range(args.steps):
         z_t, z_tp1, a = sample_batch_gpu(
             L_t_gpu, L_tp1_gpu, A_gpu, args.batch_size,
             replay=replay_gpu, replay_frac=args.replay_frac,
         )
 
-        use_anchor = bool(bank.anchor_valid.any().item())
+        # Python-level flags — no CUDA sync.
+        use_anchor = bank._has_anchors
         # Only run the heavy EMA-consistency forward every N steps; the
         # EMA accumulator itself updates every step regardless.
         use_ema = bank._ema_init and (step % args.ema_every == 0)
@@ -267,9 +270,13 @@ def main() -> int:
             print(f"  stored per op: {stored}")
             print()
 
-        loss_window.append(float(out["loss"].item()))
+        # Accumulate on GPU (no sync). Only sync every log interval.
+        loss_accum = loss_accum + out["loss"].detach()
+        loss_count += 1
         if step % 200 == 0:
-            mean_loss = float(np.mean(loss_window)) if loss_window else float("nan")
+            mean_loss = float(loss_accum.item() / max(loss_count, 1))
+            loss_accum = torch.zeros((), device=device)
+            loss_count = 0
             writer.add_scalar("train/loss", float(out["loss"].item()), step)
             writer.add_scalar("train/mse", float(out["mse"].item()), step)
             writer.add_scalar("train/ema_loss", float(out["ema_loss"].item()), step)
