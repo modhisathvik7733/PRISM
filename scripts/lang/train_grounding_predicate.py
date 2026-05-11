@@ -52,16 +52,17 @@ from prism.perception.slots import NUM_COLORS, NUM_TYPES, OBJECT_TYPES
 from prism.utils.seed import set_global_seed
 
 
-N_PRED = NUM_COLORS * NUM_TYPES                            # 24
+N_PRED = NUM_COLORS + NUM_TYPES                            # 6 + 4 = 10 (factored)
 
 
 class TinyTransformerPredicateHead(nn.Module):
-    """text -> predicate logits. Single transformer block + mean pool."""
+    """text -> factored predicate logits (NUM_COLORS + NUM_TYPES).
+    First NUM_COLORS are color logits, remaining are type logits."""
 
     def __init__(
         self,
         vocab_size: int,
-        n_predicates: int,
+        n_predicates: int = N_PRED,
         embed_dim: int = 64,
         n_heads: int = 4,
         ff_dim: int = 128,
@@ -91,7 +92,15 @@ class TinyTransformerPredicateHead(nn.Module):
 def build_episode_data(npz_path: Path
                        ) -> tuple[
                            np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """One row per episode. Returns (z_last, label, mission, combo)."""
+    """One row per episode. Returns (z_last, color_label, type_label, mission).
+
+    Labels come from parsing the mission ("go to the red ball" → (red, ball)).
+    z_last is the latent at the final step of the episode. With random
+    rollouts the agent often did NOT reach the goal, so z_last and the
+    mission may not agree on what's in view — that's expected; the
+    grounding test cares whether *T* and *R* each work independently and
+    whether they agree when they happen to.
+    """
     d = np.load(npz_path)
     if "missions" not in d.files:
         raise SystemExit("rollouts.npz missing `missions` field")
@@ -100,7 +109,7 @@ def build_episode_data(npz_path: Path
     missions = d["missions"]
     type_to_idx = {t: i for i, t in enumerate(OBJECT_TYPES)}
 
-    Z, Y, M, CT = [], [], [], []
+    Z, C, T, M = [], [], [], []
     for i in range(len(lengths)):
         L = int(lengths[i])
         if L < 1:
@@ -111,18 +120,20 @@ def build_episode_data(npz_path: Path
         gp = parsed[0][0]
         if gp.type_id not in type_to_idx:
             continue
-        c = int(gp.color_id)
-        t = type_to_idx[gp.type_id]
         Z.append(latents[i, L - 1])                    # last frame
-        Y.append(c * NUM_TYPES + t)
+        C.append(int(gp.color_id))
+        T.append(type_to_idx[gp.type_id])
         M.append(str(missions[i]))
-        CT.append((c, t))
 
     Z = np.stack(Z).astype(np.float32)
     if Z.ndim > 2:
         Z = Z.reshape(Z.shape[0], -1)
-    return (Z, np.array(Y, dtype=np.int64),
-            np.array(M), np.array(CT, dtype=np.int64))
+    return (
+        Z,
+        np.array(C, dtype=np.int64),
+        np.array(T, dtype=np.int64),
+        np.array(M),
+    )
 
 
 def main() -> int:
@@ -147,18 +158,21 @@ def main() -> int:
 
     # ---- data ----
     print(f"[ground-p] loading rollouts: {args.rollouts}")
-    Z, Y, M, CT = build_episode_data(Path(args.rollouts))
+    Z, C, T, M = build_episode_data(Path(args.rollouts))
     print(f"[ground-p]   {len(Z):,} episodes, latent_dim={Z.shape[-1]}")
-    print(f"[ground-p]   label histogram: "
-          f"{dict(sorted(Counter(Y.tolist()).items()))}")
+    print(f"[ground-p]   color hist: "
+          f"{dict(sorted(Counter(C.tolist()).items()))}")
+    print(f"[ground-p]   type  hist: "
+          f"{dict(sorted(Counter(T.tolist()).items()))}")
 
-    # ---- compositional split ----
-    combos = sorted({(int(c), int(t)) for c, t in CT})
+    # ---- compositional split over (color, type) combos ----
+    CT_pairs = list(zip(C.tolist(), T.tolist()))
+    combos = sorted({(int(c), int(t)) for c, t in CT_pairs})
     rng = random.Random(args.seed)
     rng.shuffle(combos)
     n_hold = min(args.holdout_combos, max(1, len(combos) // 4))
     held = set(combos[:n_hold])
-    held_mask = np.array([(int(c), int(t)) in held for c, t in CT])
+    held_mask = np.array([(int(c), int(t)) in held for c, t in CT_pairs])
     seen_idx = np.flatnonzero(~held_mask)
     held_idx = np.flatnonzero(held_mask)
     np_rng = np.random.default_rng(args.seed)
@@ -180,21 +194,21 @@ def main() -> int:
         tok, msk = vocab.encode_batch([str(M[i]) for i in idx])
         return (
             tok.to(device), msk.to(device),
-            torch.from_numpy(Y[idx]).to(device),
+            torch.from_numpy(C[idx]).to(device),
+            torch.from_numpy(T[idx]).to(device),
             torch.from_numpy(Z[idx]).to(device),
         )
 
-    tr_tok, tr_msk, tr_y, tr_z = enc(train_idx)
-    va_tok, va_msk, va_y, va_z = enc(val_idx)
-    he_tok, he_msk, he_y, he_z = enc(held_idx)
+    tr_tok, tr_msk, tr_c, tr_t, tr_z = enc(train_idx)
+    va_tok, va_msk, va_c, va_t, va_z = enc(val_idx)
+    he_tok, he_msk, he_c, he_t, he_z = enc(held_idx)
 
-    # ---- text model ----
+    # ---- text model (factored heads: NUM_COLORS + NUM_TYPES) ----
     text_model = TinyTransformerPredicateHead(
         vocab_size=vocab.size,
-        n_predicates=N_PRED,
     ).to(device)
     n_params = sum(p_.numel() for p_ in text_model.parameters())
-    print(f"[ground-p]   tiny_tf predicate head: {n_params:,} params")
+    print(f"[ground-p]   tiny_tf factored head: {n_params:,} params")
 
     # ---- load PredicateReadout (frozen) ----
     readout = PredicateReadout.load(args.readout, device)
@@ -209,107 +223,151 @@ def main() -> int:
     writer = SummaryWriter(out_dir / "tb")
     vocab.save(str(out_dir / "vocab.pt"))
 
-    def eval_split(tok, msk, y, z) -> dict:
+    def split(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return logits[:, :NUM_COLORS], logits[:, NUM_COLORS:]
+
+    def eval_split(tok, msk, c, t, z) -> dict:
         text_model.eval()
         with torch.no_grad():
+            # Text → (color, type).
             t_logits = text_model(tok, msk)
-            t_pred = t_logits.argmax(-1)
-            t_acc = float((t_pred == y).float().mean().item())
-            # readout view from latents
+            t_lc, t_lt = split(t_logits)
+            t_pc = t_lc.argmax(-1)
+            t_pt = t_lt.argmax(-1)
+            text_c = float((t_pc == c).float().mean().item())
+            text_t = float((t_pt == t).float().mean().item())
+            text_joint = float(
+                ((t_pc == c) & (t_pt == t)).float().mean().item()
+            )
+            # Readout from latent → (color, type).
             r_logits = readout(z)
-            r_pred = r_logits.argmax(-1)
-            r_acc = float((r_pred == y).float().mean().item())
-            agreement = float((t_pred == r_pred).float().mean().item())
+            r_lc, r_lt = split(r_logits)
+            r_pc = r_lc.argmax(-1)
+            r_pt = r_lt.argmax(-1)
+            r_c = float((r_pc == c).float().mean().item())
+            r_t = float((r_pt == t).float().mean().item())
+            r_joint = float(
+                ((r_pc == c) & (r_pt == t)).float().mean().item()
+            )
+            # Agreement: T(text) == R(z).
+            ag_c = float((t_pc == r_pc).float().mean().item())
+            ag_t = float((t_pt == r_pt).float().mean().item())
+            ag_joint = float(
+                ((t_pc == r_pc) & (t_pt == r_pt)).float().mean().item()
+            )
         text_model.train()
-        return {"text_acc": t_acc, "readout_acc": r_acc, "agreement": agreement}
+        return {
+            "text_c": text_c, "text_t": text_t, "text_joint": text_joint,
+            "read_c": r_c, "read_t": r_t, "read_joint": r_joint,
+            "ag_c": ag_c, "ag_t": ag_t, "ag_joint": ag_joint,
+        }
 
     # ---- train ----
     print(f"[ground-p] training {args.steps} steps, batch={args.batch_size}")
     for step in range(args.steps):
-        idx = torch.randint(0, tr_tok.shape[0], (args.batch_size,), device=device)
+        idx = torch.randint(0, tr_tok.shape[0],
+                            (args.batch_size,), device=device)
         logits = text_model(tr_tok[idx], tr_msk[idx])
-        loss = F.cross_entropy(logits, tr_y[idx])
+        lc, lt = split(logits)
+        loss = F.cross_entropy(lc, tr_c[idx]) + F.cross_entropy(lt, tr_t[idx])
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(text_model.parameters(), 1.0)
         opt.step()
 
         if step % 100 == 0:
-            tr_acc = float((logits.argmax(-1) == tr_y[idx]).float().mean().item())
-            v = eval_split(va_tok, va_msk, va_y, va_z)
-            h = eval_split(he_tok, he_msk, he_y, he_z)
+            with torch.no_grad():
+                pc = lc.argmax(-1)
+                pt = lt.argmax(-1)
+                tr_joint = float(
+                    ((pc == tr_c[idx]) & (pt == tr_t[idx]))
+                    .float().mean().item()
+                )
+            v = eval_split(va_tok, va_msk, va_c, va_t, va_z)
+            h = eval_split(he_tok, he_msk, he_c, he_t, he_z)
             writer.add_scalar("train/loss", float(loss.item()), step)
-            writer.add_scalar("val_id/text_acc", v["text_acc"], step)
-            writer.add_scalar("val_id/agreement", v["agreement"], step)
-            writer.add_scalar("val_held/text_acc", h["text_acc"], step)
-            writer.add_scalar("val_held/agreement", h["agreement"], step)
+            writer.add_scalar("val_id/text_joint", v["text_joint"], step)
+            writer.add_scalar("val_held/text_joint", h["text_joint"], step)
+            writer.add_scalar("val_held/agree_joint", h["ag_joint"], step)
             print(f"[step {step:5d}/{args.steps}]  "
                   f"loss={float(loss.item()):.3f}  "
-                  f"tr_acc={tr_acc*100:5.1f}%  "
-                  f"id: text={v['text_acc']*100:.0f}/"
-                  f"readout={v['readout_acc']*100:.0f}/"
-                  f"agree={v['agreement']*100:.0f}  "
-                  f"held: text={h['text_acc']*100:.0f}/"
-                  f"readout={h['readout_acc']*100:.0f}/"
-                  f"agree={h['agreement']*100:.0f}")
+                  f"tr={tr_joint*100:5.1f}%  "
+                  f"id_text={v['text_joint']*100:.0f}  "
+                  f"held_text={h['text_joint']*100:.0f}  "
+                  f"held_read={h['read_joint']*100:.0f}  "
+                  f"held_agree={h['ag_joint']*100:.0f}")
 
     # ---- final ----
-    v = eval_split(va_tok, va_msk, va_y, va_z)
-    h = eval_split(he_tok, he_msk, he_y, he_z)
+    v = eval_split(va_tok, va_msk, va_c, va_t, va_z)
+    h = eval_split(he_tok, he_msk, he_c, he_t, he_z)
     print("\n=== final results ===")
     print(f"  in-distribution (seen combos):")
-    print(f"    text accuracy:               {v['text_acc']*100:5.1f}%")
-    print(f"    readout-from-latent accuracy:{v['readout_acc']*100:5.1f}%")
-    print(f"    agreement(text, readout):    {v['agreement']*100:5.1f}%")
-    print(f"  held-out (compositional):")
-    print(f"    text accuracy:               {h['text_acc']*100:5.1f}%")
-    print(f"    readout-from-latent accuracy:{h['readout_acc']*100:5.1f}%")
-    print(f"    agreement(text, readout):    {h['agreement']*100:5.1f}%  "
-          f"<<<  Stage 1 grounding signal")
+    print(f"    text       color/type/joint: "
+          f"{v['text_c']*100:.1f}% / {v['text_t']*100:.1f}% / "
+          f"{v['text_joint']*100:.1f}%")
+    print(f"    readout    color/type/joint: "
+          f"{v['read_c']*100:.1f}% / {v['read_t']*100:.1f}% / "
+          f"{v['read_joint']*100:.1f}%")
+    print(f"    agreement  color/type/joint: "
+          f"{v['ag_c']*100:.1f}% / {v['ag_t']*100:.1f}% / "
+          f"{v['ag_joint']*100:.1f}%")
+    print(f"  held-out (compositional, unseen combos):")
+    print(f"    text       color/type/joint: "
+          f"{h['text_c']*100:.1f}% / {h['text_t']*100:.1f}% / "
+          f"{h['text_joint']*100:.1f}%")
+    print(f"    readout    color/type/joint: "
+          f"{h['read_c']*100:.1f}% / {h['read_t']*100:.1f}% / "
+          f"{h['read_joint']*100:.1f}%")
+    print(f"    agreement  color/type/joint: "
+          f"{h['ag_c']*100:.1f}% / {h['ag_t']*100:.1f}% / "
+          f"{h['ag_joint']*100:.1f}%  <<<  Stage 1 grounding signal")
 
-    pass_text = h["text_acc"] >= 0.80
-    pass_agreement = h["agreement"] >= 0.70
+    pass_text = h["text_joint"] >= 0.80
+    pass_readout = h["read_joint"] >= 0.40
+    pass_agreement = h["ag_joint"] >= 0.50
     print("\n=== verdict ===")
-    if pass_text and pass_agreement:
-        print("  PASS — text encoder predicts the same goal predicate "
-              "as readout-from-latent on unseen (color, type) combinations.")
-        print("  Stage 1.0-proper cleared. Language is grounded.")
+    if pass_text and pass_readout and pass_agreement:
+        print("  PASS — text and latent-readout both ground to the same "
+              "compositional (color, type) predicate. Stage 1.0-proper "
+              "cleared.")
     else:
         reasons = []
         if not pass_text:
-            reasons.append(f"text held-out acc {h['text_acc']*100:.1f}% < 80%")
+            reasons.append(
+                f"text held-out joint {h['text_joint']*100:.1f}% < 80%")
+        if not pass_readout:
+            reasons.append(
+                f"readout held-out joint {h['read_joint']*100:.1f}% < 40%")
         if not pass_agreement:
             reasons.append(
-                f"text/readout agreement {h['agreement']*100:.1f}% < 70%"
-            )
-        print(f"  FAIL — {'; '.join(reasons)}")
-        if h["readout_acc"] < 0.50:
-            print("  Note: readout itself is weak on held-out — bottleneck "
-                  "is at the JEPA-latent level, not the text encoder.")
-        elif h["text_acc"] >= 0.80 and h["agreement"] < 0.70:
-            print("  Note: text and readout each work individually but "
-                  "disagree on held-out. Could mean they're each correct "
-                  "on different subsets, OR one of them is being clever "
-                  "without grounding.")
+                f"agreement joint {h['ag_joint']*100:.1f}% < 50%")
+        print(f"  PARTIAL/FAIL — {'; '.join(reasons)}")
+        print("  Diagnostic:")
+        print(f"    text alone     compositional? "
+              f"{'yes' if h['text_joint']>=0.80 else 'no'}")
+        print(f"    readout alone  compositional? "
+              f"{'yes' if h['read_joint']>=0.40 else 'no'}")
+        print(f"    they agree?    "
+              f"{'yes' if h['ag_joint']>=0.50 else 'no'}")
+        print("  Note: low T/R agreement may reflect that with random "
+              "rollouts, z_last shows whatever the agent randomly ended "
+              "up viewing — not the mission target. So agreement is "
+              "bounded by the random policy's success rate at reaching "
+              "the target.")
 
     torch.save(
         {
             "state_dict": text_model.state_dict(),
             "vocab_size": vocab.size,
-            "n_predicates": N_PRED,
             "args": vars(args),
         },
         out_dir / "grounding_predicate_final.pt",
     )
     with open(out_dir / "summary.json", "w") as f:
         json.dump({
-            "id_text_acc": v["text_acc"],
-            "id_readout_acc": v["readout_acc"],
-            "id_agreement": v["agreement"],
-            "held_text_acc": h["text_acc"],
-            "held_readout_acc": h["readout_acc"],
-            "held_agreement": h["agreement"],
+            "id": v, "held": h,
             "pass_text": pass_text,
+            "pass_readout": pass_readout,
             "pass_agreement": pass_agreement,
             "held_combos": sorted(list(held)),
         }, f, indent=2)
