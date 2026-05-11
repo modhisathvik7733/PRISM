@@ -85,30 +85,38 @@ def run_episode(
     obs, _ = env.reset(seed=seed)
     n_actions = env.action_space.n
     h_prev = torch.zeros(1, policy.hidden_dim, device=device)
+    # RecurrentPolicy.step_with_value signature:
+    #   (z, prev_action, mission, h[, mem_feat]) -> (logits, value, h_next)
+    # prev_action is (B,) int64; use -1 for the first step ("no action" embed).
+    prev_a = torch.tensor([-1], device=device, dtype=torch.long)
     allowed_mask = torch.full(
         (n_actions,), -1e9, device=device, dtype=torch.float32,
     )
     for a in allowed:
         allowed_mask[a] = 0.0
     mission_oh = torch.from_numpy(mission_oh_np).to(device).unsqueeze(0)
+    mem_feat_dim = int(getattr(policy, "mem_feat_dim", 0) or 0)
+    mem_feat = (
+        torch.zeros(1, mem_feat_dim, device=device)
+        if mem_feat_dim > 0 else None
+    )
 
     for step in range(max_steps):
         encoded = _encode_image(obs["image"])
         z = jepa.encode(
             torch.from_numpy(encoded).float().unsqueeze(0).to(device),
         )
-        # RecurrentPolicy forward signature: (z, mission_oh, h_prev[, mem_feat])
-        try:
-            logits, _value, h_prev = policy(z, mission_oh, h_prev)
-        except TypeError:
-            # Some signatures expect mem_feat. Pass zeros.
-            mem_feat = torch.zeros(
-                1, policy.mem_proj.in_features if hasattr(policy, "mem_proj") else 0,
-                device=device,
+        if mem_feat is not None:
+            logits, _value, h_prev = policy.step_with_value(
+                z, prev_a, mission_oh, h_prev, mem_feat,
             )
-            logits, _value, h_prev = policy(z, mission_oh, h_prev, mem_feat)
+        else:
+            logits, _value, h_prev = policy.step_with_value(
+                z, prev_a, mission_oh, h_prev,
+            )
         masked = logits + allowed_mask.unsqueeze(0)
         action = int(masked.argmax(dim=-1).item())
+        prev_a = torch.tensor([action], device=device, dtype=torch.long)
         obs, reward, term, trunc, _ = env.step(action)
         if term or trunc:
             return (float(reward) > 0.0), step + 1, float(reward)

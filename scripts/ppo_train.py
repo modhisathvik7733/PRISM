@@ -751,6 +751,7 @@ def main() -> int:
         "bc_checkpoint": args.bc_checkpoint,
         "goal_source": args.goal_source,
         "lang_checkpoint": args.lang_checkpoint,
+        "held_out_combos": sorted(held_out_combos),
         "env_steps": total_env_steps,
         "window_mean_reward": float(np.mean(ep_reward_window)) if ep_reward_window else 0.0,
     }, final_path)
