@@ -60,7 +60,19 @@ def make_scheduler(kind: str, env_ids: list[str], seed: int):
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--jepa-checkpoint", required=True)
-    parser.add_argument("--bc-checkpoint", required=True)
+    parser.add_argument("--bc-checkpoint", default=None,
+                        help="required unless --no-bc is set")
+    parser.add_argument("--no-bc", action="store_true",
+                        help="initialize policy from scratch instead of "
+                             "loading a BC warm-start checkpoint")
+    parser.add_argument("--policy-hidden-dim", type=int, default=256)
+    parser.add_argument("--policy-latent-proj-dim", type=int, default=128)
+    parser.add_argument("--goal-source", choices=["rule", "lang"], default="rule")
+    parser.add_argument("--lang-checkpoint", default=None)
+    parser.add_argument("--vocab-checkpoint", default=None)
+    parser.add_argument("--held-out-combos", nargs="*", default=[],
+                        help="space-separated 'color_id,type_idx' pairs "
+                             "to exclude from training (Stage 1.4)")
     parser.add_argument("--envs", nargs="+",
                         default=["BabyAI-GoToObj-v0", "BabyAI-GoToLocal-v0",
                                  "BabyAI-GoTo-v0"])
@@ -91,6 +103,29 @@ def main() -> int:
     parser.add_argument("--device",
                         default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+    if not args.no_bc and args.bc_checkpoint is None:
+        parser.error("--bc-checkpoint is required unless --no-bc is set")
+    if args.goal_source == "lang":
+        if args.lang_checkpoint is None or args.vocab_checkpoint is None:
+            parser.error(
+                "--goal-source lang requires --lang-checkpoint and "
+                "--vocab-checkpoint"
+            )
+    held_out_combos: set[tuple[int, int]] = set()
+    for s in args.held_out_combos:
+        try:
+            c_str, t_str = s.split(",")
+            c_id = int(c_str)
+            t_idx = int(t_str)
+        except ValueError:
+            parser.error(
+                f"--held-out-combos entry {s!r} must be 'color_id,type_idx'"
+            )
+        if not (0 <= t_idx < len(OBJECT_TYPES)):
+            parser.error(
+                f"--held-out-combos type_idx {t_idx} out of range"
+            )
+        held_out_combos.add((c_id, int(OBJECT_TYPES[t_idx])))
 
     set_global_seed(args.seed)
     device = torch.device(args.device)
@@ -108,18 +143,42 @@ def main() -> int:
     mission_dim = len(OBJECT_TYPES) * NUM_COLORS
 
     # ---- policy ----
-    bc = torch.load(args.bc_checkpoint, map_location=device, weights_only=False)
-    mem_feat_dim = max(int(args.mem_feat_dim), int(bc.get("mem_feat_dim", 0) or 0))
-    policy = RecurrentPolicy(
-        latent_in_dim=bc["latent_in_dim"],
-        n_actions=bc["n_actions"],
-        mission_dim=bc["mission_dim"],
-        hidden_dim=bc["hidden_dim"],
-        latent_proj_dim=bc["latent_proj_dim"],
-        mem_feat_dim=mem_feat_dim,
-    ).to(device)
-    missing, unexpected = policy.load_state_dict(bc["policy_state_dict"], strict=False)
-    print(f"[curriculum] policy loaded: missing={missing} unexpected={unexpected}")
+    if args.no_bc:
+        mem_feat_dim = int(args.mem_feat_dim)
+        policy_latent_in_dim = latent_dim
+        policy_n_actions = n_actions
+        policy_mission_dim = mission_dim
+        policy_hidden_dim = args.policy_hidden_dim
+        policy_latent_proj_dim = args.policy_latent_proj_dim
+        policy = RecurrentPolicy(
+            latent_in_dim=policy_latent_in_dim,
+            n_actions=policy_n_actions,
+            mission_dim=policy_mission_dim,
+            hidden_dim=policy_hidden_dim,
+            latent_proj_dim=policy_latent_proj_dim,
+            mem_feat_dim=mem_feat_dim,
+        ).to(device)
+        print(f"[curriculum] policy initialized from scratch (no BC): "
+              f"hidden={policy_hidden_dim} "
+              f"latent_proj={policy_latent_proj_dim} mem={mem_feat_dim}")
+    else:
+        bc = torch.load(args.bc_checkpoint, map_location=device, weights_only=False)
+        mem_feat_dim = max(int(args.mem_feat_dim), int(bc.get("mem_feat_dim", 0) or 0))
+        policy_latent_in_dim = bc["latent_in_dim"]
+        policy_n_actions = bc["n_actions"]
+        policy_mission_dim = bc["mission_dim"]
+        policy_hidden_dim = bc["hidden_dim"]
+        policy_latent_proj_dim = bc["latent_proj_dim"]
+        policy = RecurrentPolicy(
+            latent_in_dim=policy_latent_in_dim,
+            n_actions=policy_n_actions,
+            mission_dim=policy_mission_dim,
+            hidden_dim=policy_hidden_dim,
+            latent_proj_dim=policy_latent_proj_dim,
+            mem_feat_dim=mem_feat_dim,
+        ).to(device)
+        missing, unexpected = policy.load_state_dict(bc["policy_state_dict"], strict=False)
+        print(f"[curriculum] policy loaded: missing={missing} unexpected={unexpected}")
 
     opt = torch.optim.AdamW(policy.parameters(), lr=args.lr, weight_decay=1e-4)
 
@@ -137,6 +196,23 @@ def main() -> int:
     # Each worker is initially assigned a random env from the pool.
     # After every `reschedule_every_episodes` episodes, the worker
     # asks the scheduler for its next env.
+    # Optional language goal provider (Stage 1.4).
+    goal_provider = None
+    if args.goal_source == "lang":
+        from prism.agents.lang_goal_provider import LangGoalProvider
+        goal_provider = LangGoalProvider(
+            lang_checkpoint=args.lang_checkpoint,
+            vocab_checkpoint=args.vocab_checkpoint,
+            device=device,
+        )
+        print(f"[curriculum] goal source = lang  "
+              f"(lang={args.lang_checkpoint})")
+    else:
+        print(f"[curriculum] goal source = rule")
+    if held_out_combos:
+        print(f"[curriculum] held-out combos ({len(held_out_combos)}): "
+              f"{sorted(held_out_combos)}")
+
     worker_env_ids = [scheduler.propose() for _ in range(args.n_envs)]
     workers = []
     workers_episode_count = [0] * args.n_envs
@@ -145,6 +221,8 @@ def main() -> int:
             worker_env_ids[i], args.seed, i, mission_dim, n_actions,
             max_steps=args.max_steps, shaping_coef=args.shaping_coef,
             use_pose_tracker=use_pose_tracker,
+            goal_provider=goal_provider,
+            held_out_combos=held_out_combos,
         ))
     print(f"[curriculum] worker → env (initial): "
           + ", ".join(f"w{i}={e.replace('BabyAI-', '').replace('-v0', '')}"
@@ -237,6 +315,8 @@ def main() -> int:
                                     max_steps=args.max_steps,
                                     shaping_coef=args.shaping_coef,
                                     use_pose_tracker=use_pose_tracker,
+                                    goal_provider=goal_provider,
+                                    held_out_combos=held_out_combos,
                                 )
                 buf_rewards[t] = torch.tensor(rewards, device=device)
                 buf_dones[t] = torch.tensor(dones, device=device)
@@ -344,14 +424,17 @@ def main() -> int:
             ckpt_path = out_dir / f"policy_iter{it+1}.pt"
             torch.save({
                 "policy_state_dict": policy.state_dict(),
-                "latent_in_dim": bc["latent_in_dim"],
-                "n_actions": bc["n_actions"],
-                "mission_dim": bc["mission_dim"],
-                "hidden_dim": bc["hidden_dim"],
-                "latent_proj_dim": bc["latent_proj_dim"],
+                "latent_in_dim": policy_latent_in_dim,
+                "n_actions": policy_n_actions,
+                "mission_dim": policy_mission_dim,
+                "hidden_dim": policy_hidden_dim,
+                "latent_proj_dim": policy_latent_proj_dim,
                 "mem_feat_dim": mem_feat_dim,
                 "scheduler": args.scheduler,
                 "envs": args.envs,
+                "goal_source": args.goal_source,
+                "lang_checkpoint": args.lang_checkpoint,
+                "held_out_combos": sorted(held_out_combos),
                 "iteration": it + 1,
                 "env_steps": total_env_steps,
                 "scheduler_history": [
@@ -365,14 +448,17 @@ def main() -> int:
     final = out_dir / "policy_final.pt"
     torch.save({
         "policy_state_dict": policy.state_dict(),
-        "latent_in_dim": bc["latent_in_dim"],
-        "n_actions": bc["n_actions"],
-        "mission_dim": bc["mission_dim"],
-        "hidden_dim": bc["hidden_dim"],
-        "latent_proj_dim": bc["latent_proj_dim"],
+        "latent_in_dim": policy_latent_in_dim,
+        "n_actions": policy_n_actions,
+        "mission_dim": policy_mission_dim,
+        "hidden_dim": policy_hidden_dim,
+        "latent_proj_dim": policy_latent_proj_dim,
         "mem_feat_dim": mem_feat_dim,
         "scheduler": args.scheduler,
         "envs": args.envs,
+        "goal_source": args.goal_source,
+        "lang_checkpoint": args.lang_checkpoint,
+        "held_out_combos": sorted(held_out_combos),
         "env_steps": total_env_steps,
         "scheduler_history": [
             (str(t), bool(s), float(v)) for t, s, v in scheduler.history
