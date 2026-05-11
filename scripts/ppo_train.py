@@ -94,7 +94,8 @@ class EnvWorker:
     def __init__(self, env_id: str, base_seed: int, worker_id: int,
                  mission_dim: int, n_actions: int,
                  max_steps: int = 64, shaping_coef: float = 0.0,
-                 use_pose_tracker: bool = False):
+                 use_pose_tracker: bool = False,
+                 goal_provider=None):
         # Pass max_episode_steps to gym.make AND apply set_max_steps post-
         # construction for belt-and-suspenders coverage. Print the diagnostic
         # only on the first worker so we don't spam 16 lines.
@@ -119,6 +120,12 @@ class EnvWorker:
         self.mem_feat = (
             np.zeros(MEM_FEAT_DIM, dtype=np.float32) if use_pose_tracker else None
         )
+        # Optional callable mission_text -> (type_id, color_id) that
+        # overrides the rule-parsed (type, color). The rule parser is
+        # still used for `spec` (mission *type* — go-to vs pickup) and
+        # the resulting `allowed_actions`. With goal_provider=None, this
+        # is bit-identical to the original rule-only PPO.
+        self.goal_provider = goal_provider
         self._reset_episode()
 
     def _reset_episode(self):
@@ -140,10 +147,21 @@ class EnvWorker:
         else:
             goal_preds, spec = parsed
             self.allowed = allowed_actions_for_spec(spec, self.n_actions)
-            tc_idx = type_color_index(goal_preds[0].type_id, goal_preds[0].color_id)
+            # Default: rule-parsed (type, color).
+            goal_type_id = goal_preds[0].type_id
+            goal_color_id = goal_preds[0].color_id
+            # If a language goal provider is attached, override the (type,
+            # color) it predicts from the mission text. spec / allowed
+            # actions are kept from the rule parse (mission-template-level).
+            if self.goal_provider is not None:
+                lang_type_id, lang_color_id = self.goal_provider(obs["mission"])
+                if lang_type_id >= 0 and lang_color_id >= 0:
+                    goal_type_id = lang_type_id
+                    goal_color_id = lang_color_id
+            tc_idx = type_color_index(goal_type_id, goal_color_id)
             self.mission_oh = np.zeros(self.mission_dim, dtype=np.float32)
             self.mission_oh[tc_idx] = 1.0
-            self.goal_pair = (goal_preds[0].type_id, goal_preds[0].color_id)
+            self.goal_pair = (goal_type_id, goal_color_id)
         self.raw_image = obs["image"]
         self.obs_encoded = _encode_image(obs["image"])
         self.prev_goal_dist = _goal_distance_from_raw_obs(self.raw_image, self.goal_pair)
@@ -292,7 +310,26 @@ def main() -> int:
     parser.add_argument("--run-name", default="ppo_v1")
     parser.add_argument("--save-every-iters", type=int, default=20)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    # Stage 1.2 — replace the rule-based mission parser's (type, color)
+    # extraction with a trained text→(color, type) classifier. spec /
+    # allowed_actions still come from the rule parser. With "rule" (default)
+    # this script behaves identically to the original.
+    parser.add_argument("--goal-source", choices=["rule", "lang"], default="rule",
+                        help="source of the goal (type, color) signal that "
+                             "drives the mission one-hot fed to the policy.")
+    parser.add_argument("--lang-checkpoint", default=None,
+                        help="text→(color, type) head; required when "
+                             "--goal-source lang")
+    parser.add_argument("--vocab-checkpoint", default=None,
+                        help="WhitespaceVocab checkpoint; required when "
+                             "--goal-source lang")
     args = parser.parse_args()
+    if args.goal_source == "lang":
+        if args.lang_checkpoint is None or args.vocab_checkpoint is None:
+            parser.error(
+                "--goal-source lang requires both --lang-checkpoint and "
+                "--vocab-checkpoint"
+            )
 
     set_global_seed(args.seed)
     device = torch.device(args.device)
@@ -349,11 +386,26 @@ def main() -> int:
             f"--mem-feat-dim must be {MEM_FEAT_DIM} (PoseTracker layout) "
             f"or 0 (disabled); got {mem_feat_dim}"
         )
+    # Stage 1.2 — optionally swap the rule-based mission parser's
+    # (type, color) with a trained text→(color, type) classifier.
+    goal_provider = None
+    if args.goal_source == "lang":
+        from prism.agents.lang_goal_provider import LangGoalProvider
+        goal_provider = LangGoalProvider(
+            lang_checkpoint=args.lang_checkpoint,
+            vocab_checkpoint=args.vocab_checkpoint,
+            device=device,
+        )
+        print(f"[ppo] goal source = lang  "
+              f"(lang={args.lang_checkpoint}, vocab={args.vocab_checkpoint})")
+    else:
+        print(f"[ppo] goal source = rule (regex parser)")
     workers = [
         EnvWorker(
             args.env_id, args.seed, i, mission_dim, n_actions,
             max_steps=args.max_steps, shaping_coef=args.shaping_coef,
             use_pose_tracker=use_pose_tracker,
+            goal_provider=goal_provider,
         )
         for i in range(args.n_envs)
     ]
