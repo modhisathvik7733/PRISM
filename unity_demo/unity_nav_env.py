@@ -54,9 +54,14 @@ class UnityNavEnv(gym.Env):
         target_color: str = "green",
         target_type: str = "ball",
         distractor_specs: list[tuple[str, str]] | None = None,
-        max_steps: int = 100,
-        forward_step: float = 0.5,
-        reach_threshold: float = 1.0,
+        # Defaults match Unity BridgeManager dynamics so trained policies
+        # transfer cleanly to deployment:
+        #   forward_step = moveSpeed * stepIntervalSeconds = 0.7 * 0.1 = 0.07
+        #   reach_threshold = BridgeManager.reachThreshold = 1.6
+        # max_steps scaled up to give enough budget at this step size.
+        max_steps: int = 300,
+        forward_step: float = 0.07,
+        reach_threshold: float = 1.6,
         plane_extent: float = 4.5,
         obs_scale: float = 2.0,
         step_penalty: float = 0.005,

@@ -315,8 +315,14 @@ def main() -> int:
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--obs-scale", type=float, default=2.0)
-    p.add_argument("--max-steps", type=int, default=80)
-    p.add_argument("--reach-threshold", type=float, default=1.0)
+    # Defaults below match Unity BridgeManager dynamics:
+    # moveSpeed=0.7 * stepInterval=0.1s = 0.07 unit/decision; reach=1.6.
+    # max_steps scaled up to give the agent budget at this step size.
+    p.add_argument("--max-steps", type=int, default=300)
+    p.add_argument("--reach-threshold", type=float, default=1.6)
+    p.add_argument("--forward-step", type=float, default=0.07,
+                   help="Synth env per-action move distance. Match Unity's "
+                        "moveSpeed*stepInterval for clean transfer.")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument(
         "--randomize-target-color", action="store_true",
@@ -346,6 +352,7 @@ def main() -> int:
     env_kwargs = dict(
         max_steps=args.max_steps,
         reach_threshold=args.reach_threshold,
+        forward_step=args.forward_step,
         obs_scale=args.obs_scale,
         randomize_target_color=args.randomize_target_color,
     )
