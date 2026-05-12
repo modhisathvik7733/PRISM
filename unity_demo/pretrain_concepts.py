@@ -58,6 +58,7 @@ from prism.cognition.policy import UniversalPolicy
 from prism.models.jepa import JepaWorldModel, upgrade_config
 from prism.perception.predicates import type_color_index
 from prism.perception.slots import (
+    AGENT_POS,
     COLOR_NAME_TO_IDX,
     COLOR_NAMES,
     NUM_COLORS,
@@ -140,7 +141,6 @@ def generate_dataset(
     images: list[np.ndarray] = []
     labels: list[int] = []
     adapter = Unity2DAdapter(obs_scale=obs_scale)
-    radius = obs_scale * 3.0 - 0.5
 
     # All (type, color) combos for sampling extras.
     all_classes = [
@@ -149,14 +149,40 @@ def generate_dataset(
         for c in TARGET_COLOR_NAMES
     ]
 
+    # Enumerate in-cone grid cells (excluding agent cell) once. The cone is
+    # heading-independent in the egocentric view: cells (gx, gy) with
+    # forward_dist = AGENT_POS[1] - gy >= 1 and |gx - AGENT_POS[0]| <= forward_dist.
+    ax_grid, ay_grid = AGENT_POS
+    view_size = adapter.view_size
+    in_cone_cells: list[tuple[int, int]] = []
+    for gy_ in range(view_size):
+        fd = ay_grid - gy_
+        if fd < 1:
+            continue
+        for gx_ in range(view_size):
+            if abs(gx_ - ax_grid) <= fd:
+                in_cone_cells.append((gx_, gy_))
+
     def _sample_pos(taken: list[np.ndarray]) -> np.ndarray:
+        """Sample a Unity (x, z) position whose rendered cell lies inside
+        the forward vision cone under the adapter's current heading, and
+        does not collide with previously taken positions."""
+        from prism.adapters.unity_2d import _FORWARD_VEC, _RIGHT_VEC
         for _ in range(30):
-            p = rng.uniform(-radius, radius, size=2).astype(np.float32)
-            # Quantize to a grid cell-resolution (obs_scale) to check
-            # collision in obs space rather than continuous space.
-            if all(
-                np.abs(p - t).max() > obs_scale * 0.9 for t in taken
-            ):
+            gx_, gy_ = in_cone_cells[int(rng.integers(0, len(in_cone_cells)))]
+            fwd_cells = ay_grid - gy_       # >= 1
+            right_cells = gx_ - ax_grid     # in [-fd, +fd]
+            # Small in-cell jitter so the object isn't pinned to the cell
+            # center; keeps width within ±0.4 to avoid spilling into a
+            # neighboring (possibly out-of-cone) cell.
+            j_fwd = float(rng.uniform(-0.4, 0.4))
+            j_right = float(rng.uniform(-0.4, 0.4))
+            fwd_unity = (fwd_cells + j_fwd) * obs_scale
+            right_unity = (right_cells + j_right) * obs_scale
+            fwd_vec = _FORWARD_VEC[adapter.heading]
+            right_vec = _RIGHT_VEC[adapter.heading]
+            p = (fwd_unity * fwd_vec + right_unity * right_vec).astype(np.float32)
+            if all(np.abs(p - t).max() > obs_scale * 0.9 for t in taken):
                 return p
         return p  # fallback after rejections
 
