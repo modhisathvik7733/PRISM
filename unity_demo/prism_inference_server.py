@@ -131,6 +131,9 @@ async def _handle_connection(websocket, *, policy, jepa, device, args):
     episode_path_len = 0.0
     episode_start_step = 0
     prev_pos: tuple[float, float] | None = None
+    # Dedup consecutive done flags from Unity (bug: it sends done=true on the
+    # touch tick AND the next tick after reset).
+    last_done = False
 
     try:
         async for message in websocket:
@@ -140,13 +143,18 @@ async def _handle_connection(websocket, *, policy, jepa, device, args):
                 print(f"[infer] invalid JSON: {message[:80]}")
                 continue
 
-            # ---- handle episode boundary ----
-            if state.get("episode_done", False):
+            # ---- handle episode boundary (dedup consecutive done flags) ----
+            this_done = bool(state.get("episode_done", False))
+            if this_done and not last_done:
                 # Compute and print path-efficiency before resetting.
                 if episode_start is not None and episode_target is not None:
-                    optimal = abs(episode_target[0] - episode_start[0]) + abs(
+                    raw_manhattan = abs(episode_target[0] - episode_start[0]) + abs(
                         episode_target[1] - episode_start[1]
                     )
+                    # We only need to enter the touch zone (radius =
+                    # args.reach_threshold around target), not reach the
+                    # target's exact center. Subtract that so eff <= 1.
+                    optimal = max(0.0, raw_manhattan - args.reach_threshold)
                     actual = episode_path_len
                     eff = (optimal / actual) if actual > 1e-6 else 0.0
                     eps_steps = step_count - episode_start_step
@@ -155,7 +163,8 @@ async def _handle_connection(websocket, *, policy, jepa, device, args):
                         f"steps_in_ep={eps_steps} "
                         f"start=({episode_start[0]:+.2f},{episode_start[1]:+.2f}) "
                         f"target=({episode_target[0]:+.2f},{episode_target[1]:+.2f}) "
-                        f"optimal_manhattan={optimal:.2f} actual_path={actual:.2f} "
+                        f"raw_manhattan={raw_manhattan:.2f} "
+                        f"optimal(zone)={optimal:.2f} actual_path={actual:.2f} "
                         f"efficiency={eff:.3f}"
                     )
                 episode_idx += 1
@@ -171,6 +180,7 @@ async def _handle_connection(websocket, *, policy, jepa, device, args):
                 else:
                     h = policy.init_hidden(1, device)
                 prev_action = torch.tensor([-1], device=device, dtype=torch.long)
+            last_done = this_done
 
             agent_pos = tuple(state.get("agent_pos", [0.0, 0.0]))
             target_pos = tuple(state.get("target_pos", [0.0, 0.0]))
@@ -275,6 +285,11 @@ def main() -> int:
     )
     p.add_argument("--target-color", default="green")
     p.add_argument("--target-type", default="ball")
+    p.add_argument(
+        "--reach-threshold", type=float, default=1.6,
+        help="Touch radius (Unity units). MUST match BridgeManager.reachThreshold "
+             "or the efficiency metric will be biased.",
+    )
     p.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu",
     )
