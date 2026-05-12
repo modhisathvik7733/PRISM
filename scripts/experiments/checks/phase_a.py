@@ -53,26 +53,40 @@ def check_imports() -> tuple[bool, dict]:
 def check_babyai_adapter_present() -> tuple[bool, dict]:
     """Verify BabyAIAdapter exists and implements the Protocol.
 
-    PR-3 implementation; PR-1 returns NotImplemented.
+    Attributes may be declared either as class-level values (with
+    defaults) or via `__annotations__`. Both are valid Protocol-style
+    declarations; the check accepts either.
     """
     try:
-        from prism.adapters.babyai_adapter import BabyAIAdapter  # noqa: F401
-        from prism.adapters.base import DomainAdapter
-        adapter_cls = BabyAIAdapter
-        # Protocol structural check is runtime via isinstance because
-        # DomainAdapter is @runtime_checkable.
-        # We can't instantiate without an encoder checkpoint at check
-        # time; just verify the class declares the required attributes.
-        required_attrs = (
-            "name", "latent_dim", "mission_dim_max", "n_obs_tokens",
-            "encoder", "tokenize", "action_head", "mask_logits",
-            "reward_shaper",
-        )
-        missing = [a for a in required_attrs if not hasattr(adapter_cls, a)]
-        ok = len(missing) == 0
-        return ok, {"missing_attrs": missing}
+        from prism.adapters.babyai_adapter import BabyAIAdapter
     except ImportError as e:
         return False, {"error": f"BabyAIAdapter not yet present (PR-2): {e!r}"}
+
+    adapter_cls = BabyAIAdapter
+
+    # Methods that must exist as callable attributes on the class.
+    required_methods = (
+        "encoder", "tokenize", "action_head", "mask_logits", "reward_shaper",
+    )
+    # Protocol-required attributes. Accept class-level values OR
+    # `__annotations__` entries.
+    required_attrs = (
+        "name", "latent_dim", "mission_dim_max", "n_obs_tokens",
+    )
+
+    annotations = getattr(adapter_cls, "__annotations__", {})
+    missing_methods = [
+        m for m in required_methods if not callable(getattr(adapter_cls, m, None))
+    ]
+    missing_attrs = [
+        a for a in required_attrs
+        if not hasattr(adapter_cls, a) and a not in annotations
+    ]
+    ok = (len(missing_methods) == 0) and (len(missing_attrs) == 0)
+    return ok, {
+        "missing_methods": missing_methods,
+        "missing_attrs": missing_attrs,
+    }
 
 
 def check_universal_policy_present() -> tuple[bool, dict]:

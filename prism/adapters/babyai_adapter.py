@@ -64,9 +64,21 @@ class BabyAIAdapter:
     The adapter holds the JEPA encoder in eval mode with frozen
     parameters (matches v5 ppo_train.py:428-430). The substrate's
     optimizer never sees these parameters.
+
+    Protocol-required attributes are declared at the class level (with
+    sentinel defaults) so structural checks via `hasattr` and
+    `__annotations__` both pass. Real values are set in `__init__`.
     """
 
+    # ------------------------------------------------------------------
+    # DomainAdapter Protocol attributes (class-level for static checking)
+    # ------------------------------------------------------------------
     name: str = "babyai"
+    latent_dim: int = 0           # set in __init__ from JEPA cfg
+    mission_dim: int = 0          # set in __init__: NUM_TYPES * NUM_COLORS (24)
+    n_actions: int = 0            # set in __init__ from JEPA cfg
+    n_obs_tokens: int = 1         # constant for BabyAI: one OBS token per step
+    mission_dim_max: int = 1      # constant for BabyAI: one MISSION token
 
     def __init__(
         self,
@@ -78,17 +90,14 @@ class BabyAIAdapter:
         self._cfg = cfg
         self._device = device
 
-        # Substrate-facing dimensions. These are READ by UniversalPolicy
-        # at construction; they cannot change later (substrate-config-hash).
-        self.latent_dim: int = _latent_dim_for_cfg(cfg)
-        self.n_actions: int = int(cfg.n_actions)
-        self.mission_dim: int = len(OBJECT_TYPES) * NUM_COLORS  # 24 for BabyAI
-
-        # Token-stream advertisements (currently unused in Phase A; the
-        # substrate still operates on the latent vector directly via
-        # `encode_obs`. PR-4 wires `tokenize` into the trunk path).
-        self.n_obs_tokens: int = 1
-        self.mission_dim_max: int = 1  # 1 token holding the 24-d one-hot
+        # Override class-level sentinels with actual JEPA-derived values.
+        # These are READ by UniversalPolicy.from_adapter at construction;
+        # they cannot change later (substrate-config-hash invariant).
+        self.latent_dim = _latent_dim_for_cfg(cfg)
+        self.n_actions = int(cfg.n_actions)
+        self.mission_dim = len(OBJECT_TYPES) * NUM_COLORS  # 24 for BabyAI
+        # n_obs_tokens and mission_dim_max keep their class-level defaults
+        # for Phase A. PR-4 may override per-tokenization-mode.
 
     # ------------------------------------------------------------------
     # Construction helpers
