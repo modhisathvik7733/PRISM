@@ -119,21 +119,46 @@ def generate_dataset(
     n_per_class: int,
     obs_scale: float = 2.0,
     seed: int = 0,
+    n_extra_objects_range: tuple[int, int] = (0, 0),
 ) -> tuple[np.ndarray, np.ndarray]:
     """For each of the 24 (type, color) classes, render n_per_class
-    observations with that one object placed at a random in-view
-    position and random virtual heading.
+    observations. Each obs has:
+      - 1 PRIMARY object of the labeled (type, color)
+      - 0..2 random EXTRA objects of different (type, color)
+      - All objects at random in-view non-overlapping positions
+      - Random virtual heading
+
+    Multi-object scenes force the model to develop position-aware,
+    object-specific features (vs. the "single object, lazy global
+    classification" failure mode of single-object datasets).
 
     Returns:
       images: (N, 3, 7, 7) float32, JEPA-normalized
-      labels: (N,) int64, class index = type_color_index(type, color)
+      labels: (N,) int64, class index = type_color_index(primary)
     """
     rng = np.random.default_rng(seed)
     images: list[np.ndarray] = []
     labels: list[int] = []
-
-    # Build an adapter once; we only use its render_obs_multi() method.
     adapter = Unity2DAdapter(obs_scale=obs_scale)
+    radius = obs_scale * 3.0 - 0.5
+
+    # All (type, color) combos for sampling extras.
+    all_classes = [
+        (OBJECT_NAME_TO_TYPE[t], COLOR_NAME_TO_IDX[c])
+        for t in TARGET_TYPE_NAMES
+        for c in TARGET_COLOR_NAMES
+    ]
+
+    def _sample_pos(taken: list[np.ndarray]) -> np.ndarray:
+        for _ in range(30):
+            p = rng.uniform(-radius, radius, size=2).astype(np.float32)
+            # Quantize to a grid cell-resolution (obs_scale) to check
+            # collision in obs space rather than continuous space.
+            if all(
+                np.abs(p - t).max() > obs_scale * 0.9 for t in taken
+            ):
+                return p
+        return p  # fallback after rejections
 
     for type_name in TARGET_TYPE_NAMES:
         type_id = OBJECT_NAME_TO_TYPE[type_name]
@@ -141,14 +166,37 @@ def generate_dataset(
             color_id = COLOR_NAME_TO_IDX[color_name]
             label = type_color_index(type_id, color_id)
             for _ in range(n_per_class):
-                # Random heading so obs distribution covers all 4 orientations.
                 adapter.heading = int(rng.integers(0, 4))
-                # Random in-view position. View covers ~±3 grid cells, each
-                # cell = obs_scale Unity units. We sample in Unity space
-                # so the in-view radius is obs_scale * 3.
-                radius = obs_scale * 3.0 - 0.5
-                pos = rng.uniform(-radius, radius, size=2).astype(np.float32)
-                scene = [(type_id, color_id, (float(pos[0]), float(pos[1])))]
+                taken: list[np.ndarray] = []
+
+                # Primary object: this is what the label refers to.
+                primary_pos = _sample_pos(taken)
+                taken.append(primary_pos)
+                scene: list[tuple[int, int, tuple[float, float]]] = [
+                    (type_id, color_id, (float(primary_pos[0]), float(primary_pos[1])))
+                ]
+
+                # Extra objects: random (type, color) != primary, at
+                # non-overlapping positions. Forces the model to be
+                # discriminative rather than just detecting "is there an object".
+                n_extras = int(rng.integers(
+                    n_extra_objects_range[0], n_extra_objects_range[1] + 1
+                ))
+                for _ in range(n_extras):
+                    # Sample an extra class != primary.
+                    while True:
+                        ext_type_id, ext_color_id = all_classes[
+                            int(rng.integers(0, len(all_classes)))
+                        ]
+                        if (ext_type_id, ext_color_id) != (type_id, color_id):
+                            break
+                    ext_pos = _sample_pos(taken)
+                    taken.append(ext_pos)
+                    scene.append((
+                        ext_type_id, ext_color_id,
+                        (float(ext_pos[0]), float(ext_pos[1])),
+                    ))
+
                 obs = adapter.render_obs_multi((0.0, 0.0), scene)
                 images.append(obs.astype(np.float32))
                 labels.append(label)
@@ -298,6 +346,12 @@ def main() -> int:
         help="Where to save the fine-tuned JEPA checkpoint. Required if "
              "--train-jepa is set.",
     )
+    p.add_argument(
+        "--max-extra-objects", type=int, default=0,
+        help="Max number of random distractor objects per training obs "
+             "(0..N). Currently uses primary-label semantics which is "
+             "ambiguous with extras >0 — leave 0 unless experimenting.",
+    )
     args = p.parse_args()
     if args.train_jepa and args.out_jepa_path is None:
         p.error("--out-jepa-path is required when --train-jepa is set")
@@ -360,11 +414,14 @@ def main() -> int:
     print(f"[concept] generating dataset: {args.n_per_class} samples/class * "
           f"{NUM_CLASSES} classes = {args.n_per_class * NUM_CLASSES} train samples")
     t0 = time.time()
+    extras_range = (0, args.max_extra_objects)
     train_images_np, train_labels_np = generate_dataset(
         n_per_class=args.n_per_class, obs_scale=args.obs_scale, seed=0,
+        n_extra_objects_range=extras_range,
     )
     eval_images_np, eval_labels_np = generate_dataset(
         n_per_class=args.n_eval_per_class, obs_scale=args.obs_scale, seed=42,
+        n_extra_objects_range=extras_range,
     )
     print(f"[concept] generated in {time.time()-t0:.1f}s. "
           f"train={train_images_np.shape}, eval={eval_images_np.shape}")
