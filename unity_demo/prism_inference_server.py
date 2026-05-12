@@ -141,6 +141,13 @@ async def _handle_connection(websocket, *, policy, jepa, device, args):
                 else:
                     h = policy.init_hidden(1, device)
                 prev_action = torch.tensor([-1], device=device, dtype=torch.long)
+                ap = state.get("agent_pos", [0.0, 0.0])
+                tp = state.get("target_pos", [0.0, 0.0])
+                print(
+                    f"[infer] *** TOUCH at step={step_count} *** "
+                    f"agent=({ap[0]:+.2f},{ap[1]:+.2f}) "
+                    f"target=({tp[0]:+.2f},{tp[1]:+.2f})"
+                )
 
             agent_pos = tuple(state.get("agent_pos", [0.0, 0.0]))
             target_pos = tuple(state.get("target_pos", [0.0, 0.0]))
