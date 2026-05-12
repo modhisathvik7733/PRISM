@@ -437,7 +437,25 @@ def main() -> int:
         help="Number of curriculum stages. Default 1 (no curriculum). "
              "When >1, total_steps is divided evenly; the engine runs "
              "stage transitions between segments. Requires --policy-type "
-             "universal --trunk transformer.",
+             "universal --trunk transformer. Ignored when --curriculum "
+             "is set (the curriculum builder declares its own stage count).",
+    )
+    # PR-6b: named curricula with per-stage env factories.
+    # When --curriculum is set, --n-stages is ignored and the stage
+    # list comes from the registered builder. --curriculum-order
+    # picks forward / reverse / shuffled for E1 ordering ablation.
+    parser.add_argument(
+        "--curriculum", default=None,
+        help="Name of a registered curriculum. Currently: "
+             "'babyai_developmental' (3-stage: GoToObj → GoToLocal → "
+             "PickupLoc). When set, supersedes --n-stages and uses the "
+             "named curriculum's per-stage env factories.",
+    )
+    parser.add_argument(
+        "--curriculum-order", default="forward",
+        choices=["forward", "reverse", "shuffled"],
+        help="Stage ordering for --curriculum. E1 ordering ablation "
+             "uses all three. shuffled is deterministic (seed=0).",
     )
     parser.add_argument(
         "--stage-expand-slots", type=int, default=0,
@@ -724,16 +742,23 @@ def main() -> int:
     if held_out_combos:
         print(f"[ppo] held-out combos ({len(held_out_combos)}): "
               f"{sorted(held_out_combos)}  (rejected during training)")
-    workers = [
-        EnvWorker(
-            args.env_id, args.seed, i, mission_dim, n_actions,
-            max_steps=args.max_steps, shaping_coef=args.shaping_coef,
-            use_pose_tracker=use_pose_tracker,
-            goal_provider=goal_provider,
-            held_out_combos=held_out_combos,
-        )
-        for i in range(args.n_envs)
-    ]
+    def _build_workers(env_id: str):
+        """Construct n_envs fresh EnvWorkers on the given env_id. Used at
+        startup and at curriculum-mode stage transitions to hot-swap envs
+        between stages. ~100ms per worker on BabyAI (gym + minigrid setup);
+        typical 32-worker swap is ~3s — acceptable per stage."""
+        return [
+            EnvWorker(
+                env_id, args.seed, i, mission_dim, n_actions,
+                max_steps=args.max_steps, shaping_coef=args.shaping_coef,
+                use_pose_tracker=use_pose_tracker,
+                goal_provider=goal_provider,
+                held_out_combos=held_out_combos,
+            )
+            for i in range(args.n_envs)
+        ]
+
+    workers = _build_workers(args.env_id)
     print(f"[ppo] env: max_steps={args.max_steps} shaping_coef={args.shaping_coef} "
           f"pose_tracker={use_pose_tracker}")
 
@@ -761,37 +786,65 @@ def main() -> int:
     if args.log_bank_stats > 0 and args.n_stages <= 1 and substrate_banks is not None:
         for _b in substrate_banks.values():
             _b.tracking = True
-    if args.n_stages > 1:
+    # PR-6b: curriculum can be either named (--curriculum) with per-stage
+    # env factories, OR synthesized (--n-stages > 1) on a single env.
+    # Named curriculum takes precedence.
+    use_curriculum = args.curriculum is not None or args.n_stages > 1
+    if use_curriculum:
         if substrate_banks is None:
             raise SystemExit(
-                "--n-stages > 1 requires --policy-type universal --trunk transformer "
-                "(the curriculum engine reads Concept/Operator banks off the "
-                "transformer's RetrievalBlock)."
+                "curriculum mode requires --policy-type universal --trunk "
+                "transformer (the curriculum engine reads Concept/Operator "
+                "banks off the transformer's RetrievalBlock)."
             )
         from prism.curriculum.engine import CurriculumEngine, CurriculumEngineConfig
-        from prism.curriculum.stage import Stage
+        from prism.curriculum.stage import Stage as _Stage
 
         banks = substrate_banks
 
-        iters_per_stage = max(1, n_iterations // args.n_stages)
-        # Recompute the final iteration count so it matches
-        # n_stages * iters_per_stage (may drop a few iterations if
-        # n_iterations isn't divisible).
-        n_iterations = iters_per_stage * args.n_stages
-
-        # Synthesize N stages on the same env (PR-6 smoke). Per-stage
-        # env_factory differentiation is PR-6b.
-        env_factory_placeholder = lambda: None  # not called in this PR
-        stages = [
-            Stage(
-                name=f"stage{k}",
-                env_factory=env_factory_placeholder,
-                max_env_steps=iters_per_stage * args.rollout_steps * args.n_envs,
-                expand_slots_before=(0 if k == 0 else args.stage_expand_slots),
-                freeze_after=(k < args.n_stages - 1),
+        if args.curriculum is not None:
+            # PR-6b path: named curriculum with per-stage env factories.
+            from prism.curriculum.babyai_curriculum import (
+                BABYAI_PROBE_ENV_ID, get_curriculum, reorder_curriculum,
             )
-            for k in range(args.n_stages)
-        ]
+            # Per-stage env_steps budget. The builder's default is 167k×3;
+            # honor --total-steps by rescaling proportionally if user
+            # overrides it.
+            n_stages_from_curr = len(get_curriculum(args.curriculum))
+            per_stage_env = args.total_steps // n_stages_from_curr
+            stages = get_curriculum(
+                args.curriculum,
+                per_stage_env_steps=per_stage_env,
+                expand_slots_per_transition=args.stage_expand_slots,
+            )
+            stages = reorder_curriculum(stages, args.curriculum_order)
+            iters_per_stage = max(
+                1, per_stage_env // (args.rollout_steps * args.n_envs)
+            )
+            n_iterations = iters_per_stage * len(stages)
+            args.n_stages = len(stages)
+            probe_env_id = BABYAI_PROBE_ENV_ID
+            print(f"[ppo] named curriculum '{args.curriculum}' "
+                  f"(order={args.curriculum_order}): "
+                  f"{[s.name + '@' + s.extra.get('env_id', '?') for s in stages]}")
+        else:
+            # PR-6 path: synthesize n_stages on the same env.
+            iters_per_stage = max(1, n_iterations // args.n_stages)
+            n_iterations = iters_per_stage * args.n_stages
+            env_factory_placeholder = lambda: None
+            stages = [
+                _Stage(
+                    name=f"stage{k}",
+                    env_factory=env_factory_placeholder,
+                    max_env_steps=iters_per_stage * args.rollout_steps * args.n_envs,
+                    expand_slots_before=(0 if k == 0 else args.stage_expand_slots),
+                    freeze_after=(k < args.n_stages - 1),
+                    extra={"env_id": args.env_id},
+                )
+                for k in range(args.n_stages)
+            ]
+            probe_env_id = args.env_id
+
         per_bank: dict[str, float] = {}
         if args.concept_freeze_threshold is not None:
             per_bank["concept"] = args.concept_freeze_threshold
@@ -805,15 +858,60 @@ def main() -> int:
         curriculum_engine = CurriculumEngine(
             stages=stages, banks=banks, config=config,
         )
+
+        # Auto probe-set: collect (or load) at Stage 0 init per
+        # resolution 6. Probe is always on the canonical probe_env_id
+        # (BabyAI-GoToLocal for the babyai_developmental curriculum)
+        # so E4 across curriculum-order arms uses the SAME probes.
+        from prism.envs.babyai import _encode_image, make_env_with_max_steps
+
+        def _probe_env_factory():
+            return make_env_with_max_steps(probe_env_id, max_steps=64)
+
+        def _probe_obs_fn(raw):
+            return _encode_image(raw["image"])
+
+        def _probe_mission_fn(raw):
+            from prism.perception.slots import NUM_COLORS, OBJECT_TYPES
+            v = np.zeros(len(OBJECT_TYPES) * NUM_COLORS, dtype=np.float32)
+            try:
+                preds = goal_predicates_for_mission(raw["mission"], None)
+                if preds and preds[0][1] is not None and preds[0][2] is not None:
+                    col, typ = preds[0][1], preds[0][2]
+                    if 0 <= col < NUM_COLORS and 0 <= typ < len(OBJECT_TYPES):
+                        v[typ * NUM_COLORS + col] = 1.0
+            except Exception:
+                pass
+            return v
+
+        curriculum_engine.init_probe_set(
+            env_factory=_probe_env_factory,
+            env_id=probe_env_id,
+            n_actions=n_actions,
+            obs_fn=_probe_obs_fn,
+            mission_fn=_probe_mission_fn,
+            save_dir=out_dir,
+        )
+        if curriculum_engine.probe_set is not None:
+            print(f"[ppo] probe set ready: {curriculum_engine.probe_set.n_frames} frames "
+                  f"from {probe_env_id} hash={curriculum_engine.probe_set.hash[:16]}…")
+
         threshold_repr = (
             f"default={args.curriculum_freeze_threshold}"
             + (f" concept={per_bank['concept']}" if "concept" in per_bank else "")
             + (f" operator={per_bank['operator']}" if "operator" in per_bank else "")
         )
-        print(f"[ppo] curriculum mode: {args.n_stages} stages × "
+        print(f"[ppo] curriculum mode: {len(stages)} stages × "
               f"{iters_per_stage} iters each (= {n_iterations} total). "
               f"expand={args.stage_expand_slots}/stage threshold=({threshold_repr}) "
               f"warmup={args.curriculum_warmup}")
+
+        # If first stage's env_id differs from --env-id, hot-swap workers.
+        first_stage_env = stages[0].extra.get("env_id")
+        if first_stage_env is not None and first_stage_env != args.env_id:
+            print(f"[ppo] swapping env for stage 0: {args.env_id} → {first_stage_env}")
+            workers = _build_workers(first_stage_env)
+
         # Begin tracking activations on stage 0 immediately.
         curriculum_engine.start_stage_tracking()
 
@@ -1176,6 +1274,25 @@ def main() -> int:
                     f"active={operator_r['n_active_after']}, "
                     f"total_frozen={operator_r['n_frozen_after']})"
                 )
+            # PR-6b: hot-swap env workers if the next stage targets a
+            # different env. The current `h` may carry buffer state from
+            # the old env; reset it to a fresh per-env init so the new
+            # stage starts with no stale token history.
+            next_stage = curriculum_engine.current_stage
+            next_env_id = next_stage.extra.get("env_id")
+            if next_env_id is not None:
+                prev_env_id = stages[stage_idx_completed].extra.get("env_id")
+                if next_env_id != prev_env_id:
+                    print(f"[curriculum] swapping env: {prev_env_id} → {next_env_id}")
+                    workers = _build_workers(next_env_id)
+                    # Reset rolling state — a buffer of stale tokens from
+                    # the old env would pollute the new stage's first
+                    # forward passes. Tuple state goes through reset_buffer.
+                    full_done = torch.ones(B, dtype=torch.bool, device=device)
+                    h = policy.reset_buffer(full_done, h)
+                    prev_actions = torch.full(
+                        (B,), -1, device=device, dtype=torch.long
+                    )
             # Begin tracking for the next stage.
             curriculum_engine.start_stage_tracking()
 
