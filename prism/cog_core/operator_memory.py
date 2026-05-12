@@ -5,15 +5,8 @@ Hopfield store. Operators are behavioral primitives (move_forward, pickup,
 toggle, etc.) — fewer than concepts but need sharper retrieval (a single
 correct operator should fire, not a blend).
 
-Key differences from ConceptMemory:
-- Smaller slot count (64 vs 1024 concepts)
-- Higher scaling β (sharper retrieval, single-pattern regime)
-- Iterative update steps for high-precision lookup
-- Stores per-operator MLP indices (for compatibility with OperatorBankV3)
-
-The retrieved operator embedding can either:
-1. Be used as a soft routing signal over a frozen OperatorBankV3 (transitional)
-2. Be used directly as the operator effect prediction (terminal)
+Same architecture as ConceptMemory (bare Hopfield + explicit K/V banks)
+but with sharper β and iterative retrieval.
 """
 
 from __future__ import annotations
@@ -28,14 +21,15 @@ import torch.nn as nn
 _VENDOR = os.path.join(os.path.dirname(__file__), "..", "_vendor")
 if _VENDOR not in sys.path:
     sys.path.insert(0, _VENDOR)
-from hflayers import HopfieldLayer  # noqa: E402
+from hflayers import Hopfield  # noqa: E402
 
 
 class OperatorMemory(nn.Module):
     """Hopfield-based operator memory for behavioral primitives.
 
-    Higher scaling than ConceptMemory because operators need sharp retrieval:
-    "move_forward" and "turn_left" are distinct actions, not a blend.
+    Higher β + iterative retrieval than ConceptMemory because operators
+    need sharp single-pattern retrieval ("move_forward" vs "turn_left"
+    are distinct actions, not a blend).
     """
 
     def __init__(
@@ -48,7 +42,6 @@ class OperatorMemory(nn.Module):
         update_steps: int = 3,       # iterative for precision
     ):
         super().__init__()
-        assert slot_dim % n_heads == 0
         self.latent_dim = latent_dim
         self.n_slots = n_slots
         self.slot_dim = slot_dim
@@ -56,40 +49,51 @@ class OperatorMemory(nn.Module):
         self.scaling = scaling
         self.update_steps = update_steps
 
-        self.hopfield = HopfieldLayer(
+        head_dim = max(8, min(latent_dim, slot_dim) // n_heads)
+
+        self.hopfield = Hopfield(
             input_size=latent_dim,
+            stored_pattern_size=latent_dim,
+            pattern_projection_size=slot_dim,
             output_size=slot_dim,
-            hidden_size=slot_dim // n_heads,
-            quantity=n_slots,
+            hidden_size=head_dim,
             num_heads=n_heads,
             scaling=scaling,
             update_steps_max=update_steps,
-            lookup_weights_as_separated=True,
-            lookup_targets_as_trainable=True,
             normalize_stored_pattern=True,
             normalize_state_pattern=True,
             normalize_pattern_projection=True,
         )
 
-        # Operator metadata Python-side: {slot_idx: {"name": str, "n_uses": int,
-        # "success_rate": float, "preconditions": list, "effects": list}}
+        # K bank: operator keys for matching state contexts.
+        self.keys = nn.Parameter(torch.randn(1, n_slots, latent_dim) * 0.02)
+        # V bank: operator embeddings retrieved by attention.
+        self.values = nn.Parameter(torch.randn(1, n_slots, slot_dim) * 0.02)
+
+        # Operator metadata Python-side.
         self.operator_metadata: dict[int, dict[str, Any]] = {}
+
+    def _build_triple(self, z: torch.Tensor) -> tuple:
+        B = z.size(0)
+        K = self.keys.expand(B, -1, -1)
+        V = self.values.expand(B, -1, -1)
+        return (K, z, V)
 
     def forward(
         self,
         z: torch.Tensor,
         return_attention: bool = False,
     ):
-        """Query operator memory with context vector z."""
         squeezed = False
         if z.dim() == 2:
             z = z.unsqueeze(1)
             squeezed = True
 
-        out = self.hopfield(z)
+        triple = self._build_triple(z)
+        out = self.hopfield(triple)
 
         if return_attention:
-            attn = self.hopfield.hopfield.get_association_matrix(z)
+            attn = self.hopfield.get_association_matrix(triple)
             attn = attn.mean(dim=1)
             if squeezed:
                 out = out.squeeze(1)
@@ -102,10 +106,7 @@ class OperatorMemory(nn.Module):
 
     @torch.no_grad()
     def select_operator(self, z: torch.Tensor) -> tuple[int, float]:
-        """Return (best_operator_slot, confidence) for a single state.
-
-        For policy use: pick the highest-weighted operator and report confidence.
-        """
+        """Return (best_operator_slot, confidence) for a single state."""
         _, attn = self.forward(z, return_attention=True)
         if attn.dim() == 3:
             attn = attn[:, -1, :]
@@ -130,7 +131,6 @@ class OperatorMemory(nn.Module):
         }
 
     def record_use(self, slot_idx: int, success: bool) -> None:
-        """Track operator usage statistics."""
         if slot_idx not in self.operator_metadata:
             self.operator_metadata[slot_idx] = {
                 "name": f"op_{slot_idx}",

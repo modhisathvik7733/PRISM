@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from prism.cog_core.concept_memory import ConceptMemory
 from prism.cog_core.operator_memory import OperatorMemory
@@ -280,27 +279,11 @@ class HybridPolicy(nn.Module):
 
     @torch.no_grad()
     def _extract_slot_vectors(self, slot_indices: torch.Tensor) -> torch.Tensor:
-        """Extract slot embeddings by index from the Hopfield target_weights.
+        """Look up V-bank entries by slot index.
 
         slot_indices: (B, K) long → (B, K, concept_slot_dim).
         """
-        # Inspect the HopfieldLayer internals to find the V (target) bank.
-        layer = self.concept_memory.hopfield
-        # In hflayers, the trainable V is `lookup_weights` (separated) or
-        # `target_weights`. Walk through child modules to find it.
-        v_bank = None
-        for name, param in layer.named_parameters():
-            if "target_weights" in name or "lookup_target" in name:
-                v_bank = param
-                break
-        if v_bank is None:
-            # Fall back: try to extract via attention forward pass.
-            B, K = slot_indices.shape
-            return torch.zeros(B, K, self.concept_slot_dim, device=slot_indices.device)
-        # v_bank shape: (1, n_slots, hidden_dim) typically.
-        # Index slots: result shape (B, K, hidden_dim)
-        v_flat = v_bank.squeeze(0) if v_bank.dim() == 3 else v_bank  # (n_slots, dim)
-        return v_flat[slot_indices]  # (B, K, dim)
+        return self.concept_memory.get_slot_values(slot_indices)
 
 
 def build_hybrid_from_checkpoint_args(args_dict: dict) -> HybridPolicy:

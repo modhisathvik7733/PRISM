@@ -4,21 +4,15 @@ Replaces PRISM's hardcoded predicate_readout with a growable, queryable,
 inspectable concept store built on modern Hopfield networks (Ramsauer 2021,
 arxiv:2008.02217).
 
-Architectural rationale:
-- Hardcoded predicates (96 fixed slots) → cannot grow, cannot adapt to new domains
-- HopfieldLayer with N trainable slots → growable, attention-based retrieval,
-  same generalization properties as transformer attention (proven equivalent
-  to Hopfield update rule by Ramsauer 2021)
+Architecture: bare `Hopfield` with explicit nn.Parameter K (keys) and V
+(values) banks. This gives clean attention extraction via
+`hopfield.get_association_matrix((K, Q, V))` and direct slot inspection
+via `self.values[slot_idx]`.
 
-Each slot is a trainable concept prototype. Inputs (JEPA latents) are queried
-against all slots via attention; output is a weighted combination of slot
-values. Operates in three regimes depending on scaling (β):
+Operates in three retrieval regimes depending on scaling (β):
   - β low: global averaging (good for OOD)
   - β medium: metastable composition (where learning happens)
   - β high: single-pattern retrieval (precise recall)
-
-Slot metadata (names, properties) is tracked Python-side for inspection and
-can be populated by ConceptManager via LLM bootstrap.
 """
 
 from __future__ import annotations
@@ -34,28 +28,26 @@ import torch.nn as nn
 _VENDOR = os.path.join(os.path.dirname(__file__), "..", "_vendor")
 if _VENDOR not in sys.path:
     sys.path.insert(0, _VENDOR)
-from hflayers import HopfieldLayer  # noqa: E402
+from hflayers import Hopfield  # noqa: E402
 
 
 class ConceptMemory(nn.Module):
-    """Hopfield-based concept memory replacing fixed predicate readout.
+    """Hopfield-based concept memory with explicit trainable K/V banks.
 
     Parameters
     ----------
     latent_dim : int
         Dimension of the input query (JEPA latent dim).
     n_slots : int
-        Number of trainable concept slots (the "database rows"). Default 1024.
+        Number of trainable concept slots.
     slot_dim : int
-        Dimension of each retrieved concept embedding. Default 64.
+        Dimension of each retrieved concept embedding (output dim).
     n_heads : int
-        Number of attention heads. Default 4.
+        Number of attention heads. Must divide max(latent_dim, slot_dim).
     scaling : float
-        Hopfield β (softmax inverse temperature). Higher = sharper retrieval.
-        Default 1.0 = metastable regime where learning happens.
+        Hopfield β (softmax inverse temperature). 1.0 = metastable regime.
     update_steps : int
         Iterative Hopfield update steps. 0 = single-shot (attention-like).
-        For concept memory, 0 is usually best. Default 0.
     """
 
     def __init__(
@@ -68,10 +60,6 @@ class ConceptMemory(nn.Module):
         update_steps: int = 0,
     ):
         super().__init__()
-        # head_dim must divide slot_dim evenly across heads
-        assert slot_dim % n_heads == 0, (
-            f"slot_dim={slot_dim} must be divisible by n_heads={n_heads}"
-        )
         self.latent_dim = latent_dim
         self.n_slots = n_slots
         self.slot_dim = slot_dim
@@ -79,36 +67,54 @@ class ConceptMemory(nn.Module):
         self.scaling = scaling
         self.update_steps = update_steps
 
-        # HopfieldLayer = trainable K and V banks (the "database").
-        # input is the query, the layer stores patterns internally.
-        # lookup_weights_as_separated=True → K and V are independent trainable matrices
-        # lookup_targets_as_trainable=True → V (concept embeddings) is learned
-        self.hopfield = HopfieldLayer(
+        # Head dim must divide both the K and V projections cleanly.
+        # We pick head_dim from the smaller of latent_dim and slot_dim
+        # to avoid asymmetry; n_heads must divide it.
+        head_dim = max(8, min(latent_dim, slot_dim) // n_heads)
+        # Round head_dim down so n_heads * head_dim is reasonable.
+
+        # Bare Hopfield: takes (K, Q, V) tuple, returns retrieved values.
+        # We manage K and V as nn.Parameter banks below.
+        self.hopfield = Hopfield(
             input_size=latent_dim,
+            stored_pattern_size=latent_dim,
+            pattern_projection_size=slot_dim,
             output_size=slot_dim,
-            hidden_size=slot_dim // n_heads,
-            quantity=n_slots,
+            hidden_size=head_dim,
             num_heads=n_heads,
             scaling=scaling,
             update_steps_max=update_steps,
-            lookup_weights_as_separated=True,
-            lookup_targets_as_trainable=True,
             normalize_stored_pattern=True,
             normalize_state_pattern=True,
             normalize_pattern_projection=True,
             dropout=0.0,
         )
 
-        # Slot metadata for human inspection (NOT part of state_dict).
-        # Populated by ConceptManager when novel slots are flagged.
-        # Format: {slot_idx: {"name": str, "properties": dict, "count": int}}
+        # K bank: keys that queries match against (in latent_dim space).
+        self.keys = nn.Parameter(torch.randn(1, n_slots, latent_dim) * 0.02)
+        # V bank: values retrieved by attention (in slot_dim space).
+        self.values = nn.Parameter(torch.randn(1, n_slots, slot_dim) * 0.02)
+
+        # Slot metadata for human inspection (NOT in state_dict).
         self.slot_metadata: dict[int, dict[str, Any]] = {}
+
+    def _build_triple(self, z: torch.Tensor) -> tuple:
+        """Build (K, Q, V) tuple expected by Hopfield.forward.
+
+        z is the query Q with shape (B, N, latent_dim). K and V are
+        expanded from the trainable banks to match the batch.
+        """
+        B = z.size(0)
+        K = self.keys.expand(B, -1, -1)    # (B, n_slots, latent_dim)
+        V = self.values.expand(B, -1, -1)  # (B, n_slots, slot_dim)
+        Q = z                               # (B, N, latent_dim)
+        return (K, Q, V)
 
     def forward(
         self,
         z: torch.Tensor,
         return_attention: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ):
         """Query the memory with latent z.
 
         Parameters
@@ -120,27 +126,25 @@ class ConceptMemory(nn.Module):
 
         Returns
         -------
-        concept : Tensor
-            Shape (B, slot_dim) or (B, T, slot_dim) — retrieved concept embedding.
-        attention : Tensor (optional)
-            Shape (B, n_slots) or (B, T, n_slots) — softmax weights over slots.
+        concept : (B, slot_dim) or (B, T, slot_dim)
+        attention : (B, n_slots) or (B, T, n_slots), if return_attention
         """
-        # Normalize input shape to (B, N, latent_dim) for HopfieldLayer.
         squeezed = False
         if z.dim() == 2:
             z = z.unsqueeze(1)  # (B, 1, latent_dim)
             squeezed = True
 
-        out = self.hopfield(z)  # (B, N, slot_dim)
+        triple = self._build_triple(z)
+        out = self.hopfield(triple)  # (B, N, slot_dim)
 
         if return_attention:
-            # Get association matrix: (B, n_heads, N, n_slots)
-            attn = self.hopfield.hopfield.get_association_matrix(z)
-            # Average over heads → (B, N, n_slots)
+            # Hopfield.get_association_matrix returns (B, num_heads, N_q, N_kv).
+            attn = self.hopfield.get_association_matrix(triple)
+            # Average over heads → (B, N_q, n_slots).
             attn = attn.mean(dim=1)
             if squeezed:
                 out = out.squeeze(1)
-                attn = attn.squeeze(1)
+                attn = attn.squeeze(1)  # (B, n_slots)
             return out, attn
 
         if squeezed:
@@ -153,18 +157,18 @@ class ConceptMemory(nn.Module):
         z: torch.Tensor,
         k: int = 5,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return indices and weights of top-k activated slots.
-
-        Returns
-        -------
-        indices : LongTensor (B, k)
-        weights : Tensor (B, k)
-        """
+        """Return indices and weights of top-k activated slots."""
         _, attn = self.forward(z, return_attention=True)
-        if attn.dim() == 3:  # (B, T, n_slots) — take last timestep
+        if attn.dim() == 3:
             attn = attn[:, -1, :]
         weights, indices = attn.topk(k, dim=-1)
         return indices, weights
+
+    @torch.no_grad()
+    def get_slot_values(self, slot_indices: torch.Tensor) -> torch.Tensor:
+        """Look up V-bank entries by slot index. (B, K) → (B, K, slot_dim)."""
+        v_flat = self.values.squeeze(0)  # (n_slots, slot_dim)
+        return v_flat[slot_indices]
 
     @torch.no_grad()
     def get_active_slots(
@@ -172,22 +176,20 @@ class ConceptMemory(nn.Module):
         z: torch.Tensor,
         threshold: float = 0.05,
     ) -> list[dict[str, Any]]:
-        """Return all slots that activate above threshold for this input.
-
-        Useful for ConceptManager to detect novel patterns.
-        """
+        """Return slots that activate above threshold for this input."""
         _, attn = self.forward(z, return_attention=True)
         if attn.dim() == 3:
             attn = attn[:, -1, :]
+        if attn.dim() == 1:
+            attn = attn.unsqueeze(0)
         active: list[dict[str, Any]] = []
-        for b in range(z.size(0) if z.dim() > 1 else 1):
-            row = attn[b] if attn.dim() == 2 else attn
-            for i in torch.where(row > threshold)[0].cpu().tolist():
+        for b in range(attn.size(0)):
+            for i in torch.where(attn[b] > threshold)[0].cpu().tolist():
                 meta = self.slot_metadata.get(i, {"name": f"unnamed_{i}"})
                 active.append({
                     "batch_idx": b,
                     "slot_idx": i,
-                    "weight": float(row[i]),
+                    "weight": float(attn[b, i]),
                     "metadata": meta,
                 })
         return active
@@ -198,7 +200,6 @@ class ConceptMemory(nn.Module):
         name: str,
         properties: dict | None = None,
     ) -> None:
-        """Tag a slot with a human-readable name (called by ConceptManager)."""
         if slot_idx not in self.slot_metadata:
             self.slot_metadata[slot_idx] = {
                 "name": name,
@@ -211,7 +212,6 @@ class ConceptMemory(nn.Module):
                 self.slot_metadata[slot_idx]["properties"].update(properties)
 
     def increment_slot_count(self, slot_idx: int) -> None:
-        """Track how often each slot has been activated (for pruning)."""
         if slot_idx not in self.slot_metadata:
             self.slot_metadata[slot_idx] = {
                 "name": f"unnamed_{slot_idx}",
@@ -223,7 +223,6 @@ class ConceptMemory(nn.Module):
         )
 
     def get_named_slot_count(self) -> int:
-        """Number of slots that have been named (excluding unnamed_X defaults)."""
         return sum(
             1 for meta in self.slot_metadata.values()
             if not meta["name"].startswith("unnamed_")
