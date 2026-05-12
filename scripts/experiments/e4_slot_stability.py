@@ -239,6 +239,12 @@ def main():
                         "between them changes routing).")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--diagnose", action="store_true",
+                   help="Print extra diagnostics: per-frozen-slot mean/max "
+                        "attention at each snapshot, cond-MLP weight delta, "
+                        "base-query delta, top-10 dominant slots at each "
+                        "snapshot. Answers: did the frozen slots die or "
+                        "just rotate? did the cond MLP actually change?")
     args = p.parse_args()
 
     device = torch.device(args.device)
@@ -317,6 +323,20 @@ def main():
     bank_a_values = {
         "concept": policy.inner.retrieval.concept_bank.values.detach().clone().cpu(),
         "operator": policy.inner.retrieval.operator_bank.values.detach().clone().cpu(),
+    }
+    # Capture cond-MLP weights + base queries at snapshot A so we can
+    # measure their drift after loading snapshot B (--diagnose).
+    cond_a = {
+        "concept": {
+            "weight": policy.inner.retrieval.concept_cond.weight.detach().clone().cpu(),
+            "bias": policy.inner.retrieval.concept_cond.bias.detach().clone().cpu(),
+            "base": policy.inner.retrieval.concept_base.detach().clone().cpu(),
+        },
+        "operator": {
+            "weight": policy.inner.retrieval.operator_cond.weight.detach().clone().cpu(),
+            "bias": policy.inner.retrieval.operator_cond.bias.detach().clone().cpu(),
+            "base": policy.inner.retrieval.operator_base.detach().clone().cpu(),
+        },
     }
     attn_a = _collect_per_frame_attention(policy, probe_set, device, args.batch_size)
     print(f"[E4]   attention collected: concept {tuple(attn_a['concept'].shape)} "
@@ -407,7 +427,82 @@ def main():
             "frozen_rows_info": frz_info,
         }
 
+    # --- Diagnose mode: probe the MECHANISM of any drift ---
+    if args.diagnose:
+        print()
+        print("=" * 70)
+        print("E4 diagnostics — probing the mechanism of slot drift")
+        print("=" * 70)
+        for bank_name in ("concept", "operator"):
+            print(f"\n[{bank_name}] bank")
+            frozen = bank_a_frozen[bank_name]
+            n_frozen = int(frozen.sum().item())
+
+            # 1. Cond MLP weight delta.
+            cond_a_w = cond_a[bank_name]["weight"]
+            cond_a_b = cond_a[bank_name]["bias"]
+            cond_a_base = cond_a[bank_name]["base"]
+            cond_b_module = (policy.inner.retrieval.concept_cond
+                             if bank_name == "concept"
+                             else policy.inner.retrieval.operator_cond)
+            cond_b_base_t = (policy.inner.retrieval.concept_base
+                             if bank_name == "concept"
+                             else policy.inner.retrieval.operator_base)
+            cond_b_w = cond_b_module.weight.detach().cpu()
+            cond_b_b = cond_b_module.bias.detach().cpu()
+            cond_b_base = cond_b_base_t.detach().cpu()
+
+            w_norm_a = float(cond_a_w.norm().item())
+            w_delta = float((cond_b_w - cond_a_w).norm().item())
+            b_delta = float((cond_b_b - cond_a_b).norm().item())
+            base_norm_a = float(cond_a_base.norm().item())
+            base_delta = float((cond_b_base - cond_a_base).norm().item())
+
+            print(f"  cond_MLP.weight:  ‖A‖={w_norm_a:.3f}  "
+                  f"‖B−A‖={w_delta:.3f}  rel={w_delta / max(w_norm_a, 1e-9):.3f}")
+            print(f"  cond_MLP.bias:    ‖B−A‖={b_delta:.4f}")
+            print(f"  base query:       ‖A‖={base_norm_a:.3f}  "
+                  f"‖B−A‖={base_delta:.4f}  rel={base_delta / max(base_norm_a, 1e-9):.4f}")
+
+            # 2. Per-frozen-slot attention: did they die or rotate?
+            if n_frozen > 0:
+                a_attn = attn_a[bank_name]
+                b_attn = attn_b[bank_name]
+                frz_idx = torch.nonzero(frozen, as_tuple=False).flatten().tolist()
+                print(f"  per-frozen-slot attention (mean across {a_attn.size(0)} probe frames):")
+                print(f"    {'slot':>5} {'mean_A':>8} {'mean_B':>8} {'B/A':>7} "
+                      f"{'max_A':>8} {'max_B':>8}")
+                # Show all 12 concept frozen / 2 operator frozen.
+                for s in frz_idx:
+                    ma = float(a_attn[:, s].mean().item())
+                    mb = float(b_attn[:, s].mean().item())
+                    xa = float(a_attn[:, s].max().item())
+                    xb = float(b_attn[:, s].max().item())
+                    ratio = mb / max(ma, 1e-12)
+                    print(f"    {s:>5d} {ma:>8.4f} {mb:>8.4f} {ratio:>7.2f}× "
+                          f"{xa:>8.4f} {xb:>8.4f}")
+                # Aggregate: total attention mass to frozen slots.
+                total_a = float(a_attn[:, frz_idx].sum().item())
+                total_b = float(b_attn[:, frz_idx].sum().item())
+                grand_a = float(a_attn.sum().item())
+                grand_b = float(b_attn.sum().item())
+                print(f"  frozen-slot attention share: "
+                      f"A={total_a/max(grand_a,1e-9):.2%}  "
+                      f"B={total_b/max(grand_b,1e-9):.2%}")
+
+            # 3. Top-10 dominant slots at each snapshot.
+            avg_a_slots = attn_a[bank_name].mean(dim=0)
+            avg_b_slots = attn_b[bank_name].mean(dim=0)
+            top_a_ind = avg_a_slots.topk(10).indices.tolist()
+            top_b_ind = avg_b_slots.topk(10).indices.tolist()
+            overlap = len(set(top_a_ind) & set(top_b_ind))
+            print(f"  top-10 dominant slots A: {top_a_ind}")
+            print(f"  top-10 dominant slots B: {top_b_ind}")
+            print(f"  overlap A∩B: {overlap}/10  "
+                  f"({'frozen-in-A: '+str([s for s in top_a_ind if s in frz_idx]) if n_frozen>0 else ''})")
+
     # --- Pass/fail decision ---
+    print()
     print("=" * 70)
     print("E4 — slot stability between snapshots")
     print("=" * 70)
