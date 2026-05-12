@@ -272,24 +272,45 @@ class MemoryBank(nn.Module):
         retrieved : (B, D_tok)
         """
         B = query.size(0)
-        # Zero-mask inactive slot V rows so they contribute nothing to the
-        # weighted-sum output even though their K rows still take some
-        # softmax mass. Cold-slot leakage (audit pass-2 issue 3b /
-        # acknowledged in resolution 5): inactive slots steal a small
-        # share of the softmax denominator. PR-5 step 2b layers proper
-        # masked-softmax on top via Hopfield's association_mask.
+        # Resolution 5 / audit pass-2 issue 3b — cold-slot leakage:
+        # without an explicit mask, Hopfield's softmax over K gives
+        # inactive slots ~uniform attention (50% with half the slots
+        # inactive — measured). We exclude inactive K rows from the
+        # softmax denominator via Hopfield's `association_mask`:
+        # additive -inf at inactive positions makes their softmax
+        # weight exactly zero. The V-mask is also kept as defense in
+        # depth (if association_mask somehow leaks).
         active = self.active_mask.to(self.values.dtype).view(1, -1, 1)
         K = (self.keys * active).expand(B, -1, -1)
         V = (self.values * active).expand(B, -1, -1)
         Q = query.unsqueeze(1)                  # (B, 1, D_tok)
         triple = (K, Q, V)
-        out = self.hopfield(triple)             # (B, 1, D_tok)
+
+        # Build association_mask only when there are inactive slots;
+        # avoid mask-building overhead on the fully-active hot path.
+        attn_mask = None
+        if not bool(self.active_mask.all().item()):
+            inactive = (~self.active_mask).view(1, -1)            # (1, n_slots)
+            attn_mask = torch.zeros(1, self.n_slots, device=query.device)
+            attn_mask = attn_mask.masked_fill(inactive, float("-inf"))
+            # hflayers Hopfield accepts an (N_q, N_kv)-shaped float
+            # association_mask; broadcasts over batch + heads.
+
+        if attn_mask is not None:
+            out = self.hopfield(triple, association_mask=attn_mask)
+        else:
+            out = self.hopfield(triple)
+        # out: (B, 1, D_tok)
 
         if track_activations:
             # Hopfield.get_association_matrix returns (B, n_heads, N_q, N_kv).
             # Sum over batch / heads / query length → (n_slots,).
-            attn = self.hopfield.get_association_matrix(triple)
-            # Detach: activation_mass is a statistic, not a gradient path.
+            if attn_mask is not None:
+                attn = self.hopfield.get_association_matrix(
+                    triple, association_mask=attn_mask
+                )
+            else:
+                attn = self.hopfield.get_association_matrix(triple)
             slot_mass = attn.detach().sum(dim=(0, 1, 2))    # (n_slots,)
             self.activation_mass = self.activation_mass + slot_mass
             self.activation_steps = self.activation_steps + B
@@ -418,15 +439,18 @@ if __name__ == "__main__":
     for _ in range(3):
         grow_bank.retrieve(q_grow, track_activations=True)
     am = grow_bank.activation_mass
-    if am[8:].abs().sum().item() != 0.0:
-        # Note: with cold-slot leakage, inactive slots get a small but
-        # nonzero share. The masked-softmax warmup (PR-5 step 2b) fixes
-        # this; for now we document and accept.
-        leak = am[8:].abs().sum().item()
-        total = am.abs().sum().item()
-        print(f"[membank] cold-slot leakage observed: inactive slots got "
-              f"{leak/total:.1%} of total attention "
-              f"(acknowledged; PR-5 step 2b will mask via Hopfield association_mask)")
+    leak = am[8:].abs().sum().item()
+    total = am.abs().sum().item()
+    leak_frac = leak / max(total, 1e-12)
+    print(f"[membank] cold-slot leakage = {leak_frac:.2%} of total attention "
+          f"(via Hopfield association_mask, should be ~0)")
+    if leak_frac > 0.01:  # 1% tolerance — anything above is a real bug.
+        print(f"FAIL: cold-slot leakage {leak_frac:.2%} > 1% threshold. "
+              f"The association_mask path is not actually excluding inactive "
+              f"slots from softmax. Likely cause: hflayers Hopfield fork uses "
+              f"a different kwarg name (try stored_pattern_padding_mask) or "
+              f"a different mask shape.")
+        _sys.exit(1)
     print(f"[membank] activation tracking: mass on active slots = "
           f"{am[:8].sum().item():.3f}, steps = {grow_bank.activation_steps.item()}")
 
