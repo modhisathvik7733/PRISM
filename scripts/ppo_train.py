@@ -691,7 +691,7 @@ def main() -> int:
     opt = torch.optim.AdamW(policy.parameters(), lr=args.lr, weight_decay=1e-4)
     # AMP scaler — no-op when disabled. GradScaler manages fp16 gradient
     # underflow: scale loss before backward, unscale before clip + step.
-    amp_scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+    amp_scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
     if args.amp:
         print(f"[ppo] AMP enabled: forward+backward in mixed precision; "
               f"replay-equality tolerance relaxed to 5e-3 (fp16 reduction noise).")
@@ -874,7 +874,7 @@ def main() -> int:
                 mask = make_action_mask(allowed_per_env, n_actions, device)
 
                 # encode + step policy (in autocast if --amp)
-                with torch.cuda.amp.autocast(enabled=args.amp):
+                with torch.amp.autocast("cuda", enabled=args.amp):
                     z = jepa.encode(obs_batch)
                 z_flat = z.float().flatten(start_dim=1)  # (B, latent_dim) — store fp32
                 if state_kind == "tuple":
@@ -891,7 +891,7 @@ def main() -> int:
                     buf_mem[t] = mem_batch
                 else:
                     mem_batch = None
-                with torch.cuda.amp.autocast(enabled=args.amp):
+                with torch.amp.autocast("cuda", enabled=args.amp):
                     logits, value, h_next = policy.step_with_value(
                         z, prev_actions, missions, h, mem_feat=mem_batch
                     )
@@ -1018,7 +1018,7 @@ def main() -> int:
                 values_seq = []
                 for t in range(T):
                     mem_t = mb_mem[t] if mb_mem is not None else None
-                    with torch.cuda.amp.autocast(enabled=args.amp):
+                    with torch.amp.autocast("cuda", enabled=args.amp):
                         logits_t, value_t, h_run = policy.step_with_value(
                             mb_z[t], mb_prev[t], mb_missions[t], h_run, mem_feat=mem_t
                         )
