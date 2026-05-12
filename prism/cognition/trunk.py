@@ -171,24 +171,33 @@ class UniversalTrunk(nn.Module):
         new_token: torch.Tensor,
         buf_tokens: torch.Tensor,
         buf_valid_len: torch.Tensor,
+        prefix_tokens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """One trunk step.
 
         1. Shift buffer left by 1 (drops oldest if at capacity).
         2. Insert `new_token` at position L-1.
         3. Increment valid_len (clamped at L).
-        4. Run the transformer over the full (B, L, D_tok) buffer with a
-           combined causal + valid-mask, return hidden at position L-1.
+        4. Optionally prepend `prefix_tokens` (e.g., RetrievalBlock mem
+           tokens). Prefix is NOT stored in the rolling buffer — it
+           is per-step transient context. The trunk attends from buf
+           positions to all prefix positions plus causally within buf.
+        5. Run the transformer; return hidden at the last position (the
+           newest buf token).
 
         Parameters
         ----------
         new_token : (B, D_tok)
         buf_tokens : (B, L, D_tok)
         buf_valid_len : (B,) long
+        prefix_tokens : (B, n_prefix, D_tok) | None
+            Per-step context tokens prepended to the sequence. Used by
+            RetrievalBlock to inject Hopfield-memory retrievals.
 
         Returns
         -------
-        hidden_last : (B, D_tok) — output at position L-1 (the newest token).
+        hidden_last : (B, D_tok) — output at the newest buf position
+            (index `n_prefix + L - 1` in the concatenated sequence).
         new_buf_tokens : (B, L, D_tok)
         new_buf_valid_len : (B,) long, clamped at L.
         """
@@ -249,16 +258,45 @@ class UniversalTrunk(nn.Module):
         pos_ids = torch.arange(L, device=device)
         masked_buf = masked_buf + self.pos_embed(pos_ids).unsqueeze(0)
 
-        # Build the shared (L, L) causal additive mask.
-        attn_mask = torch.zeros(L, L, device=device)
-        attn_mask = attn_mask.masked_fill(~causal_mask, float("-inf"))
+        # Build the sequence: optional [prefix, buf] concat. Prefix is
+        # per-step transient (e.g., RetrievalBlock mem tokens) and does
+        # NOT enter the rolling buffer. It gets no positional embedding
+        # — prefix identity is positional via its role, not its slot.
+        if prefix_tokens is not None:
+            assert prefix_tokens.dim() == 3 and prefix_tokens.size(0) == B and \
+                prefix_tokens.size(2) == self.D_tok, (
+                f"prefix_tokens shape mismatch: expected (B={B}, *, D={self.D_tok}), "
+                f"got {tuple(prefix_tokens.shape)}"
+            )
+            n_prefix = prefix_tokens.size(1)
+            sequence = torch.cat([prefix_tokens, masked_buf], dim=1)
+        else:
+            n_prefix = 0
+            sequence = masked_buf
+        S = n_prefix + L
+
+        # Build the (S, S) additive attention mask:
+        #   prefix-prefix : full attention (mem tokens mix freely).
+        #   prefix-buf    : blocked (mem cannot peek into rolling state).
+        #   buf-prefix    : full (every buf position attends to all mem).
+        #   buf-buf       : causal lower triangular.
+        attn_mask = torch.full((S, S), float("-inf"), device=device)
+        if n_prefix > 0:
+            attn_mask[:n_prefix, :n_prefix] = 0.0          # prefix-prefix full
+            attn_mask[n_prefix:, :n_prefix] = 0.0          # buf attends to prefix
+        # Causal within buf.
+        causal_buf_block = torch.zeros(L, L, device=device)
+        causal_buf_block = causal_buf_block.masked_fill(~causal_mask, float("-inf"))
+        attn_mask[n_prefix:, n_prefix:] = causal_buf_block
 
         # Run the layers.
-        h = masked_buf
+        h = sequence
         for layer in self.layers:
             h = layer(h, src_mask=attn_mask)
 
-        hidden_last = h[:, L - 1, :]
+        # Hidden at the newest buf position = last index in the
+        # concatenated sequence.
+        hidden_last = h[:, -1, :]
         return hidden_last, new_buf_tokens, new_buf_valid_len
 
 

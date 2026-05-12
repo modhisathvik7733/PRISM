@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 
+from prism.cognition.retrieval_block import RetrievalBlock
 from prism.cognition.trunk import UniversalTrunk
 
 if TYPE_CHECKING:
@@ -63,6 +64,12 @@ class _TransformerInner(nn.Module):
         ffn_dim: int = 512,
         mem_feat_dim: int = 0,
         dropout: float = 0.0,
+        concept_n_slots: int = 1024,
+        operator_n_slots: int = 64,
+        concept_scaling: float = 1.0,
+        operator_scaling: float = 4.0,
+        operator_update_steps: int = 3,
+        use_retrieval: bool = True,
     ):
         super().__init__()
         self.latent_in_dim = latent_in_dim
@@ -71,6 +78,7 @@ class _TransformerInner(nn.Module):
         self.D_tok = D_tok
         self.L = L
         self.mem_feat_dim = mem_feat_dim
+        self.use_retrieval = use_retrieval
         # Backwards-compatibility attribute consumed by ppo_train.py;
         # used only for logging in this path (the rollout buffer's hidden
         # storage uses the tuple state directly).
@@ -91,6 +99,22 @@ class _TransformerInner(nn.Module):
             D_tok=D_tok, L=L, n_layers=n_layers,
             n_heads=n_heads, ffn_dim=ffn_dim, dropout=dropout,
         )
+
+        # RetrievalBlock — 2 query tokens into ConceptMemory + OperatorMemory.
+        # The substrate is no longer a vanilla transformer once this is in;
+        # Hopfield-memory retrieval is the substrate's load-bearing feature.
+        if use_retrieval:
+            self.retrieval: nn.Module = RetrievalBlock(
+                D_tok=D_tok,
+                concept_n_slots=concept_n_slots,
+                operator_n_slots=operator_n_slots,
+                n_heads=n_heads,
+                concept_scaling=concept_scaling,
+                operator_scaling=operator_scaling,
+                operator_update_steps=operator_update_steps,
+            )
+        else:
+            self.retrieval = nn.Identity()
 
         self.action_head = nn.Linear(D_tok, n_actions)
         self.value_head = nn.Linear(D_tok, 1)
@@ -131,8 +155,16 @@ class _TransformerInner(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         buf_tokens, buf_valid_len = h_prev
         new_token = self._build_input_token(z, prev_action, mission, mem_feat)
+        # RetrievalBlock: 2 query tokens into ConceptMemory + OperatorMemory,
+        # conditioned on the current obs token. Prepended to the trunk's
+        # input sequence as transient per-step context (not stored in the
+        # rolling buffer — see UniversalTrunk.step docstring).
+        if self.use_retrieval:
+            prefix = self.retrieval(new_token)        # (B, 2, D_tok)
+        else:
+            prefix = None
         hidden_last, new_tokens, new_valid_len = self.trunk.step(
-            new_token, buf_tokens, buf_valid_len,
+            new_token, buf_tokens, buf_valid_len, prefix_tokens=prefix,
         )
         logits = self.action_head(hidden_last)
         value = self.value_head(hidden_last).squeeze(-1)
@@ -354,6 +386,12 @@ class UniversalPolicy(nn.Module):
                 ffn_dim=trunk_ffn_dim,
                 mem_feat_dim=mem_feat_dim,
                 dropout=0.0,
+                concept_n_slots=concept_n_slots,
+                operator_n_slots=operator_n_slots,
+                concept_scaling=concept_scaling,
+                operator_scaling=operator_scaling,
+                operator_update_steps=3,
+                use_retrieval=True,
             )
             return cls(adapter=adapter, hybrid_policy=inner)
 
@@ -434,9 +472,17 @@ if __name__ == "__main__":
     policy = UniversalPolicy.from_adapter(
         adapter, trunk="transformer",
         D_tok=64, L=8, n_trunk_layers=2, n_trunk_heads=4, trunk_ffn_dim=128,
+        concept_n_slots=128, operator_n_slots=16,
     )
-    print(f"[policy] built UniversalPolicy(trunk=transformer); "
+    print(f"[policy] built UniversalPolicy(trunk=transformer, retrieval=on); "
           f"state_kind={policy.state_kind} params={sum(p.numel() for p in policy.parameters()):,}")
+    # Verify retrieval is active.
+    inner = policy.inner
+    assert hasattr(inner, "retrieval") and not isinstance(inner.retrieval, torch.nn.Identity), \
+        "FAIL: RetrievalBlock not constructed when trunk=transformer"
+    print(f"[policy] retrieval block present: "
+          f"concept_slots={inner.retrieval.concept_bank.n_slots} "
+          f"operator_slots={inner.retrieval.operator_bank.n_slots}")
     if policy.state_kind != "tuple":
         print(f"FAIL: state_kind expected 'tuple', got {policy.state_kind!r}")
         sys.exit(1)
