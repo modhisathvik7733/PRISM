@@ -198,6 +198,10 @@ class UniversalPolicy(nn.Module):
         # branches on this to allocate the rollout buffer correctly and to
         # call the right reset path.
         self.state_kind: str = "tuple" if isinstance(hybrid_policy, _TransformerInner) else "tensor"
+        # Buffer length (rolling window) for the transformer trunk. Reported
+        # as 1 for the GRU path since there's no rolling window — the
+        # trainer's rollout buffer only uses this when state_kind == 'tuple'.
+        self.L: int = int(getattr(hybrid_policy, "L", 1))
 
     # ------------------------------------------------------------------
     # PR-2 hidden-state contract (single tensor; matches v5)

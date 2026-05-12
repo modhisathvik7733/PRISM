@@ -485,14 +485,10 @@ def main() -> int:
             # frozen JEPA without re-reading the checkpoint.
             from prism.adapters.babyai_adapter import BabyAIAdapter
             from prism.cognition.policy import UniversalPolicy
-            if args.trunk != "gru":
-                raise NotImplementedError(
-                    f"--trunk={args.trunk!r} is implemented in PR-4 "
-                    f"(Phase B). PR-2 supports --trunk gru only."
-                )
             adapter = BabyAIAdapter(jepa=jepa, cfg=cfg, device=device)
             return UniversalPolicy.from_adapter(
                 adapter,
+                trunk=args.trunk,
                 hidden_dim=kwargs["hidden_dim"],
                 latent_proj_dim=kwargs["latent_proj_dim"],
                 action_emb_dim=kwargs.get("action_emb_dim", 16),
@@ -621,8 +617,17 @@ def main() -> int:
     print(f"[ppo] target {args.total_steps} env steps "
           f"= {n_iterations} iterations @ {args.rollout_steps}*{args.n_envs}")
 
-    h = policy.init_hidden(args.n_envs, device)  # (B, hidden_dim)
+    h = policy.init_hidden(args.n_envs, device)  # (B, hidden_dim) or (tokens, valid_len)
     prev_actions = torch.full((args.n_envs,), -1, device=device, dtype=torch.long)
+
+    # State kind: 'tensor' for v5 / universal+gru paths (single hidden tensor),
+    # 'tuple' for universal+transformer paths ((buf_tokens, buf_valid_len)).
+    # The trainer branches on this to size and record the rollout buffer.
+    state_kind = getattr(policy, "state_kind", "tensor")
+    # Pull L/D_tok off the policy when it's a tuple-state path. Defaults are
+    # ignored on the tensor path.
+    trunk_L = int(getattr(policy, "L", 1))
+    trunk_D = int(getattr(policy, "hidden_dim", 0))
 
     ep_reward_window = deque(maxlen=200)
     ep_steps_window = deque(maxlen=200)
@@ -639,7 +644,17 @@ def main() -> int:
         buf_rewards = torch.zeros(T, B, device=device)
         buf_values = torch.zeros(T, B, device=device)
         buf_dones = torch.zeros(T, B, device=device)
-        buf_h_init = torch.zeros(T, B, policy.hidden_dim, device=device)
+        # Per-state-kind hidden buffer. tensor path: single (T, B, hidden_dim).
+        # tuple path: two tensors stored independently (audit pass-2 issue 4a:
+        # both must be restored at replay time or log_probs desync).
+        if state_kind == "tuple":
+            buf_h_init = None
+            buf_h_tokens = torch.zeros(T, B, trunk_L, trunk_D, device=device)
+            buf_h_valid = torch.zeros(T, B, dtype=torch.long, device=device)
+        else:
+            buf_h_init = torch.zeros(T, B, policy.hidden_dim, device=device)
+            buf_h_tokens = None
+            buf_h_valid = None
         buf_prev_actions = torch.zeros(T, B, dtype=torch.long, device=device)
         buf_missions = torch.zeros(T, B, mission_dim, device=device)
         buf_action_mask = torch.zeros(T, B, n_actions, device=device)
@@ -661,7 +676,11 @@ def main() -> int:
                 # encode + step policy
                 z = jepa.encode(obs_batch)
                 z_flat = z.flatten(start_dim=1)  # (B, latent_dim)
-                buf_h_init[t] = h
+                if state_kind == "tuple":
+                    buf_h_tokens[t] = h[0]
+                    buf_h_valid[t] = h[1]
+                else:
+                    buf_h_init[t] = h
                 buf_prev_actions[t] = prev_actions
                 buf_missions[t] = missions
                 buf_action_mask[t] = mask
@@ -699,9 +718,16 @@ def main() -> int:
                         ep_steps_window.append(info["ep_steps"])
                 buf_rewards[t] = torch.tensor(rewards, device=device)
                 buf_dones[t] = torch.tensor(dones, device=device)
-                # Reset h on done (per-env), set prev_action to action (or -1 if done)
+                # Reset h on done (per-env), set prev_action to action (or -1 if done).
+                # For universal policies we go through `policy.reset_buffer(done, h)`,
+                # the only API that resets both tensors of the tuple state atomically
+                # (audit pass-2 issue 7g). For hybrid/recurrent paths we keep the v5
+                # single-tensor torch.where to preserve bit-exactness.
                 done_t = buf_dones[t].bool()
-                h = torch.where(done_t.unsqueeze(1), policy.init_hidden(B, device), h_next)
+                if args.policy_type == "universal":
+                    h = policy.reset_buffer(done_t, h_next)
+                else:
+                    h = torch.where(done_t.unsqueeze(1), policy.init_hidden(B, device), h_next)
                 prev_actions = torch.where(done_t, torch.full_like(action, -1), action)
 
             # bootstrap value for the last state
@@ -765,9 +791,18 @@ def main() -> int:
                 mb_mem = buf_mem[:, mb_envs_t] if buf_mem is not None else None
 
                 # We need to handle within-rollout episode boundaries: when
-                # done at step t, reset hidden for env at step t+1. Use
-                # buf_h_init[0] as the very-first hidden, then re-derive.
-                h_run = buf_h_init[0, mb_envs_t]
+                # done at step t, reset hidden for env at step t+1. Use the
+                # per-state-kind buffer at t=0 as the very-first hidden, then
+                # re-derive. For tuple state this is BOTH tensors restored
+                # together — audit pass-2 issue 4a: a missing restore here
+                # silently desyncs log_probs in PPO replay.
+                if state_kind == "tuple":
+                    h_run = (
+                        buf_h_tokens[0, mb_envs_t],
+                        buf_h_valid[0, mb_envs_t],
+                    )
+                else:
+                    h_run = buf_h_init[0, mb_envs_t]
                 # latent passed to policy: we kept a flat (B, latent_dim)
                 # version in buf_z; reshape into the encoder's natural
                 # spatial form by reading cfg.
@@ -783,13 +818,20 @@ def main() -> int:
                     )
                     logits_seq.append(logits_t)
                     values_seq.append(value_t)
-                    # reset h on done at step t (for step t+1 onward)
+                    # reset h on done at step t (for step t+1 onward).
+                    # Same dispatch as the rollout reset above: universal
+                    # goes through policy.reset_buffer (single paired-reset
+                    # API); hybrid/recurrent uses the v5 inline torch.where
+                    # to preserve bit-exactness.
                     done_t = mb_dones[t].bool()
-                    h_run = torch.where(
-                        done_t.unsqueeze(1),
-                        policy.init_hidden(mb_z[t].shape[0], device),
-                        h_run,
-                    )
+                    if args.policy_type == "universal":
+                        h_run = policy.reset_buffer(done_t, h_run)
+                    else:
+                        h_run = torch.where(
+                            done_t.unsqueeze(1),
+                            policy.init_hidden(mb_z[t].shape[0], device),
+                            h_run,
+                        )
                 logits_all = torch.stack(logits_seq, dim=0)  # (T, mb, n_actions)
                 values_all = torch.stack(values_seq, dim=0)  # (T, mb)
 
