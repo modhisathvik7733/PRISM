@@ -134,6 +134,14 @@ async def _handle_connection(websocket, *, policy, jepa, device, args):
     # Dedup consecutive done flags from Unity (bug: it sends done=true on the
     # touch tick AND the next tick after reset).
     last_done = False
+    # Discrimination telemetry: did the agent come within reach_threshold of
+    # the red distractor at any point during this episode?
+    distractor_approached = False
+    # Cumulative tallies (printed every 5 episodes).
+    n_episodes_done = 0
+    n_clean_episodes = 0    # finished without ever visiting the distractor
+    sum_efficiency = 0.0
+    sum_steps_in_ep = 0
 
     try:
         async for message in websocket:
@@ -146,7 +154,7 @@ async def _handle_connection(websocket, *, policy, jepa, device, args):
             # ---- handle episode boundary (dedup consecutive done flags) ----
             this_done = bool(state.get("episode_done", False))
             if this_done and not last_done:
-                # Compute and print path-efficiency before resetting.
+                # Compute and print path-efficiency + discrimination before resetting.
                 if episode_start is not None and episode_target is not None:
                     raw_manhattan = abs(episode_target[0] - episode_start[0]) + abs(
                         episode_target[1] - episode_start[1]
@@ -158,21 +166,37 @@ async def _handle_connection(websocket, *, policy, jepa, device, args):
                     actual = episode_path_len
                     eff = (optimal / actual) if actual > 1e-6 else 0.0
                     eps_steps = step_count - episode_start_step
+                    clean = "CLEAN" if not distractor_approached else "DISTRACTED"
                     print(
                         f"[infer] *** TOUCH ep#{episode_idx} step={step_count} "
-                        f"steps_in_ep={eps_steps} "
+                        f"steps_in_ep={eps_steps} {clean} "
                         f"start=({episode_start[0]:+.2f},{episode_start[1]:+.2f}) "
                         f"target=({episode_target[0]:+.2f},{episode_target[1]:+.2f}) "
                         f"raw_manhattan={raw_manhattan:.2f} "
                         f"optimal(zone)={optimal:.2f} actual_path={actual:.2f} "
                         f"efficiency={eff:.3f}"
                     )
+                    n_episodes_done += 1
+                    if not distractor_approached:
+                        n_clean_episodes += 1
+                    sum_efficiency += eff
+                    sum_steps_in_ep += eps_steps
+                    if n_episodes_done % 5 == 0:
+                        disc_rate = n_clean_episodes / n_episodes_done
+                        print(
+                            f"[infer] ===== SUMMARY after {n_episodes_done} eps: "
+                            f"discrimination={disc_rate:.1%} "
+                            f"({n_clean_episodes}/{n_episodes_done} clean) "
+                            f"mean_eff={sum_efficiency/n_episodes_done:.3f} "
+                            f"mean_steps_per_ep={sum_steps_in_ep/n_episodes_done:.0f} ====="
+                        )
                 episode_idx += 1
                 episode_start = None
                 episode_target = None
                 episode_path_len = 0.0
                 episode_start_step = step_count
                 prev_pos = None
+                distractor_approached = False
                 adapter.reset()
                 if state_kind == "tuple":
                     done_t = torch.ones(1, dtype=torch.bool, device=device)
@@ -201,6 +225,14 @@ async def _handle_connection(websocket, *, policy, jepa, device, args):
                         + (agent_pos[1] - prev_pos[1]) ** 2
                     ) ** 0.5
                 prev_pos = agent_pos
+                # Discrimination check: did we get close to the distractor?
+                if distractor_pos is not None:
+                    dd = (
+                        (agent_pos[0] - distractor_pos[0]) ** 2
+                        + (agent_pos[1] - distractor_pos[1]) ** 2
+                    ) ** 0.5
+                    if dd < args.reach_threshold:
+                        distractor_approached = True
 
             # ---- adapter: render fake BabyAI obs ----
             # Target: green ball (type=BALL=6, color=GREEN=1)
