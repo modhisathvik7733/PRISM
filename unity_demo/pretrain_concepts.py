@@ -120,38 +120,25 @@ def generate_dataset(
     n_per_class: int,
     obs_scale: float = 2.0,
     seed: int = 0,
-    n_extra_objects_range: tuple[int, int] = (0, 0),
 ) -> tuple[np.ndarray, np.ndarray]:
     """For each of the 24 (type, color) classes, render n_per_class
-    observations. Each obs has:
-      - 1 PRIMARY object of the labeled (type, color)
-      - 0..2 random EXTRA objects of different (type, color)
-      - All objects at random in-view non-overlapping positions
-      - Random virtual heading
-
-    Multi-object scenes force the model to develop position-aware,
-    object-specific features (vs. the "single object, lazy global
-    classification" failure mode of single-object datasets).
+    single-object observations:
+      - 1 object of the labeled (type, color)
+      - Placed at a random in-view (cone) position with random heading
+      - Empty floor in-cone, unseen out-of-cone (matches BabyAI rendering)
 
     Returns:
       images: (N, 3, 7, 7) float32, JEPA-normalized
-      labels: (N,) int64, class index = type_color_index(primary)
+      labels: (N,) int64, class index = type_color_index(type, color)
     """
     rng = np.random.default_rng(seed)
     images: list[np.ndarray] = []
     labels: list[int] = []
     adapter = Unity2DAdapter(obs_scale=obs_scale)
 
-    # All (type, color) combos for sampling extras.
-    all_classes = [
-        (OBJECT_NAME_TO_TYPE[t], COLOR_NAME_TO_IDX[c])
-        for t in TARGET_TYPE_NAMES
-        for c in TARGET_COLOR_NAMES
-    ]
-
-    # Enumerate in-cone grid cells (excluding agent cell) once. The cone is
-    # heading-independent in the egocentric view: cells (gx, gy) with
-    # forward_dist = AGENT_POS[1] - gy >= 1 and |gx - AGENT_POS[0]| <= forward_dist.
+    # Enumerate in-cone grid cells (excluding agent cell) once. Cone geometry:
+    # cells (gx, gy) with forward_dist = AGENT_POS[1] - gy >= 1
+    # AND |gx - AGENT_POS[0]| <= forward_dist.
     ax_grid, ay_grid = AGENT_POS
     view_size = adapter.view_size
     in_cone_cells: list[tuple[int, int]] = []
@@ -163,28 +150,22 @@ def generate_dataset(
             if abs(gx_ - ax_grid) <= fd:
                 in_cone_cells.append((gx_, gy_))
 
-    def _sample_pos(taken: list[np.ndarray]) -> np.ndarray:
-        """Sample a Unity (x, z) position whose rendered cell lies inside
-        the forward vision cone under the adapter's current heading, and
-        does not collide with previously taken positions."""
+    def _sample_in_cone_unity_pos() -> np.ndarray:
+        """Sample a Unity (x, z) whose rendered cell lies inside the
+        forward vision cone under the adapter's current heading."""
         from prism.adapters.unity_2d import _FORWARD_VEC, _RIGHT_VEC
-        for _ in range(30):
-            gx_, gy_ = in_cone_cells[int(rng.integers(0, len(in_cone_cells)))]
-            fwd_cells = ay_grid - gy_       # >= 1
-            right_cells = gx_ - ax_grid     # in [-fd, +fd]
-            # Small in-cell jitter so the object isn't pinned to the cell
-            # center; keeps width within ±0.4 to avoid spilling into a
-            # neighboring (possibly out-of-cone) cell.
-            j_fwd = float(rng.uniform(-0.4, 0.4))
-            j_right = float(rng.uniform(-0.4, 0.4))
-            fwd_unity = (fwd_cells + j_fwd) * obs_scale
-            right_unity = (right_cells + j_right) * obs_scale
-            fwd_vec = _FORWARD_VEC[adapter.heading]
-            right_vec = _RIGHT_VEC[adapter.heading]
-            p = (fwd_unity * fwd_vec + right_unity * right_vec).astype(np.float32)
-            if all(np.abs(p - t).max() > obs_scale * 0.9 for t in taken):
-                return p
-        return p  # fallback after rejections
+        gx_, gy_ = in_cone_cells[int(rng.integers(0, len(in_cone_cells)))]
+        fwd_cells = ay_grid - gy_       # >= 1
+        right_cells = gx_ - ax_grid     # in [-fd, +fd]
+        # Small in-cell jitter so the object isn't pinned to the cell center;
+        # ±0.4 keeps it inside the cell.
+        j_fwd = float(rng.uniform(-0.4, 0.4))
+        j_right = float(rng.uniform(-0.4, 0.4))
+        fwd_unity = (fwd_cells + j_fwd) * obs_scale
+        right_unity = (right_cells + j_right) * obs_scale
+        fwd_vec = _FORWARD_VEC[adapter.heading]
+        right_vec = _RIGHT_VEC[adapter.heading]
+        return (fwd_unity * fwd_vec + right_unity * right_vec).astype(np.float32)
 
     for type_name in TARGET_TYPE_NAMES:
         type_id = OBJECT_NAME_TO_TYPE[type_name]
@@ -193,36 +174,8 @@ def generate_dataset(
             label = type_color_index(type_id, color_id)
             for _ in range(n_per_class):
                 adapter.heading = int(rng.integers(0, 4))
-                taken: list[np.ndarray] = []
-
-                # Primary object: this is what the label refers to.
-                primary_pos = _sample_pos(taken)
-                taken.append(primary_pos)
-                scene: list[tuple[int, int, tuple[float, float]]] = [
-                    (type_id, color_id, (float(primary_pos[0]), float(primary_pos[1])))
-                ]
-
-                # Extra objects: random (type, color) != primary, at
-                # non-overlapping positions. Forces the model to be
-                # discriminative rather than just detecting "is there an object".
-                n_extras = int(rng.integers(
-                    n_extra_objects_range[0], n_extra_objects_range[1] + 1
-                ))
-                for _ in range(n_extras):
-                    # Sample an extra class != primary.
-                    while True:
-                        ext_type_id, ext_color_id = all_classes[
-                            int(rng.integers(0, len(all_classes)))
-                        ]
-                        if (ext_type_id, ext_color_id) != (type_id, color_id):
-                            break
-                    ext_pos = _sample_pos(taken)
-                    taken.append(ext_pos)
-                    scene.append((
-                        ext_type_id, ext_color_id,
-                        (float(ext_pos[0]), float(ext_pos[1])),
-                    ))
-
+                pos = _sample_in_cone_unity_pos()
+                scene = [(type_id, color_id, (float(pos[0]), float(pos[1])))]
                 obs = adapter.render_obs_multi((0.0, 0.0), scene)
                 images.append(obs.astype(np.float32))
                 labels.append(label)
@@ -419,12 +372,6 @@ def main() -> int:
         help="Where to save the fine-tuned JEPA checkpoint. Required if "
              "--train-jepa is set.",
     )
-    p.add_argument(
-        "--max-extra-objects", type=int, default=0,
-        help="Max number of random distractor objects per training obs "
-             "(0..N). Currently uses primary-label semantics which is "
-             "ambiguous with extras >0 — leave 0 unless experimenting.",
-    )
     args = p.parse_args()
     if args.train_jepa and args.out_jepa_path is None:
         p.error("--out-jepa-path is required when --train-jepa is set")
@@ -482,14 +429,11 @@ def main() -> int:
     print(f"[concept] generating dataset: {args.n_per_class} samples/class * "
           f"{NUM_CLASSES} classes = {args.n_per_class * NUM_CLASSES} train samples")
     t0 = time.time()
-    extras_range = (0, args.max_extra_objects)
     train_images_np, train_labels_np = generate_dataset(
         n_per_class=args.n_per_class, obs_scale=args.obs_scale, seed=0,
-        n_extra_objects_range=extras_range,
     )
     eval_images_np, eval_labels_np = generate_dataset(
         n_per_class=args.n_eval_per_class, obs_scale=args.obs_scale, seed=42,
-        n_extra_objects_range=extras_range,
     )
     print(f"[concept] generated in {time.time()-t0:.1f}s. "
           f"train={train_images_np.shape}, eval={eval_images_np.shape}")
