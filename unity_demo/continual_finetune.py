@@ -120,7 +120,14 @@ def freeze_memory_banks(policy: UniversalPolicy) -> dict[str, int]:
 def greedy_action(env: UnityNavEnv) -> int:
     """Emit one of {turn_left, turn_right, forward} that points the agent
     at the target. Uses env internals (cheat) — that's fine because this
-    is a synthetic expert for BC."""
+    is a synthetic expert for BC.
+
+    Strategy: commit to one axis at a time. Drive forward whenever the
+    forward distance is meaningfully positive; only turn when the target
+    is behind us, or when we've drawn level on the forward axis and the
+    lateral offset still needs closing. This avoids the diagonal-target
+    spin trap (alternating turn_right/turn_left every tick).
+    """
     agent = env._agent_pos
     target = env._target_pos
     heading = env._adapter.heading
@@ -131,14 +138,22 @@ def greedy_action(env: UnityNavEnv) -> int:
     forward_dist = float(delta @ fwd)
     right_dist = float(delta @ right)
 
-    # If the target is mostly to one side, turn that way first.
-    # Heuristic: if lateral component > 1/2 of forward component, prioritize turning.
-    if abs(right_dist) > 0.4 and abs(right_dist) > 0.5 * abs(forward_dist):
-        return _ACT_RIGHT if right_dist > 0 else _ACT_LEFT
-    # If target is mostly behind, turn around (one tick of turn_right).
-    if forward_dist < -0.4:
+    # 1. Already nearly inside the touch zone — just push forward.
+    if float(np.linalg.norm(delta)) < 0.8:
+        return _ACT_FORWARD
+
+    # 2. Target is significantly behind: about-face (any single turn).
+    if forward_dist < -0.5:
         return _ACT_RIGHT
-    # Otherwise drive forward.
+
+    # 3. Drawn level on the forward axis AND there's lateral offset:
+    #    commit to turning toward the offset side. This is the ONLY
+    #    place we turn; the "abs(forward_dist) < some_threshold" guard
+    #    prevents the diagonal-spin oscillation.
+    if forward_dist < 0.6 and abs(right_dist) > 0.4:
+        return _ACT_RIGHT if right_dist > 0 else _ACT_LEFT
+
+    # 4. Otherwise drive forward.
     return _ACT_FORWARD
 
 
