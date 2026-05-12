@@ -340,7 +340,15 @@ def main() -> int:
     retrieval.concept_base.requires_grad_(True)
 
     # Classification head — scaffolding, discarded at save time.
-    classifier = nn.Linear(D_tok, NUM_CLASSES).to(device)
+    # 2-layer MLP (was Linear): gives the head enough capacity to carve out
+    # 24 separable regions in concept-token space, avoiding the "always
+    # predict the dominant class" degenerate solution.
+    classifier = nn.Sequential(
+        nn.Linear(D_tok, D_tok * 2),
+        nn.ReLU(),
+        nn.Dropout(0.1),
+        nn.Linear(D_tok * 2, NUM_CLASSES),
+    ).to(device)
 
     policy_trainable_params = [p_ for p_ in policy.parameters() if p_.requires_grad] + list(classifier.parameters())
     jepa_trainable_params = [p_ for p_ in jepa.parameters() if p_.requires_grad]
