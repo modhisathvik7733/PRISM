@@ -40,7 +40,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from prism.cog_core.dev_curriculum import (
-    DEFAULT_STAGES, DevelopmentalCurriculum,
+    DEFAULT_STAGES, DevelopmentalCurriculum, DevStage,
 )
 from prism.envs.babyai import _encode_image
 from prism.models.jepa import JepaConfig, JepaWorldModel
@@ -285,6 +285,19 @@ def main() -> int:
                         help="Measure competence (and consider stage-advance) "
                              "every N optimizer steps.")
     parser.add_argument("--gate-eval-n-transitions", type=int, default=500)
+    # Bypass the developmental curriculum and train on a single env for the
+    # full --total-steps budget. Used when the dev curriculum advances out
+    # of the color/type-rich env (GoToLocal) before the factored aux loss
+    # has shaped the latent (the v5.0 Phase 1 failure mode: each stage hit
+    # min_steps before competence really converged, JEPA exits at 32k
+    # steps with weak factorization → 4.7% held-out joint).
+    parser.add_argument(
+        "--single-env", default=None,
+        help="If set, skip the curriculum and train only on this env for "
+             "--total-steps. Use BabyAI-GoToLocal-v0 for max color/type "
+             "variety. Stage cosine target raised to 0.999 so the curriculum "
+             "never auto-completes.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--device",
@@ -319,7 +332,24 @@ def main() -> int:
     print(f"[dev-jepa] model: encoder={cfg.encoder_type} dyn={cfg.dynamics_type} "
           f"params={sum(p.numel() for p in model.parameters()):,}")
 
-    curr = DevelopmentalCurriculum(stages=list(DEFAULT_STAGES))
+    if args.single_env:
+        # One stage covering the entire training budget. min_steps and
+        # max_steps both set to total_steps so the curriculum never
+        # advances. transition_cos=0.999 means competence is never
+        # declared (effectively impossible at this threshold).
+        single_stage = DevStage(
+            name="single",
+            env_id=args.single_env,
+            description=f"single-env training on {args.single_env}",
+            min_steps=args.total_steps,
+            max_steps=args.total_steps,
+            transition_cos=0.999,
+        )
+        curr = DevelopmentalCurriculum(stages=[single_stage])
+        print(f"[dev-jepa] single-env mode: {args.single_env} for "
+              f"{args.total_steps} steps (curriculum bypassed)")
+    else:
+        curr = DevelopmentalCurriculum(stages=list(DEFAULT_STAGES))
     print("[dev-jepa] curriculum stages:")
     for s in curr.stages:
         print(f"  {s}")
