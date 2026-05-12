@@ -162,13 +162,18 @@ async def _handle_connection(websocket, *, policy, jepa, device, args):
             await websocket.send(json.dumps({"action": unity_action}))
 
             step_count += 1
-            if step_count % 100 == 1:
+            # Verbose for the first 10 steps so we can see initial behavior;
+            # then drop to every-100 to keep logs readable.
+            if step_count <= 10 or step_count % 100 == 1:
+                logits_list = logits.squeeze(0).tolist()
+                logits_str = ",".join(f"{x:+.2f}" for x in logits_list)
                 print(
                     f"[infer] step={step_count} "
-                    f"agent=({agent_pos[0]:.2f},{agent_pos[1]:.2f}) "
-                    f"target=({target_pos[0]:.2f},{target_pos[1]:.2f}) "
+                    f"agent=({agent_pos[0]:+.2f},{agent_pos[1]:+.2f}) "
+                    f"target=({target_pos[0]:+.2f},{target_pos[1]:+.2f}) "
                     f"heading={adapter.heading} "
-                    f"substrate_act={substrate_action} unity_act={unity_action}"
+                    f"sub_act={substrate_action} unity_act={unity_action} "
+                    f"logits=[{logits_str}]"
                 )
     except Exception as e:
         print(f"[infer] connection error: {type(e).__name__}: {e}")
