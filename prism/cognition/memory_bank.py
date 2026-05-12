@@ -131,6 +131,12 @@ class MemoryBank(nn.Module):
         # Step counter — used to normalize activation_mass into a
         # "fraction of attention received" if the engine wants that.
         self.register_buffer("activation_steps", torch.zeros((), dtype=torch.long))
+        # Tracking flag — when True, `retrieve()` accumulates activation
+        # statistics implicitly (without the caller passing
+        # `track_activations=True` explicitly). The engine toggles this
+        # at stage entry/exit so the trainer's hot-path code doesn't
+        # need to know about the curriculum.
+        self.tracking: bool = False
         # Backward hooks zero the gradient on frozen rows. This catches
         # ALL paths that produce a gradient on K/V — direct backprop,
         # SparseHopfieldOptimizer, any future loss term. Adam-state
@@ -300,7 +306,7 @@ class MemoryBank(nn.Module):
     def retrieve(
         self,
         query: torch.Tensor,
-        track_activations: bool = False,
+        track_activations: bool | None = None,
     ) -> torch.Tensor:
         """Issue a query against the bank.
 
@@ -347,7 +353,13 @@ class MemoryBank(nn.Module):
             out = self.hopfield(triple)
         # out: (B, 1, D_tok)
 
-        if track_activations:
+        # When `track_activations` is None, honor `self.tracking` so the
+        # engine can toggle stage-level tracking without the trainer
+        # threading a flag through every retrieval call.
+        effective_track = (
+            track_activations if track_activations is not None else self.tracking
+        )
+        if effective_track:
             # Hopfield.get_association_matrix returns (B, n_heads, N_q, N_kv).
             # Sum over batch / heads / query length → (n_slots,).
             if attn_mask is not None:

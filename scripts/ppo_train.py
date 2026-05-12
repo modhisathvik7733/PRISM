@@ -376,6 +376,36 @@ def main() -> int:
              "delegates to. PR-4 removes this flag when transformer trunk "
              "becomes the only path.",
     )
+    # v6.0 PR-6: curriculum mode. When --n-stages > 1, total_steps is
+    # divided evenly across N stages on the same env (smoke test for the
+    # CurriculumEngine wiring). Per-stage env_factories arrive in PR-6b;
+    # this gets us the freeze/expand/advance loop end-to-end on BabyAI.
+    parser.add_argument(
+        "--n-stages", type=int, default=1,
+        help="Number of curriculum stages. Default 1 (no curriculum). "
+             "When >1, total_steps is divided evenly; the engine runs "
+             "stage transitions between segments. Requires --policy-type "
+             "universal --trunk transformer.",
+    )
+    parser.add_argument(
+        "--stage-expand-slots", type=int, default=0,
+        help="Number of new slots each bank activates BEFORE each stage "
+             "(except the first). Requires headroom: build the substrate "
+             "with concept_n_slots >= initial_active + (n_stages-1)*this. "
+             "0 means no growth.",
+    )
+    parser.add_argument(
+        "--curriculum-warmup", type=int, default=0,
+        help="Gradient steps each newly-expanded slot must run before "
+             "the NEXT stage transition can freeze. Maps to "
+             "CurriculumEngineConfig.warmup_steps. 0 disables the check.",
+    )
+    parser.add_argument(
+        "--curriculum-freeze-threshold", type=float, default=0.005,
+        help="Activation-fraction threshold for the freeze decision at "
+             "each stage end. Provisional default; the v6 plan calls "
+             "for an ablation sweep before Phase C.",
+    )
     # v6.0 Phase B pre-condition (resolution-7 / audit pass-2 issue 4a):
     # one-shot check that the replay path produces bit-identical log_probs
     # to the rollout path on the first mini-batch of the first iteration.
@@ -616,6 +646,72 @@ def main() -> int:
     n_iterations = args.total_steps // (args.rollout_steps * args.n_envs)
     print(f"[ppo] target {args.total_steps} env steps "
           f"= {n_iterations} iterations @ {args.rollout_steps}*{args.n_envs}")
+
+    # v6.0 PR-6: optional curriculum mode. n_stages > 1 wires the
+    # CurriculumEngine to drive activation tracking + freeze/expand
+    # between iteration segments. Requires universal+transformer policy
+    # so the banks are at policy.inner.retrieval.{concept,operator}_bank.
+    curriculum_engine = None
+    iters_per_stage = n_iterations
+    stage_boundaries: list[int] = []
+    if args.n_stages > 1:
+        if not (args.policy_type == "universal" and args.trunk == "transformer"):
+            raise SystemExit(
+                "--n-stages > 1 requires --policy-type universal --trunk transformer "
+                "(the curriculum engine reads Concept/Operator banks off the "
+                "transformer's RetrievalBlock)."
+            )
+        from prism.cognition.memory_bank import MemoryBank
+        from prism.curriculum.engine import CurriculumEngine, CurriculumEngineConfig
+        from prism.curriculum.stage import Stage
+
+        inner = policy.inner
+        if not hasattr(inner, "retrieval") or not hasattr(inner.retrieval, "concept_bank"):
+            raise SystemExit(
+                "Policy.inner has no .retrieval.concept_bank — curriculum mode "
+                "requires the transformer-trunk path with use_retrieval=True."
+            )
+        banks: dict[str, MemoryBank] = {
+            "concept": inner.retrieval.concept_bank,
+            "operator": inner.retrieval.operator_bank,
+        }
+
+        iters_per_stage = max(1, n_iterations // args.n_stages)
+        # stage_boundaries[k] = first iteration of stage k (k=0 is the
+        # start). We advance the engine when `it` reaches a boundary >0.
+        stage_boundaries = [k * iters_per_stage for k in range(args.n_stages)]
+        # Always recompute the final iteration count so it matches
+        # n_stages * iters_per_stage (may drop a few iterations if
+        # n_iterations isn't divisible).
+        n_iterations = iters_per_stage * args.n_stages
+
+        # Synthesize N stages on the same env (PR-6 smoke). Per-stage
+        # env_factory differentiation is PR-6b.
+        env_factory_placeholder = lambda: None  # not called in this PR
+        stages = [
+            Stage(
+                name=f"stage{k}",
+                env_factory=env_factory_placeholder,
+                max_env_steps=iters_per_stage * args.rollout_steps * args.n_envs,
+                expand_slots_before=(0 if k == 0 else args.stage_expand_slots),
+                freeze_after=(k < args.n_stages - 1),
+            )
+            for k in range(args.n_stages)
+        ]
+        config = CurriculumEngineConfig(
+            activation_freeze_threshold=args.curriculum_freeze_threshold,
+            warmup_steps=args.curriculum_warmup,
+        )
+        curriculum_engine = CurriculumEngine(
+            stages=stages, banks=banks, config=config,
+        )
+        print(f"[ppo] curriculum mode: {args.n_stages} stages × "
+              f"{iters_per_stage} iters each (= {n_iterations} total). "
+              f"expand={args.stage_expand_slots}/stage threshold="
+              f"{args.curriculum_freeze_threshold} warmup="
+              f"{args.curriculum_warmup}")
+        # Begin tracking activations on stage 0 immediately.
+        curriculum_engine.start_stage_tracking()
 
     h = policy.init_hidden(args.n_envs, device)  # (B, hidden_dim) or (tokens, valid_len)
     prev_actions = torch.full((args.n_envs,), -1, device=device, dtype=torch.long)
@@ -917,6 +1013,41 @@ def main() -> int:
                 f"lr={opt.param_groups[0]['lr']:.2e} ent_coef={ent_coef:.4f}"
             )
 
+        # v6.0 PR-6: curriculum stage transition. Fires at the end of
+        # every `iters_per_stage`-th iteration EXCEPT the final iteration
+        # (final stage just ends without transitioning forward).
+        if curriculum_engine is not None and (it + 1) % iters_per_stage == 0 \
+                and (it + 1) < n_iterations:
+            # Record gradient steps taken in this stage so the engine's
+            # warmup check (audit 7a) has accurate counts. Each iter does
+            # ppo_epochs * n_minibatches optimizer steps.
+            grad_steps_this_stage = iters_per_stage * args.ppo_epochs * args.n_minibatches
+            curriculum_engine.record_gradient_steps(grad_steps_this_stage)
+            curriculum_engine.stop_stage_tracking()
+            stage_idx_completed = curriculum_engine._current_stage_idx
+            try:
+                report = curriculum_engine.advance_stage(opt)
+            except RuntimeError as e:
+                print(f"[curriculum] advance_stage RAISED at stage {stage_idx_completed}: {e}")
+                raise
+            if report is not None:
+                concept_r = report.bank_reports["concept"]
+                operator_r = report.bank_reports["operator"]
+                print(
+                    f"[curriculum] stage {stage_idx_completed} → "
+                    f"{stage_idx_completed + 1}: "
+                    f"concept(frozen+={len(concept_r['frozen_idx'])}, "
+                    f"expanded+={len(concept_r['expanded_idx'])}, "
+                    f"active={concept_r['n_active_after']}, "
+                    f"total_frozen={concept_r['n_frozen_after']}) | "
+                    f"operator(frozen+={len(operator_r['frozen_idx'])}, "
+                    f"expanded+={len(operator_r['expanded_idx'])}, "
+                    f"active={operator_r['n_active_after']}, "
+                    f"total_frozen={operator_r['n_frozen_after']})"
+                )
+            # Begin tracking for the next stage.
+            curriculum_engine.start_stage_tracking()
+
         if (it + 1) % args.save_every_iters == 0 or it == n_iterations - 1:
             ckpt_path = out_dir / f"policy_iter{it+1}.pt"
             torch.save({
@@ -945,6 +1076,18 @@ def main() -> int:
                 "window_mean_reward": float(np.mean(ep_reward_window)) if ep_reward_window else 0.0,
             }, ckpt_path)
             print(f"[ckpt] saved {ckpt_path}")
+
+    # v6.0 PR-6: tidy up after the final stage (no advance — the engine
+    # ran its last `advance_stage` at the boundary between the
+    # penultimate and final stages, and the final stage's `freeze_after`
+    # was forced False in the synthesized curriculum).
+    if curriculum_engine is not None:
+        last_stage_grad_steps = iters_per_stage * args.ppo_epochs * args.n_minibatches
+        curriculum_engine.record_gradient_steps(last_stage_grad_steps)
+        curriculum_engine.stop_stage_tracking()
+        print(f"[curriculum] final stage complete; "
+              f"total gradient steps tracked = "
+              f"{curriculum_engine._cumulative_gradient_steps}")
 
     # final
     final_path = out_dir / "policy_final.pt"

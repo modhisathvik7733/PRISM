@@ -317,6 +317,24 @@ class CurriculumEngine:
         self._current_stage_idx = next_idx
         return report
 
+    # ------------------------------------------------------------------
+    # Tracking toggle (caller wraps each stage's training in this)
+    # ------------------------------------------------------------------
+    def start_stage_tracking(self) -> None:
+        """Begin accumulating per-slot activation statistics in every
+        managed bank. Called by the trainer immediately before a stage's
+        training loop. Idempotent."""
+        for bank in self.banks.values():
+            bank.tracking = True
+
+    def stop_stage_tracking(self) -> None:
+        """Stop accumulating; the next `advance_stage` will read the
+        accumulated statistics and reset. Called by the trainer
+        immediately after a stage's training loop, before
+        `advance_stage`. Idempotent."""
+        for bank in self.banks.values():
+            bank.tracking = False
+
     def record_gradient_steps(self, n_steps: int) -> None:
         """Trainer reports gradient steps taken during this stage so the
         engine can enforce the audit-7a warmup invariant.
