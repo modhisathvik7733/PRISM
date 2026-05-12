@@ -235,6 +235,51 @@ class MemoryBank(nn.Module):
         self.n_active += n_new
         return new_idx
 
+    def retrieve_with_attention(
+        self,
+        query: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Retrieve plus per-query attention weights over slots.
+
+        Used by E4 (audit issue 3d / resolution 5): top-K activating
+        frames per slot, computed by feeding a frozen probe set through
+        this method and reading attention. This is the operational
+        definition of "stable abstraction" — weights bit-equal + top-K
+        frame Jaccard ≥ 0.6 across stage transitions.
+
+        Returns
+        -------
+        out  : (B, D_tok) — retrieval output, same as `retrieve(query)`.
+        attn : (B, n_slots) — softmax weights, averaged over heads.
+            Inactive slots are guaranteed to have weight 0 (via
+            association_mask).
+        """
+        B = query.size(0)
+        active = self.active_mask.to(self.values.dtype).view(1, -1, 1)
+        K = (self.keys * active).expand(B, -1, -1)
+        V = (self.values * active).expand(B, -1, -1)
+        Q = query.unsqueeze(1)
+        triple = (K, Q, V)
+
+        attn_mask = None
+        if not bool(self.active_mask.all().item()):
+            inactive = (~self.active_mask).view(1, -1)
+            attn_mask = torch.zeros(1, self.n_slots, device=query.device)
+            attn_mask = attn_mask.masked_fill(inactive, float("-inf"))
+
+        if attn_mask is not None:
+            out = self.hopfield(triple, association_mask=attn_mask)
+            raw_attn = self.hopfield.get_association_matrix(
+                triple, association_mask=attn_mask
+            )
+        else:
+            out = self.hopfield(triple)
+            raw_attn = self.hopfield.get_association_matrix(triple)
+        # raw_attn: (B, n_heads, N_q=1, n_slots). Average over heads,
+        # squeeze the singleton query dim.
+        attn = raw_attn.mean(dim=1).squeeze(1)             # (B, n_slots)
+        return out.squeeze(1), attn
+
     def reset_activation_history(self) -> None:
         """Clear activation_mass and activation_steps. Called by the
         CurriculumEngine between stages so that the next stage's
