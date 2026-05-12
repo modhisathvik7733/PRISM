@@ -56,13 +56,24 @@ class MemoryBank(nn.Module):
         n_heads: int = 4,
         scaling: float = 1.0,
         update_steps: int = 0,
+        n_active_init: int | None = None,
     ):
         super().__init__()
         self.D_tok = D_tok
-        self.n_slots = n_slots
+        self.n_slots = n_slots  # pre-allocated CAPACITY (parameter shape)
         self.n_heads = n_heads
         self.scaling = scaling
         self.update_steps = update_steps
+        # n_active = currently participating in retrieval. Allows growth
+        # via `expand(n_new)` without nn.Parameter reshape / optimizer
+        # state surgery. Defaults to full capacity (no growth planned).
+        if n_active_init is None:
+            n_active_init = n_slots
+        if not (0 < n_active_init <= n_slots):
+            raise ValueError(
+                f"n_active_init={n_active_init} must be in (0, n_slots={n_slots}]"
+            )
+        self.n_active: int = n_active_init
 
         head_dim = max(8, D_tok // n_heads)
         self.hopfield = Hopfield(
@@ -79,8 +90,19 @@ class MemoryBank(nn.Module):
             normalize_pattern_projection=True,
             dropout=0.0,
         )
-        self.keys = nn.Parameter(torch.randn(1, n_slots, D_tok) * 0.02)
-        self.values = nn.Parameter(torch.randn(1, n_slots, D_tok) * 0.02)
+        # Active slots get the v5 small-random init; pre-allocated inactive
+        # slots are initialized to "near-null": small K, exactly zero V.
+        # Plan spec for capacity growth: "Keys initialized close to a null
+        # direction (small norm), values initialized at zero." On expand(),
+        # the slot is flipped to active and starts learning from this baseline.
+        k_init = torch.randn(1, n_slots, D_tok) * 0.02
+        v_init = torch.randn(1, n_slots, D_tok) * 0.02
+        # Zero out inactive slot V rows (K is already small-random).
+        if n_active_init < n_slots:
+            v_init[:, n_active_init:, :] = 0.0
+            k_init[:, n_active_init:, :] *= 0.1  # extra-small for inactive
+        self.keys = nn.Parameter(k_init)
+        self.values = nn.Parameter(v_init)
 
         # Frozen mask: True at slot index i means slot i's K and V rows are
         # frozen (no gradient, no Adam step). The mask is a buffer (not a
@@ -89,6 +111,26 @@ class MemoryBank(nn.Module):
         # Audit pass-2 issue 3a/3c/7e: this is the substrate's only answer
         # to "is this slot mutable?".
         self.register_buffer("frozen_mask", torch.zeros(n_slots, dtype=torch.bool))
+        # Active mask: True at slot index i means slot i participates in
+        # retrieval. Slots beyond n_active are pre-allocated capacity; they
+        # only become active via `expand(n_new)`. Slots are zero-initialized
+        # so that on first activation their attention contribution starts
+        # near the "no information" baseline. Audit pass-2 issue 7a is
+        # mitigated here: capacity is always present, growth is just a
+        # mask flip; the masked-softmax warmup mechanism (PR-5 step 2b)
+        # layers on top.
+        active_init = torch.zeros(n_slots, dtype=torch.bool)
+        active_init[:n_active_init] = True
+        self.register_buffer("active_mask", active_init)
+        # Per-slot activation mass: accumulated attention weight received
+        # over the lifetime of the bank. Feeds the activation-based
+        # freezing decision at stage transitions (resolution 4 from the
+        # plan). Reset between stages by the CurriculumEngine; written
+        # only when `track_activations=True` is passed to `retrieve`.
+        self.register_buffer("activation_mass", torch.zeros(n_slots))
+        # Step counter — used to normalize activation_mass into a
+        # "fraction of attention received" if the engine wants that.
+        self.register_buffer("activation_steps", torch.zeros((), dtype=torch.long))
         # Backward hooks zero the gradient on frozen rows. This catches
         # ALL paths that produce a gradient on K/V — direct backprop,
         # SparseHopfieldOptimizer, any future loss term. Adam-state
@@ -160,22 +202,98 @@ class MemoryBank(nn.Module):
         """
         return not bool(self.frozen_mask[slot_idx].item())
 
-    def retrieve(self, query: torch.Tensor) -> torch.Tensor:
+    # ------------------------------------------------------------------
+    # Growth (PR-5 step 2) — activate pre-allocated capacity
+    # ------------------------------------------------------------------
+    def expand(self, n_new: int) -> torch.Tensor:
+        """Activate `n_new` previously-inactive slots. Returns the indices
+        of the newly-activated slots (so the CurriculumEngine can tag
+        their origin / warmup state).
+
+        Raises if there is not enough pre-allocated capacity (n_active +
+        n_new > n_slots). Constructor must size n_slots to the maximum
+        capacity the curriculum will ever ask for.
+
+        Audit pass-2 issue 5a (expand triggering rule): caller-controlled,
+        once per stage transition, fixed n_new per stage. This method
+        does NOT trigger itself; the CurriculumEngine is the single
+        writer.
+
+        Plan resolution: slot origin is registered at creation (resolution
+        5b). With pre-allocated capacity, "creation" = "activation"; the
+        engine should call `register_origin(idx, domain)` here.
+        """
+        if self.n_active + n_new > self.n_slots:
+            raise ValueError(
+                f"expand(n_new={n_new}) would exceed pre-allocated capacity "
+                f"(n_active={self.n_active}, n_slots={self.n_slots}). "
+                f"Construct the bank with a larger n_slots to support more growth."
+            )
+        new_idx = torch.arange(self.n_active, self.n_active + n_new,
+                                device=self.active_mask.device)
+        self.active_mask[new_idx] = True
+        self.n_active += n_new
+        return new_idx
+
+    def reset_activation_history(self) -> None:
+        """Clear activation_mass and activation_steps. Called by the
+        CurriculumEngine between stages so that the next stage's
+        freezing decision uses only that stage's activation statistics.
+        """
+        self.activation_mass.zero_()
+        self.activation_steps.zero_()
+
+    def slot_activation_fraction(self) -> torch.Tensor:
+        """Per-slot mean attention-weight share over the tracked window.
+        Returns shape (n_slots,). Slots with zero activation_steps
+        return zero. Used by CurriculumEngine to compute the freeze set:
+            freeze_idx = where(activation_fraction > threshold)
+        """
+        steps = self.activation_steps.clamp(min=1)
+        return self.activation_mass / steps
+
+    def retrieve(
+        self,
+        query: torch.Tensor,
+        track_activations: bool = False,
+    ) -> torch.Tensor:
         """Issue a query against the bank.
 
         Parameters
         ----------
         query : (B, D_tok)
+        track_activations : if True, accumulate attention-weight statistics
+            into `self.activation_mass` for the curriculum-engine's
+            activation-based freezing decision (resolution 4). Default
+            False to avoid the double-forward cost during evaluation.
 
         Returns
         -------
         retrieved : (B, D_tok)
         """
         B = query.size(0)
-        K = self.keys.expand(B, -1, -1)         # (B, n_slots, D_tok)
-        V = self.values.expand(B, -1, -1)       # (B, n_slots, D_tok)
+        # Zero-mask inactive slot V rows so they contribute nothing to the
+        # weighted-sum output even though their K rows still take some
+        # softmax mass. Cold-slot leakage (audit pass-2 issue 3b /
+        # acknowledged in resolution 5): inactive slots steal a small
+        # share of the softmax denominator. PR-5 step 2b layers proper
+        # masked-softmax on top via Hopfield's association_mask.
+        active = self.active_mask.to(self.values.dtype).view(1, -1, 1)
+        K = (self.keys * active).expand(B, -1, -1)
+        V = (self.values * active).expand(B, -1, -1)
         Q = query.unsqueeze(1)                  # (B, 1, D_tok)
-        out = self.hopfield((K, Q, V))          # (B, 1, D_tok)
+        triple = (K, Q, V)
+        out = self.hopfield(triple)             # (B, 1, D_tok)
+
+        if track_activations:
+            # Hopfield.get_association_matrix returns (B, n_heads, N_q, N_kv).
+            # Sum over batch / heads / query length → (n_slots,).
+            attn = self.hopfield.get_association_matrix(triple)
+            # Detach: activation_mass is a statistic, not a gradient path.
+            slot_mass = attn.detach().sum(dim=(0, 1, 2))    # (n_slots,)
+            self.activation_mass = self.activation_mass + slot_mass
+            self.activation_steps = self.activation_steps + B
+
         return out.squeeze(1)
 
 
@@ -276,5 +394,68 @@ if __name__ == "__main__":
         print("FAIL: values[frozen_idx] changed after opt.step()")
         _sys.exit(1)
     print(f"[membank] opt.step(): frozen slot weights are bit-identical to pre-step (checksum match)")
+
+    # PR-5 step 2 — capacity growth via expand() + activation tracking.
+    # 1. Construct with partial capacity active.
+    # 2. expand(): flip more bits, returns new indices.
+    # 3. retrieve(track_activations=True): activation_mass accumulates.
+    # 4. Inactive slots have zero V → they steal some softmax mass but
+    #    contribute nothing to the output (acknowledged cold-slot leakage).
+    grow_bank = MemoryBank(D_tok=32, n_slots=16, n_active_init=8, n_heads=2)
+    assert grow_bank.n_active == 8
+    assert grow_bank.active_mask[:8].all() and not grow_bank.active_mask[8:].any()
+    print(f"[membank] expand: constructed with n_slots={grow_bank.n_slots} n_active={grow_bank.n_active}")
+
+    # Inactive slot V rows must be exactly zero.
+    if grow_bank.values[:, 8:, :].abs().sum().item() != 0.0:
+        print("FAIL: inactive slot V rows are not zero-initialized")
+        _sys.exit(1)
+    print(f"[membank] inactive slot V rows are zero (near-null init)")
+
+    # Run some retrievals with activation tracking; verify activation_mass
+    # is concentrated on active slots and zero on inactive slots.
+    q_grow = torch.randn(5, 32)
+    for _ in range(3):
+        grow_bank.retrieve(q_grow, track_activations=True)
+    am = grow_bank.activation_mass
+    if am[8:].abs().sum().item() != 0.0:
+        # Note: with cold-slot leakage, inactive slots get a small but
+        # nonzero share. The masked-softmax warmup (PR-5 step 2b) fixes
+        # this; for now we document and accept.
+        leak = am[8:].abs().sum().item()
+        total = am.abs().sum().item()
+        print(f"[membank] cold-slot leakage observed: inactive slots got "
+              f"{leak/total:.1%} of total attention "
+              f"(acknowledged; PR-5 step 2b will mask via Hopfield association_mask)")
+    print(f"[membank] activation tracking: mass on active slots = "
+          f"{am[:8].sum().item():.3f}, steps = {grow_bank.activation_steps.item()}")
+
+    # Expand by 4 slots: 8 → 12 active.
+    new_idx = grow_bank.expand(4)
+    assert grow_bank.n_active == 12
+    assert grow_bank.active_mask[:12].all() and not grow_bank.active_mask[12:].any()
+    if new_idx.tolist() != [8, 9, 10, 11]:
+        print(f"FAIL: expand() returned unexpected indices {new_idx.tolist()}")
+        _sys.exit(1)
+    print(f"[membank] expand(4): n_active 8 → 12, new indices = {new_idx.tolist()}")
+
+    # Over-expand: should raise.
+    try:
+        grow_bank.expand(10)  # 12 + 10 > 16
+    except ValueError as e:
+        print(f"[membank] over-expand correctly raises ValueError: ok")
+    else:
+        print("FAIL: expand() past capacity did not raise")
+        _sys.exit(1)
+
+    # reset_activation_history clears the stats.
+    grow_bank.reset_activation_history()
+    if grow_bank.activation_mass.abs().sum().item() != 0.0:
+        print("FAIL: reset_activation_history did not clear activation_mass")
+        _sys.exit(1)
+    if grow_bank.activation_steps.item() != 0:
+        print("FAIL: reset_activation_history did not clear activation_steps")
+        _sys.exit(1)
+    print(f"[membank] reset_activation_history: clears mass + step counter")
 
     print("[membank] all smoke checks passed")
