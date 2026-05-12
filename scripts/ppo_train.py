@@ -288,6 +288,58 @@ def compute_gae(
     return advantages, returns
 
 
+def _find_substrate_banks(policy) -> dict | None:
+    """Return {'concept': bank, 'operator': bank} if the policy is a
+    transformer-trunk UniversalPolicy with retrieval; else None. Used
+    by both curriculum mode and the --log-bank-stats path so they don't
+    duplicate substrate-shape detection.
+    """
+    if getattr(policy, "state_kind", None) != "tuple":
+        return None
+    inner = getattr(policy, "inner", None)
+    if inner is None or not hasattr(inner, "retrieval"):
+        return None
+    if not hasattr(inner.retrieval, "concept_bank"):
+        return None
+    return {
+        "concept": inner.retrieval.concept_bank,
+        "operator": inner.retrieval.operator_bank,
+    }
+
+
+def _log_bank_stats(banks: dict, it: int) -> None:
+    """Print a one-line summary per managed bank. Quiet skip when the
+    bank has no tracking data yet (activation_steps == 0)."""
+    for name, bank in banks.items():
+        if int(bank.activation_steps.item()) == 0:
+            print(f"[bank-stats:iter {it+1}] {name}: no tracking yet "
+                  f"(activation_steps=0)")
+            continue
+        frac = bank.slot_activation_fraction()
+        n_active = int(bank.n_active)
+        n_frozen = int(bank.frozen_mask.sum().item())
+        active_frac = frac[bank.active_mask].clamp(min=1e-12)
+        # Distribution stats over active slots.
+        p = active_frac / active_frac.sum()
+        entropy = float(-(p * p.log()).sum().item())
+        # Max-entropy reference for active count.
+        import math as _math
+        ln_n = _math.log(max(n_active, 1))
+        ratio = entropy / ln_n if ln_n > 0 else 0.0
+        top = active_frac.topk(min(5, n_active))
+        top_idx = top.indices.tolist()
+        top_vals = [round(float(v), 4) for v in top.values.tolist()]
+        print(
+            f"[bank-stats:iter {it+1}] {name}: "
+            f"active={n_active} frozen={n_frozen}/{bank.n_slots} "
+            f"({100 * n_frozen / bank.n_slots:.1f}%) "
+            f"max={float(active_frac.max()):.4f} "
+            f"med={float(active_frac.median()):.4f} "
+            f"entropy={entropy:.3f}/{ln_n:.3f} (ratio={ratio:.2f}) "
+            f"top5_idx={top_idx} top5_frac={top_vals}"
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--jepa-checkpoint", required=True)
@@ -401,10 +453,35 @@ def main() -> int:
              "CurriculumEngineConfig.warmup_steps. 0 disables the check.",
     )
     parser.add_argument(
+        "--log-bank-stats", type=int, default=0,
+        help="Print per-bank activation stats every N iterations. 0 "
+             "disables. Requires --policy-type universal --trunk "
+             "transformer. Reports active/frozen counts, max/median "
+             "activation_fraction, attention entropy (over active "
+             "slots), and top-5 slot indices. Useful for understanding "
+             "how Hopfield retrieval evolves during long runs.",
+    )
+    parser.add_argument(
         "--curriculum-freeze-threshold", type=float, default=0.005,
-        help="Activation-fraction threshold for the freeze decision at "
-             "each stage end. Provisional default; the v6 plan calls "
-             "for an ablation sweep before Phase C.",
+        help="Default activation-fraction threshold for the freeze "
+             "decision at each stage end. Used by any bank not overridden "
+             "by the per-bank flags below. Provisional default; the v6 "
+             "plan calls for an ablation sweep before Phase C.",
+    )
+    # Per-bank threshold overrides — PR-6 smoke showed Operator (β=4)
+    # saturates at 0.005 while Concept (β=1) freezes ~1%/stage; the
+    # same threshold doesn't fit both. None = use --curriculum-freeze-
+    # threshold; a float overrides it for that bank.
+    parser.add_argument(
+        "--concept-freeze-threshold", type=float, default=None,
+        help="Per-bank override for the concept bank. Default: use "
+             "--curriculum-freeze-threshold.",
+    )
+    parser.add_argument(
+        "--operator-freeze-threshold", type=float, default=None,
+        help="Per-bank override for the operator bank. Suggested 0.05 "
+             "given the β=4 sharp-retrieval saturation observed in the "
+             "PR-6 smoke run. Default: use --curriculum-freeze-threshold.",
     )
     # v6.0 Phase B pre-condition (resolution-7 / audit pass-2 issue 4a):
     # one-shot check that the replay path produces bit-identical log_probs
@@ -653,34 +730,33 @@ def main() -> int:
     # so the banks are at policy.inner.retrieval.{concept,operator}_bank.
     curriculum_engine = None
     iters_per_stage = n_iterations
-    stage_boundaries: list[int] = []
+    # Banks dict for curriculum and/or --log-bank-stats. Constructed
+    # once; None if the policy is not transformer+retrieval.
+    substrate_banks = _find_substrate_banks(policy)
+    if args.log_bank_stats > 0 and substrate_banks is None:
+        raise SystemExit(
+            "--log-bank-stats requires --policy-type universal --trunk "
+            "transformer with use_retrieval=True."
+        )
+    # If logging is on but curriculum isn't, enable tracking manually so
+    # activation_mass actually accumulates.
+    if args.log_bank_stats > 0 and args.n_stages <= 1 and substrate_banks is not None:
+        for _b in substrate_banks.values():
+            _b.tracking = True
     if args.n_stages > 1:
-        if not (args.policy_type == "universal" and args.trunk == "transformer"):
+        if substrate_banks is None:
             raise SystemExit(
                 "--n-stages > 1 requires --policy-type universal --trunk transformer "
                 "(the curriculum engine reads Concept/Operator banks off the "
                 "transformer's RetrievalBlock)."
             )
-        from prism.cognition.memory_bank import MemoryBank
         from prism.curriculum.engine import CurriculumEngine, CurriculumEngineConfig
         from prism.curriculum.stage import Stage
 
-        inner = policy.inner
-        if not hasattr(inner, "retrieval") or not hasattr(inner.retrieval, "concept_bank"):
-            raise SystemExit(
-                "Policy.inner has no .retrieval.concept_bank — curriculum mode "
-                "requires the transformer-trunk path with use_retrieval=True."
-            )
-        banks: dict[str, MemoryBank] = {
-            "concept": inner.retrieval.concept_bank,
-            "operator": inner.retrieval.operator_bank,
-        }
+        banks = substrate_banks
 
         iters_per_stage = max(1, n_iterations // args.n_stages)
-        # stage_boundaries[k] = first iteration of stage k (k=0 is the
-        # start). We advance the engine when `it` reaches a boundary >0.
-        stage_boundaries = [k * iters_per_stage for k in range(args.n_stages)]
-        # Always recompute the final iteration count so it matches
+        # Recompute the final iteration count so it matches
         # n_stages * iters_per_stage (may drop a few iterations if
         # n_iterations isn't divisible).
         n_iterations = iters_per_stage * args.n_stages
@@ -698,18 +774,28 @@ def main() -> int:
             )
             for k in range(args.n_stages)
         ]
+        per_bank: dict[str, float] = {}
+        if args.concept_freeze_threshold is not None:
+            per_bank["concept"] = args.concept_freeze_threshold
+        if args.operator_freeze_threshold is not None:
+            per_bank["operator"] = args.operator_freeze_threshold
         config = CurriculumEngineConfig(
             activation_freeze_threshold=args.curriculum_freeze_threshold,
+            per_bank_threshold=per_bank,
             warmup_steps=args.curriculum_warmup,
         )
         curriculum_engine = CurriculumEngine(
             stages=stages, banks=banks, config=config,
         )
+        threshold_repr = (
+            f"default={args.curriculum_freeze_threshold}"
+            + (f" concept={per_bank['concept']}" if "concept" in per_bank else "")
+            + (f" operator={per_bank['operator']}" if "operator" in per_bank else "")
+        )
         print(f"[ppo] curriculum mode: {args.n_stages} stages × "
               f"{iters_per_stage} iters each (= {n_iterations} total). "
-              f"expand={args.stage_expand_slots}/stage threshold="
-              f"{args.curriculum_freeze_threshold} warmup="
-              f"{args.curriculum_warmup}")
+              f"expand={args.stage_expand_slots}/stage threshold=({threshold_repr}) "
+              f"warmup={args.curriculum_warmup}")
         # Begin tracking activations on stage 0 immediately.
         curriculum_engine.start_stage_tracking()
 
@@ -1012,6 +1098,14 @@ def main() -> int:
                 f"pi={last_pi_loss:+.4f} v={last_v_loss:.4f} H={last_ent:.3f} KL={last_kl:.4f} "
                 f"lr={opt.param_groups[0]['lr']:.2e} ent_coef={ent_coef:.4f}"
             )
+
+        # v6.0 PR-6 follow-up: bank-stats logging cadence. Fires every
+        # --log-bank-stats iterations. Works with or without curriculum;
+        # when curriculum is off, tracking was enabled manually above so
+        # activation_mass actually accumulates.
+        if args.log_bank_stats > 0 and substrate_banks is not None \
+                and (it + 1) % args.log_bank_stats == 0:
+            _log_bank_stats(substrate_banks, it)
 
         # v6.0 PR-6: curriculum stage transition. Fires at the end of
         # every `iters_per_stage`-th iteration EXCEPT the final iteration

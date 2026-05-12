@@ -39,7 +39,7 @@ stages) is PR-6.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -70,8 +70,17 @@ class CurriculumEngineConfig:
     """
 
     activation_freeze_threshold: float = 0.005
-    """Slots whose activation_fraction (cumulative mass / steps) exceeds
-    this at stage-end enter the freeze set."""
+    """Default threshold: slots whose activation_fraction (cumulative
+    mass / steps) exceeds this at stage-end enter the freeze set.
+    Overridden per-bank via `per_bank_threshold` below."""
+
+    per_bank_threshold: dict[str, float] = field(default_factory=dict)
+    """Per-bank threshold overrides. Looked up by bank name; falls back
+    to `activation_freeze_threshold` when absent. The PR-6 smoke run
+    showed Operator (β=4, 64 slots) saturates at 0.005 while Concept
+    (β=1, 1024 slots) freezes only ~1% per stage at the same threshold
+    — clear signal that the two banks need different gates. Suggested
+    defaults: {"concept": 0.005, "operator": 0.05}."""
 
     warmup_steps: int = 5000
     """Audit issue 7a: must validate at stage end that every slot added
@@ -261,7 +270,9 @@ class CurriculumEngine:
         if completed.freeze_after:
             for name, bank in self.banks.items():
                 fraction = bank.slot_activation_fraction()
-                threshold = self.config.activation_freeze_threshold
+                threshold = self.config.per_bank_threshold.get(
+                    name, self.config.activation_freeze_threshold
+                )
                 # Eligible: active AND not already frozen AND above threshold.
                 eligible = (
                     bank.active_mask

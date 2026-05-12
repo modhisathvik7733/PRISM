@@ -33,12 +33,22 @@ class ContinualBackpropHook:
         decay_rate: float = 0.99,              # EMA decay for utility
         maturity_threshold: int = 100,         # don't reinit until unit has been seen N times
         unit_dim: int = 0,                     # which dim of output is the "unit" dim
+        protected_mask: torch.Tensor | None = None,
     ):
         self.layer = layer
         self.replacement_rate = replacement_rate
         self.decay_rate = decay_rate
         self.maturity_threshold = maturity_threshold
         self.unit_dim = unit_dim
+        # Audit pass-2 issue 3c: when this hook wraps weights backed by a
+        # MemoryBank (frozen-slot semantics), the bank's frozen_mask must
+        # be passed here so reinit cannot re-write rows the curriculum
+        # froze. `protected_mask` is a (n_units,) bool tensor: True at
+        # indices that must never be reinitialized. Callers that wrap a
+        # bank's K/V tensors should pass `bank.frozen_mask` here and
+        # update it via `set_protected_mask` whenever the curriculum
+        # engine freezes new slots.
+        self.protected_mask: torch.Tensor | None = protected_mask
 
         # Get number of units (output dim).
         if isinstance(layer, nn.Linear):
@@ -81,10 +91,25 @@ class ContinualBackpropHook:
             self.age += 1
 
     @torch.no_grad()
+    def set_protected_mask(self, mask: torch.Tensor) -> None:
+        """Replace the protected-units mask. Called by trainers that
+        share a bank's frozen_mask: as the CurriculumEngine freezes new
+        slots, the trainer must propagate the updated frozen_mask into
+        every ContinualBackpropHook wrapping that bank's weights. Audit
+        pass-2 issue 3c: missing this propagation lets reinit silently
+        re-write rows the curriculum froze."""
+        if mask.shape != (self.n_units,):
+            raise ValueError(
+                f"protected_mask shape {tuple(mask.shape)} != ({self.n_units},)"
+            )
+        self.protected_mask = mask
+
     def reinit_dead_units(self, optimizer: torch.optim.Optimizer | None = None) -> int:
         """Reinitialize the lowest-utility mature units. Returns count of reinit."""
-        # Only consider units past maturity threshold.
+        # Only consider units past maturity threshold AND not protected.
         mature = self.age >= self.maturity_threshold
+        if self.protected_mask is not None:
+            mature = mature & (~self.protected_mask)
         if mature.sum() == 0:
             return 0
 
@@ -202,3 +227,69 @@ class ContinualBackpropManager:
         for hook in self.hooks:
             hook.detach()
         self.hooks.clear()
+
+
+if __name__ == "__main__":
+    # Standalone smoke test for audit-3c: a protected_mask prevents
+    # reinit from touching the masked rows even when their utility is
+    # the lowest in the layer. Run with:
+    #   `python -m prism.training.continual_backprop`
+    import sys as _sys
+
+    torch.manual_seed(0)
+    layer = nn.Linear(8, 16)          # 16 units; will protect indices [0, 5, 11]
+    protected = torch.zeros(16, dtype=torch.bool)
+    protected[[0, 5, 11]] = True
+
+    hook = ContinualBackpropHook(
+        layer=layer,
+        replacement_rate=1.0,         # try to reinit every mature unit
+        maturity_threshold=1,
+        protected_mask=protected,
+    )
+
+    # Drive enough forward passes to mature all units.
+    for _ in range(5):
+        x = torch.randn(4, 8)
+        _ = layer(x)
+    # Manually nudge utility: force protected units to look "dead"
+    # (lowest utility) so the naive selector would pick them first.
+    hook.utility[:] = 1.0
+    hook.utility[[0, 5, 11]] = 0.0
+
+    # Snapshot weights for the protected rows.
+    before_protected = layer.weight[[0, 5, 11], :].detach().clone()
+    n_reinit = hook.reinit_dead_units()
+    after_protected = layer.weight[[0, 5, 11], :].detach().clone()
+
+    if not torch.equal(before_protected, after_protected):
+        print(f"FAIL: protected rows were modified by reinit_dead_units")
+        _sys.exit(1)
+    print(f"[cbp] reinit touched {n_reinit} units; "
+          f"protected rows [0, 5, 11] are bit-identical pre/post")
+
+    # set_protected_mask should accept a new mask and apply on next reinit.
+    new_protected = torch.zeros(16, dtype=torch.bool)
+    new_protected[[2, 7]] = True
+    hook.set_protected_mask(new_protected)
+    hook.utility[:] = 1.0
+    hook.utility[[2, 7]] = 0.0
+    before_new = layer.weight[[2, 7], :].detach().clone()
+    n_reinit2 = hook.reinit_dead_units()
+    after_new = layer.weight[[2, 7], :].detach().clone()
+    if not torch.equal(before_new, after_new):
+        print(f"FAIL: set_protected_mask did not apply to next reinit_dead_units")
+        _sys.exit(1)
+    print(f"[cbp] set_protected_mask: new mask applied; "
+          f"protected rows [2, 7] bit-identical pre/post")
+
+    # Wrong-shape mask raises.
+    try:
+        hook.set_protected_mask(torch.zeros(15, dtype=torch.bool))
+    except ValueError:
+        print(f"[cbp] set_protected_mask rejects wrong-shape mask")
+    else:
+        print("FAIL: set_protected_mask accepted wrong-shape mask")
+        _sys.exit(1)
+
+    print("[cbp] all smoke checks passed")
