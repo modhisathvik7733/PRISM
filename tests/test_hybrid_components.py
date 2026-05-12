@@ -123,9 +123,9 @@ def test_cycle_loss():
         hidden_dim=64, n_layers=1, n_heads=4,
     )
     z = torch.randn(2, 64)
-    _, attn = cm(z, return_attention=True)
+    original_concept = cm(z, return_attention=False)
     tokens = torch.randint(1, 128, (2, 10))
-    out = cycle(tokens, cm, attn)
+    out = cycle(tokens, cm, original_concept)
     assert "cycle_loss" in out
     assert out["cycle_loss"].requires_grad
     print(f"✓ test_cycle_loss (loss={out['cycle_loss'].item():.4f})")
