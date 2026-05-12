@@ -149,45 +149,69 @@ def test_sparse_hopfield_optimizer():
     print("✓ test_sparse_hopfield_optimizer")
 
 
-def test_hybrid_policy_step():
+def test_hybrid_policy_step_with_value():
+    """HybridPolicy must be drop-in compatible with RecurrentPolicy.step_with_value:
+    accept tensor h_prev, return (logits, value, h_next_tensor)."""
     from prism.models.hybrid_policy import HybridPolicy
     policy = HybridPolicy(
         latent_in_dim=128, n_actions=7, mission_dim=24,
+        hidden_dim=128, latent_proj_dim=64,
         concept_n_slots=64, concept_slot_dim=32,
         operator_n_slots=16, operator_slot_dim=32,
-        dynamics_token_dim=64, dynamics_layers=2,
-        vocab_size=128, lang_hidden_dim=64,
-        enable_language=True,
     )
     B = 2
     z = torch.randn(B, 128)
     prev_a = torch.tensor([-1, 3], dtype=torch.long)
     mission = torch.zeros(B, 24); mission[0, 5] = 1.0; mission[1, 10] = 1.0
-    buf = policy.init_hidden(B, torch.device("cpu"))
+    h = policy.init_hidden(B, torch.device("cpu"))
 
-    out = policy.forward(z, prev_a, mission, buf)
-    assert out["logits"].shape == (B, 7)
-    assert out["value"].shape == (B,)
-    print("✓ test_hybrid_policy_step")
+    assert isinstance(h, torch.Tensor), f"init_hidden must return a tensor, got {type(h)}"
+    assert h.shape == (B, 128)
+
+    logits, value, h_next = policy.step_with_value(z, prev_a, mission, h)
+    assert logits.shape == (B, 7), f"logits shape {logits.shape}"
+    assert value.shape == (B,), f"value shape {value.shape}"
+    assert h_next.shape == (B, 128), f"h_next shape {h_next.shape}"
+    assert isinstance(h_next, torch.Tensor), "h_next must be a tensor for PPO"
+    print("✓ test_hybrid_policy_step_with_value")
 
 
-def test_hybrid_policy_language():
+def test_hybrid_policy_inspection():
+    """HybridPolicy exposes active concept and operator slots for inspection."""
     from prism.models.hybrid_policy import HybridPolicy
     policy = HybridPolicy(
         latent_in_dim=128, n_actions=7, mission_dim=24,
+        hidden_dim=128, latent_proj_dim=64,
         concept_n_slots=32, concept_slot_dim=32,
         operator_n_slots=8, operator_slot_dim=32,
-        dynamics_token_dim=64, dynamics_layers=2,
-        vocab_size=128, lang_hidden_dim=64,
-        enable_language=True,
+    )
+    z = torch.randn(1, 128)
+    active = policy.get_active_concepts(z, threshold=0.0)
+    assert len(active) >= 1, "should find at least one active concept"
+    op_slot, op_conf = policy.get_active_operator(z)
+    assert 0 <= op_slot < 8
+    assert 0.0 <= op_conf <= 1.0
+    print(f"✓ test_hybrid_policy_inspection "
+          f"(active_concepts={len(active)}, op_slot={op_slot}, conf={op_conf:.3f})")
+
+
+def test_hybrid_policy_no_operator():
+    """HybridPolicy with use_operator_memory=False should still work."""
+    from prism.models.hybrid_policy import HybridPolicy
+    policy = HybridPolicy(
+        latent_in_dim=128, n_actions=7, mission_dim=24,
+        hidden_dim=64, latent_proj_dim=64,
+        concept_n_slots=32, concept_slot_dim=32,
+        use_operator_memory=False,
     )
     B = 2
     z = torch.randn(B, 128)
-    mission = torch.zeros(B, 24); mission[:, 5] = 1.0
-
-    tokens, info = policy.generate_description(z, mission, max_len=12)
-    assert tokens.size(0) == B
-    print(f"✓ test_hybrid_policy_language (gen_len={tokens.size(1)})")
+    prev_a = torch.tensor([-1, 0], dtype=torch.long)
+    mission = torch.zeros(B, 24); mission[:, 0] = 1.0
+    h = policy.init_hidden(B, torch.device("cpu"))
+    logits, value, h_next = policy.step_with_value(z, prev_a, mission, h)
+    assert logits.shape == (B, 7)
+    print("✓ test_hybrid_policy_no_operator")
 
 
 def run_all():
@@ -200,8 +224,9 @@ def run_all():
     test_concept_to_text()
     test_cycle_loss()
     test_sparse_hopfield_optimizer()
-    test_hybrid_policy_step()
-    test_hybrid_policy_language()
+    test_hybrid_policy_step_with_value()
+    test_hybrid_policy_inspection()
+    test_hybrid_policy_no_operator()
     print("\n✓ ALL TESTS PASSED")
 
 

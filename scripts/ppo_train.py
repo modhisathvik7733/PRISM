@@ -51,6 +51,7 @@ from prism.agents.grounded_agent import allowed_actions_for_spec
 from prism.agents.pose_tracker import MEM_FEAT_DIM, PoseTracker
 from prism.envs.babyai import _encode_image, make_env_with_max_steps, set_max_steps  # noqa: F401
 from prism.models.jepa import JepaConfig, JepaWorldModel, upgrade_config
+from prism.models.hybrid_policy import HybridPolicy
 from prism.models.recurrent_policy import RecurrentPolicy
 from prism.perception import compute_distances, extract_slots
 from prism.perception.predicates import type_color_index
@@ -343,6 +344,26 @@ def main() -> int:
                              "given below.")
     parser.add_argument("--policy-hidden-dim", type=int, default=256)
     parser.add_argument("--policy-latent-proj-dim", type=int, default=128)
+    # v5.0 — Hopfield-augmented hybrid policy. When --policy-type hybrid,
+    # ConceptMemory + OperatorMemory replace the raw JEPA latent on the
+    # GRU input. Same step_with_value contract as RecurrentPolicy.
+    parser.add_argument(
+        "--policy-type", choices=["recurrent", "hybrid"], default="recurrent",
+        help="recurrent = original RecurrentPolicy (GRU on JEPA latent). "
+             "hybrid = HybridPolicy (Hopfield ConceptMemory + OperatorMemory "
+             "in front of the same GRU trunk). Use 'hybrid' for v5.0.",
+    )
+    parser.add_argument("--concept-n-slots", type=int, default=1024)
+    parser.add_argument("--concept-slot-dim", type=int, default=64)
+    parser.add_argument("--concept-scaling", type=float, default=1.0)
+    parser.add_argument("--operator-n-slots", type=int, default=64)
+    parser.add_argument("--operator-slot-dim", type=int, default=64)
+    parser.add_argument("--operator-scaling", type=float, default=4.0)
+    parser.add_argument(
+        "--no-operator-memory", action="store_true",
+        help="disable OperatorMemory for the hybrid policy. Only "
+             "ConceptMemory is used. Lighter, faster.",
+    )
     # Stage 1.2 — replace the rule-based mission parser's (type, color)
     # extraction with a trained text→(color, type) classifier. spec /
     # allowed_actions still come from the rule parser. With "rule" (default)
@@ -412,7 +433,24 @@ def main() -> int:
     mission_dim = len(OBJECT_TYPES) * NUM_COLORS
     print(f"[ppo] frozen JEPA: encoder={cfg.encoder_type} latent_dim={latent_dim} n_actions={n_actions}")
 
-    # ---------- recurrent policy ----------
+    # ---------- recurrent / hybrid policy ----------
+    def _build_policy(**kwargs):
+        """Construct either RecurrentPolicy or HybridPolicy with the same
+        shared kwargs. HybridPolicy also takes the Hopfield-config kwargs
+        which are silently ignored by RecurrentPolicy."""
+        if args.policy_type == "hybrid":
+            return HybridPolicy(
+                **kwargs,
+                concept_n_slots=args.concept_n_slots,
+                concept_slot_dim=args.concept_slot_dim,
+                concept_scaling=args.concept_scaling,
+                operator_n_slots=args.operator_n_slots,
+                operator_slot_dim=args.operator_slot_dim,
+                operator_scaling=args.operator_scaling,
+                use_operator_memory=not args.no_operator_memory,
+            ).to(device)
+        return RecurrentPolicy(**kwargs).to(device)
+
     if args.no_bc:
         mem_feat_dim = int(args.mem_feat_dim)
         policy_latent_in_dim = latent_dim
@@ -420,15 +458,15 @@ def main() -> int:
         policy_mission_dim = mission_dim
         policy_hidden_dim = args.policy_hidden_dim
         policy_latent_proj_dim = args.policy_latent_proj_dim
-        policy = RecurrentPolicy(
+        policy = _build_policy(
             latent_in_dim=policy_latent_in_dim,
             n_actions=policy_n_actions,
             mission_dim=policy_mission_dim,
             hidden_dim=policy_hidden_dim,
             latent_proj_dim=policy_latent_proj_dim,
             mem_feat_dim=mem_feat_dim,
-        ).to(device)
-        print(f"[ppo] policy initialized from scratch (no BC): "
+        )
+        print(f"[ppo] policy={args.policy_type} initialized from scratch (no BC): "
               f"hidden={policy_hidden_dim} "
               f"latent_proj={policy_latent_proj_dim} "
               f"mem={mem_feat_dim}")
@@ -445,15 +483,19 @@ def main() -> int:
         policy_mission_dim = bc["mission_dim"]
         policy_hidden_dim = bc["hidden_dim"]
         policy_latent_proj_dim = bc["latent_proj_dim"]
-        policy = RecurrentPolicy(
+        policy = _build_policy(
             latent_in_dim=policy_latent_in_dim,
             n_actions=policy_n_actions,
             mission_dim=policy_mission_dim,
             hidden_dim=policy_hidden_dim,
             latent_proj_dim=policy_latent_proj_dim,
             mem_feat_dim=mem_feat_dim,
-        ).to(device)
+        )
         # strict=False so the value_head (newly added) loads with random init.
+        # When loading a RecurrentPolicy BC checkpoint into HybridPolicy,
+        # the Hopfield memories are also random-init (no overlap in keys),
+        # and the latent_proj / action_emb / mission_proj / gru / heads
+        # load via name match.
         missing, unexpected = policy.load_state_dict(bc["policy_state_dict"], strict=False)
         print(f"[ppo] BC weights loaded: missing={missing} unexpected={unexpected}")
         if bc["latent_in_dim"] != latent_dim:
@@ -720,6 +762,14 @@ def main() -> int:
             ckpt_path = out_dir / f"policy_iter{it+1}.pt"
             torch.save({
                 "policy_state_dict": policy.state_dict(),
+                "policy_type": args.policy_type,
+                "concept_n_slots": args.concept_n_slots,
+                "concept_slot_dim": args.concept_slot_dim,
+                "concept_scaling": args.concept_scaling,
+                "operator_n_slots": args.operator_n_slots,
+                "operator_slot_dim": args.operator_slot_dim,
+                "operator_scaling": args.operator_scaling,
+                "use_operator_memory": not args.no_operator_memory,
                 "latent_in_dim": policy_latent_in_dim,
                 "n_actions": policy_n_actions,
                 "mission_dim": policy_mission_dim,
