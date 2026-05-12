@@ -124,6 +124,14 @@ async def _handle_connection(websocket, *, policy, jepa, device, args):
     step_count = 0
     state_kind = getattr(policy, "state_kind", "tensor")
 
+    # Episode telemetry for path-efficiency metric.
+    episode_idx = 0
+    episode_start: tuple[float, float] | None = None
+    episode_target: tuple[float, float] | None = None
+    episode_path_len = 0.0
+    episode_start_step = 0
+    prev_pos: tuple[float, float] | None = None
+
     try:
         async for message in websocket:
             try:
@@ -134,6 +142,28 @@ async def _handle_connection(websocket, *, policy, jepa, device, args):
 
             # ---- handle episode boundary ----
             if state.get("episode_done", False):
+                # Compute and print path-efficiency before resetting.
+                if episode_start is not None and episode_target is not None:
+                    optimal = abs(episode_target[0] - episode_start[0]) + abs(
+                        episode_target[1] - episode_start[1]
+                    )
+                    actual = episode_path_len
+                    eff = (optimal / actual) if actual > 1e-6 else 0.0
+                    eps_steps = step_count - episode_start_step
+                    print(
+                        f"[infer] *** TOUCH ep#{episode_idx} step={step_count} "
+                        f"steps_in_ep={eps_steps} "
+                        f"start=({episode_start[0]:+.2f},{episode_start[1]:+.2f}) "
+                        f"target=({episode_target[0]:+.2f},{episode_target[1]:+.2f}) "
+                        f"optimal_manhattan={optimal:.2f} actual_path={actual:.2f} "
+                        f"efficiency={eff:.3f}"
+                    )
+                episode_idx += 1
+                episode_start = None
+                episode_target = None
+                episode_path_len = 0.0
+                episode_start_step = step_count
+                prev_pos = None
                 adapter.reset()
                 if state_kind == "tuple":
                     done_t = torch.ones(1, dtype=torch.bool, device=device)
@@ -141,16 +171,23 @@ async def _handle_connection(websocket, *, policy, jepa, device, args):
                 else:
                     h = policy.init_hidden(1, device)
                 prev_action = torch.tensor([-1], device=device, dtype=torch.long)
-                ap = state.get("agent_pos", [0.0, 0.0])
-                tp = state.get("target_pos", [0.0, 0.0])
-                print(
-                    f"[infer] *** TOUCH at step={step_count} *** "
-                    f"agent=({ap[0]:+.2f},{ap[1]:+.2f}) "
-                    f"target=({tp[0]:+.2f},{tp[1]:+.2f})"
-                )
 
             agent_pos = tuple(state.get("agent_pos", [0.0, 0.0]))
             target_pos = tuple(state.get("target_pos", [0.0, 0.0]))
+
+            # Episode start: first state of a new episode.
+            if episode_start is None:
+                episode_start = agent_pos
+                episode_target = target_pos
+                prev_pos = agent_pos
+
+            # Accumulate path length.
+            if prev_pos is not None:
+                episode_path_len += (
+                    (agent_pos[0] - prev_pos[0]) ** 2
+                    + (agent_pos[1] - prev_pos[1]) ** 2
+                ) ** 0.5
+            prev_pos = agent_pos
 
             # ---- adapter: render fake BabyAI obs ----
             obs_np = adapter.render_obs(agent_pos, target_pos)  # (3, 7, 7)
