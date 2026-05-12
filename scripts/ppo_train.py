@@ -662,8 +662,10 @@ def main() -> int:
                 logits, value, h_next = policy.step_with_value(
                     z, prev_actions, missions, h, mem_feat=mem_batch
                 )
-                masked = logits + mask
-                dist = torch.distributions.Categorical(logits=masked)
+                if args.policy_type == "universal":
+                    dist = policy.action_dist(logits, mask)
+                else:
+                    dist = torch.distributions.Categorical(logits=logits + mask)
                 action = dist.sample()
                 log_prob = dist.log_prob(action)
 
@@ -767,7 +769,6 @@ def main() -> int:
                     logits_t, value_t, h_run = policy.step_with_value(
                         mb_z[t], mb_prev[t], mb_missions[t], h_run, mem_feat=mem_t
                     )
-                    logits_t = logits_t + mb_mask[t]
                     logits_seq.append(logits_t)
                     values_seq.append(value_t)
                     # reset h on done at step t (for step t+1 onward)
@@ -780,7 +781,10 @@ def main() -> int:
                 logits_all = torch.stack(logits_seq, dim=0)  # (T, mb, n_actions)
                 values_all = torch.stack(values_seq, dim=0)  # (T, mb)
 
-                dist = torch.distributions.Categorical(logits=logits_all)
+                if args.policy_type == "universal":
+                    dist = policy.action_dist(logits_all, mb_mask)
+                else:
+                    dist = torch.distributions.Categorical(logits=logits_all + mb_mask)
                 new_logp = dist.log_prob(mb_actions)
                 entropy = dist.entropy()
 

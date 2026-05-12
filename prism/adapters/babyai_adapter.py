@@ -211,28 +211,27 @@ class BabyAIAdapter:
     ) -> torch.Tensor:
         """Apply per-env action masking.
 
-        `env_state` for BabyAI is a `torch.Tensor` of shape `(B, n_actions)`
-        with 1.0 at allowed actions and 0.0 at disallowed actions. This
-        matches what EnvWorker already builds; the adapter just applies
-        the mask to logits with `-inf` at disallowed positions.
+        `env_state` for BabyAI is a `torch.Tensor` broadcastable to
+        `logits`, with `0.0` at allowed actions and `-inf` at disallowed
+        actions (additive-mask convention). The adapter adds it to the
+        logits; disallowed positions become `-inf` and are excluded by
+        `Categorical(logits=...)`. This matches the `(T, B, n_actions)`
+        mask `ppo_train` builds via `make_action_mask` and persists in
+        the rollout buffer, so the same tensor is used for live sampling
+        and K-epoch replay without conversion.
 
         Substrate guarantee: this is called BEFORE every action sampling.
-        Adapters with no masking rules can pass an all-ones tensor or
-        None; we treat None as no-op.
+        Adapters with no masking rules pass `env_state=None`, which is a
+        no-op.
         """
         if env_state is None:
             return logits
         if not isinstance(env_state, torch.Tensor):
             raise TypeError(
                 f"BabyAIAdapter.mask_logits expects env_state as a Tensor "
-                f"(allowed-action mask), got {type(env_state).__name__}"
+                f"(additive logit mask), got {type(env_state).__name__}"
             )
-        # Apply -inf at disallowed positions (where mask == 0).
-        return torch.where(
-            env_state > 0.5,
-            logits,
-            torch.full_like(logits, float("-inf")),
-        )
+        return logits + env_state
 
     def reward_shaper(self) -> Callable[[Any, Any, float], float] | None:
         """BabyAI's natural reward `1 - 0.9 * (steps/max_steps)` is
