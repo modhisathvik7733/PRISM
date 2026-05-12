@@ -452,6 +452,18 @@ def main() -> int:
              "the NEXT stage transition can freeze. Maps to "
              "CurriculumEngineConfig.warmup_steps. 0 disables the check.",
     )
+    # AMP / mixed precision: forward + backward go through
+    # torch.cuda.amp.autocast + GradScaler. Typically 1.5-2× speedup on
+    # Ampere+ GPUs. Caveat: fp16 reductions in matmul change the log_prob
+    # rollout/replay max_abs_diff from ~1e-7 to ~1e-3 — automatically
+    # relaxes --check-replay-equality tolerance when --amp is set.
+    parser.add_argument(
+        "--amp", action="store_true",
+        help="Enable mixed-precision training via torch.cuda.amp. "
+             "1.5-2× faster on Ampere+ GPUs. Relaxes replay-equality "
+             "tolerance from 1e-4 to 5e-3 to accommodate fp16 reduction "
+             "noise.",
+    )
     parser.add_argument(
         "--log-bank-stats", type=int, default=0,
         help="Print per-bank activation stats every N iterations. 0 "
@@ -677,6 +689,12 @@ def main() -> int:
           f"(mem_proj {'enabled (zero-init)' if mem_feat_dim > 0 else 'disabled'})")
 
     opt = torch.optim.AdamW(policy.parameters(), lr=args.lr, weight_decay=1e-4)
+    # AMP scaler — no-op when disabled. GradScaler manages fp16 gradient
+    # underflow: scale loss before backward, unscale before clip + step.
+    amp_scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+    if args.amp:
+        print(f"[ppo] AMP enabled: forward+backward in mixed precision; "
+              f"replay-equality tolerance relaxed to 5e-3 (fp16 reduction noise).")
 
     out_dir = Path("runs") / args.run_name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -855,9 +873,10 @@ def main() -> int:
                 allowed_per_env = [w.allowed for w in workers]
                 mask = make_action_mask(allowed_per_env, n_actions, device)
 
-                # encode + step policy
-                z = jepa.encode(obs_batch)
-                z_flat = z.flatten(start_dim=1)  # (B, latent_dim)
+                # encode + step policy (in autocast if --amp)
+                with torch.cuda.amp.autocast(enabled=args.amp):
+                    z = jepa.encode(obs_batch)
+                z_flat = z.float().flatten(start_dim=1)  # (B, latent_dim) — store fp32
                 if state_kind == "tuple":
                     buf_h_tokens[t] = h[0]
                     buf_h_valid[t] = h[1]
@@ -872,9 +891,13 @@ def main() -> int:
                     buf_mem[t] = mem_batch
                 else:
                     mem_batch = None
-                logits, value, h_next = policy.step_with_value(
-                    z, prev_actions, missions, h, mem_feat=mem_batch
-                )
+                with torch.cuda.amp.autocast(enabled=args.amp):
+                    logits, value, h_next = policy.step_with_value(
+                        z, prev_actions, missions, h, mem_feat=mem_batch
+                    )
+                    # Categorical needs fp32 logits for stable log_prob.
+                    logits = logits.float()
+                    value = value.float()
                 if args.policy_type == "universal":
                     dist = policy.action_dist(logits, mask)
                 else:
@@ -995,9 +1018,12 @@ def main() -> int:
                 values_seq = []
                 for t in range(T):
                     mem_t = mb_mem[t] if mb_mem is not None else None
-                    logits_t, value_t, h_run = policy.step_with_value(
-                        mb_z[t], mb_prev[t], mb_missions[t], h_run, mem_feat=mem_t
-                    )
+                    with torch.cuda.amp.autocast(enabled=args.amp):
+                        logits_t, value_t, h_run = policy.step_with_value(
+                            mb_z[t], mb_prev[t], mb_missions[t], h_run, mem_feat=mem_t
+                        )
+                        logits_t = logits_t.float()
+                        value_t = value_t.float()
                     logits_seq.append(logits_t)
                     values_seq.append(value_t)
                     # reset h on done at step t (for step t+1 onward).
@@ -1037,7 +1063,11 @@ def main() -> int:
                 # ~1000× ULP and ~10000× smaller than any real desync.
                 if args.check_replay_equality and it == 0 and epoch == 0 and mb_start == 0:
                     max_abs_diff = float((new_logp - mb_old_logp).abs().max().item())
-                    tol = 1e-4
+                    # fp16 matmul reductions in autocast push the diff
+                    # from ~1e-7 to ~1e-3. Stay strict in fp32, relax in
+                    # AMP — real desync is still O(1) and well above
+                    # either threshold.
+                    tol = 5e-3 if args.amp else 1e-4
                     bit_equal = torch.equal(new_logp, mb_old_logp)
                     print(
                         f"[E0b] replay log_prob max_abs_diff={max_abs_diff:.3e} "
@@ -1067,9 +1097,16 @@ def main() -> int:
                 loss = policy_loss + args.value_coef * value_loss - ent_coef * entropy_term
 
                 opt.zero_grad(set_to_none=True)
-                loss.backward()
+                # AMP-aware backward: scaler.scale() handles fp16 underflow.
+                # In fp32 (--amp not set) the scaler is a no-op pass-through.
+                amp_scaler.scale(loss).backward()
+                # Unscale BEFORE grad clip so the clip works on the
+                # un-scaled gradients (otherwise the clip norm is
+                # multiplied by scaler's scale factor).
+                amp_scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(policy.parameters(), args.max_grad_norm)
-                opt.step()
+                amp_scaler.step(opt)
+                amp_scaler.update()
 
                 with torch.no_grad():
                     approx_kl = ((ratio - 1.0) - (new_logp - mb_old_logp)).mean()
