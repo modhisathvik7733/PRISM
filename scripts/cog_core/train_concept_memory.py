@@ -41,6 +41,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from prism.cog_core.concept_memory import ConceptMemory
+from prism.cog_core.disentangled_concept_memory import DisentangledFactoredMemory
 from prism.cog_core.factored_concept_memory import FactoredConceptMemory
 from prism.perception.slots import (
     AGENT_POS,
@@ -187,6 +188,29 @@ def main() -> int:
     p.add_argument("--color-slot-dim", type=int, default=16)
     p.add_argument("--type-slots", type=int, default=16)
     p.add_argument("--type-slot-dim", type=int, default=16)
+    # DisentangledFactoredMemory: bottleneck + orthogonality + adversarial debiasing.
+    # The full disentanglement stack. Use this to hit ≥80% held-out compositional.
+    p.add_argument(
+        "--disentangled",
+        action="store_true",
+        help="use DisentangledFactoredMemory (bottleneck + ortho + adversarial)",
+    )
+    p.add_argument("--color-emb-dim", type=int, default=24,
+                   help="bottleneck dim for color extractor")
+    p.add_argument("--type-emb-dim", type=int, default=24,
+                   help="bottleneck dim for type extractor")
+    p.add_argument("--extractor-hidden", type=int, default=128,
+                   help="hidden dim of the attribute extractor MLPs")
+    p.add_argument("--ortho-weight", type=float, default=1.0,
+                   help="orthogonality loss weight on extractor subspaces")
+    p.add_argument("--adv-weight", type=float, default=0.3,
+                   help="adversarial debiasing loss weight")
+    p.add_argument("--adv-lambda", type=float, default=0.5,
+                   help="gradient reversal lambda inside the adversary")
+    p.add_argument("--supcon-weight", type=float, default=0.0,
+                   help="supervised contrastive alignment weight (optional)")
+    p.add_argument("--supcon-temp", type=float, default=0.5,
+                   help="supervised contrastive temperature")
     args = p.parse_args()
 
     set_global_seed(42)
@@ -253,7 +277,33 @@ def main() -> int:
         f"[train_concept_memory] latent_proj: {latent_dim} → {args.working_dim}"
     )
 
-    if args.factored:
+    if args.disentangled:
+        print(
+            f"[train_concept_memory] mode=disentangled: "
+            f"emb(color={args.color_emb_dim}, type={args.type_emb_dim}) "
+            f"slots(color={args.color_slots}x{args.color_slot_dim}, "
+            f"type={args.type_slots}x{args.type_slot_dim}) "
+            f"ortho={args.ortho_weight} adv={args.adv_weight} "
+            f"adv_lambda={args.adv_lambda} supcon={args.supcon_weight}"
+        )
+        memory = DisentangledFactoredMemory(
+            latent_dim=args.working_dim,
+            color_emb_dim=args.color_emb_dim,
+            type_emb_dim=args.type_emb_dim,
+            extractor_hidden=args.extractor_hidden,
+            color_n_slots=args.color_slots,
+            color_slot_dim=args.color_slot_dim,
+            type_n_slots=args.type_slots,
+            type_slot_dim=args.type_slot_dim,
+            n_heads=args.n_heads,
+            scaling=args.scaling,
+            n_colors=NUM_COLORS,
+            n_types=NUM_TYPES,
+            adv_lambda=args.adv_lambda,
+        ).to(device)
+        color_head = nn.Linear(args.color_slot_dim, NUM_COLORS).to(device)
+        type_head = nn.Linear(args.type_slot_dim, NUM_TYPES).to(device)
+    elif args.factored:
         print(
             f"[train_concept_memory] mode=factored: "
             f"color({args.color_slots}x{args.color_slot_dim}) + "
@@ -297,9 +347,15 @@ def main() -> int:
     # SparseHopfieldOptimizer only meaningful for single-memory mode.
     sparse_opt = (
         SparseHopfieldOptimizer(memory, opt)
-        if args.use_sparse_opt and not args.factored
+        if args.use_sparse_opt and not args.factored and not args.disentangled
         else None
     )
+
+    # SupCon helper — imported only if requested (avoids JEPA import cost).
+    if args.disentangled and args.supcon_weight > 0.0:
+        from prism.models.jepa import _sup_con_loss as supcon_fn
+    else:
+        supcon_fn = None
 
     @torch.no_grad()
     def evaluate(loader) -> dict:
@@ -311,7 +367,11 @@ def main() -> int:
         for z, c, t in loader:
             z, c, t = z.to(device), c.to(device), t.to(device)
             z_proj = latent_proj(z)
-            if args.factored:
+            if args.disentangled:
+                out = memory(z_proj)
+                cl = color_head(out["color_concept"]).argmax(-1)
+                tl = type_head(out["type_concept"]).argmax(-1)
+            elif args.factored:
                 color_concept, type_concept = memory(z_proj)
                 cl = color_head(color_concept).argmax(-1)
                 tl = type_head(type_concept).argmax(-1)
@@ -335,26 +395,70 @@ def main() -> int:
         latent_proj.train(); memory.train(); color_head.train(); type_head.train()
         running = 0.0
         n_batches = 0
+        running_ortho = 0.0
+        running_adv = 0.0
+        running_supcon = 0.0
         for z, c, t in train_loader:
             z, c, t = z.to(device), c.to(device), t.to(device)
             z_proj = latent_proj(z)
 
-            if args.factored:
+            if args.disentangled:
+                out = memory(z_proj)
+                c_logits = color_head(out["color_concept"])
+                t_logits = type_head(out["type_concept"])
+                loss_c = F.cross_entropy(c_logits, c)
+                loss_t = F.cross_entropy(t_logits, t)
+
+                # Orthogonality on extractor subspaces.
+                loss_ortho = memory.orthogonality_loss()
+
+                # Adversarial debiasing: adversaries try to predict the
+                # WRONG attribute from each embedding. Gradient reversal
+                # inside the model means the extractors are trained to
+                # make these adversaries fail.
+                loss_adv_t = F.cross_entropy(out["adv_type_from_color"], t)
+                loss_adv_c = F.cross_entropy(out["adv_color_from_type"], c)
+                loss_adv = loss_adv_t + loss_adv_c
+
+                # Optional SupCon on disentangled embeddings.
+                if supcon_fn is not None:
+                    loss_supcon = (
+                        supcon_fn(out["color_emb"], c, temperature=args.supcon_temp)
+                        + supcon_fn(out["type_emb"], t, temperature=args.supcon_temp)
+                    )
+                else:
+                    loss_supcon = torch.zeros((), device=device)
+
+                loss = (
+                    loss_c + loss_t
+                    + args.ortho_weight * loss_ortho
+                    + args.adv_weight * loss_adv
+                    + args.supcon_weight * loss_supcon
+                )
+
+                running_ortho += float(loss_ortho.detach())
+                running_adv += float(loss_adv.detach())
+                running_supcon += float(loss_supcon.detach())
+                attn = None  # not used by sparse_opt in this mode
+            elif args.factored:
                 (color_concept, type_concept), _ = memory(
                     z_proj, return_attention=True
                 )
                 c_logits = color_head(color_concept)
                 t_logits = type_head(type_concept)
+                loss_c = F.cross_entropy(c_logits, c)
+                loss_t = F.cross_entropy(t_logits, t)
+                loss = loss_c + loss_t
+                attn = None
             else:
                 concept, attn = memory(z_proj, return_attention=True)
                 c_logits = color_head(concept)
                 t_logits = type_head(concept)
+                loss_c = F.cross_entropy(c_logits, c)
+                loss_t = F.cross_entropy(t_logits, t)
+                loss = loss_c + loss_t
 
-            loss_c = F.cross_entropy(c_logits, c)
-            loss_t = F.cross_entropy(t_logits, t)
-            loss = loss_c + loss_t
-
-            if sparse_opt is not None:
+            if sparse_opt is not None and attn is not None:
                 sparse_opt.zero_grad()
                 loss.backward()
                 sparse_opt.record_attention(attn)
@@ -370,9 +474,16 @@ def main() -> int:
         avg = running / max(1, n_batches)
         train_eval = evaluate(train_loader)
         test_eval = evaluate(test_loader)
+        aux_str = ""
+        if args.disentangled:
+            aux_str = (
+                f" ortho={running_ortho/max(1,n_batches):.4f}"
+                f" adv={running_adv/max(1,n_batches):.4f}"
+                f" supcon={running_supcon/max(1,n_batches):.4f}"
+            )
         print(
             f"[epoch {epoch+1:2d}/{args.epochs}] "
-            f"loss={avg:.4f} "
+            f"loss={avg:.4f}{aux_str} "
             f"train: color={train_eval['color_acc']*100:5.1f}% "
             f"type={train_eval['type_acc']*100:5.1f}% "
             f"joint={train_eval['joint_acc']*100:5.1f}%  | "
@@ -386,28 +497,44 @@ def main() -> int:
             memory.save(str(run_dir / "concept_memory_best.pt"))
             torch.save(
                 {
+                    "memory_state": memory.state_dict(),
                     "latent_proj": latent_proj.state_dict(),
                     "color_head": color_head.state_dict(),
                     "type_head": type_head.state_dict(),
                     "latent_dim": latent_dim,
                     "working_dim": args.working_dim,
+                    "mode": (
+                        "disentangled" if args.disentangled
+                        else "factored" if args.factored
+                        else "joint"
+                    ),
+                    "args": vars(args),
                     "epoch": epoch + 1,
                     "test_joint": best_joint,
+                    "test_color_acc": test_eval["color_acc"],
+                    "test_type_acc": test_eval["type_acc"],
                 },
-                str(run_dir / "heads_best.pt"),
+                str(run_dir / "full_stack_best.pt"),
             )
 
     memory.save(str(run_dir / "concept_memory_final.pt"))
     torch.save(
         {
+            "memory_state": memory.state_dict(),
             "latent_proj": latent_proj.state_dict(),
             "color_head": color_head.state_dict(),
             "type_head": type_head.state_dict(),
             "latent_dim": latent_dim,
             "working_dim": args.working_dim,
+            "mode": (
+                "disentangled" if args.disentangled
+                else "factored" if args.factored
+                else "joint"
+            ),
+            "args": vars(args),
             "best_test_joint": best_joint,
         },
-        str(run_dir / "heads_final.pt"),
+        str(run_dir / "full_stack_final.pt"),
     )
     print(
         f"\n[done] best test joint accuracy: {best_joint*100:.1f}% "
