@@ -78,14 +78,19 @@ NUM_CLASSES = NUM_TYPES * NUM_COLORS  # 24
 # Checkpoint loading (same as continual_finetune.py — copy-pasted to keep
 # this script standalone)
 # ===========================================================================
-def load_jepa(path: Path, device: torch.device):
+def load_jepa(path: Path, device: torch.device, trainable: bool = False):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     cfg = upgrade_config(ckpt["cfg"])
     jepa = JepaWorldModel(cfg).to(device)
     jepa.load_state_dict(ckpt["model"])
-    jepa.eval()
-    for p in jepa.parameters():
-        p.requires_grad_(False)
+    if trainable:
+        jepa.train()  # enable dropout/BN training mode
+        for p in jepa.parameters():
+            p.requires_grad_(True)
+    else:
+        jepa.eval()
+        for p in jepa.parameters():
+            p.requires_grad_(False)
     return jepa, cfg
 
 
@@ -160,18 +165,26 @@ def concept_token_forward(
     policy: UniversalPolicy,
     jepa: JepaWorldModel,
     images: torch.Tensor,
+    jepa_trainable: bool = False,
 ) -> torch.Tensor:
     """obs -> JEPA latent -> obs_token (via latent_proj) -> concept query
     -> concept_bank retrieval -> concept_token. Skips action_emb and
     mission_proj because concepts should be perception-anchored, not
     mission-anchored — we want "this IS a red ball" regardless of task.
+
+    If jepa_trainable is True, JEPA's encode runs WITH gradient tracking
+    so the encoder can adapt to the target-domain (Unity) obs
+    distribution. Otherwise we wrap it in no_grad for speed.
     """
     inner = policy._inner
     retrieval = inner.retrieval
     concept_bank = retrieval.concept_bank
 
-    with torch.no_grad():
+    if jepa_trainable:
         z = jepa.encode(images)
+    else:
+        with torch.no_grad():
+            z = jepa.encode(images)
     if z.ndim > 2:
         z = z.flatten(1)
     obs_token = inner.latent_proj(z)  # (B, D_tok)
@@ -192,6 +205,7 @@ def train_one_epoch(
     labels: torch.Tensor,
     opt: torch.optim.Optimizer,
     batch_size: int,
+    jepa_trainable: bool = False,
 ) -> tuple[float, float]:
     N = images.size(0)
     perm = torch.randperm(N, device=images.device)
@@ -202,15 +216,15 @@ def train_one_epoch(
         idx = perm[i:i + batch_size]
         imgs = images[idx]
         labs = labels[idx]
-        c_tok = concept_token_forward(policy, jepa, imgs)
+        c_tok = concept_token_forward(policy, jepa, imgs, jepa_trainable=jepa_trainable)
         logits = classifier(c_tok)
         loss = F.cross_entropy(logits, labs)
         opt.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            [p for p in opt.param_groups[0]["params"]],
-            max_norm=1.0,
-        )
+        all_params = []
+        for group in opt.param_groups:
+            all_params.extend(group["params"])
+        torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
         opt.step()
         total_loss += float(loss.item())
         n_correct += int((logits.argmax(-1) == labs).sum().item())
@@ -267,17 +281,34 @@ def main() -> int:
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument(
+        "--jepa-lr", type=float, default=1e-4,
+        help="Lower LR for JEPA params when --train-jepa is set "
+             "(encoder needs gentle updates to preserve general features).",
+    )
     p.add_argument("--obs-scale", type=float, default=2.0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument(
+        "--train-jepa", action="store_true",
+        help="Unfreeze JEPA and fine-tune it on the synthetic Unity dataset. "
+             "Closes the domain gap at the encoder level.",
+    )
+    p.add_argument(
+        "--out-jepa-path", default=None,
+        help="Where to save the fine-tuned JEPA checkpoint. Required if "
+             "--train-jepa is set.",
+    )
     args = p.parse_args()
+    if args.train_jepa and args.out_jepa_path is None:
+        p.error("--out-jepa-path is required when --train-jepa is set")
 
     device = torch.device(args.device)
     out_path = Path(args.out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"[concept] device={device}")
-    print(f"[concept] loading JEPA from {args.jepa}")
-    jepa, cfg = load_jepa(Path(args.jepa), device)
+    print(f"[concept] loading JEPA from {args.jepa} (trainable={args.train_jepa})")
+    jepa, cfg = load_jepa(Path(args.jepa), device, trainable=args.train_jepa)
 
     print(f"[concept] loading base policy from {args.base_policy}")
     base_ckpt = torch.load(args.base_policy, map_location=device, weights_only=False)
@@ -311,9 +342,12 @@ def main() -> int:
     # Classification head — scaffolding, discarded at save time.
     classifier = nn.Linear(D_tok, NUM_CLASSES).to(device)
 
-    trainable_params = [p_ for p_ in policy.parameters() if p_.requires_grad] + list(classifier.parameters())
-    n_trainable = sum(p_.numel() for p_ in trainable_params)
-    print(f"[concept] trainable params: {n_trainable:,}")
+    policy_trainable_params = [p_ for p_ in policy.parameters() if p_.requires_grad] + list(classifier.parameters())
+    jepa_trainable_params = [p_ for p_ in jepa.parameters() if p_.requires_grad]
+    n_policy_trainable = sum(p_.numel() for p_ in policy_trainable_params)
+    n_jepa_trainable = sum(p_.numel() for p_ in jepa_trainable_params)
+    print(f"[concept] trainable policy/classifier params: {n_policy_trainable:,}")
+    print(f"[concept] trainable JEPA params: {n_jepa_trainable:,}")
 
     print(f"[concept] generating dataset: {args.n_per_class} samples/class * "
           f"{NUM_CLASSES} classes = {args.n_per_class * NUM_CLASSES} train samples")
@@ -338,10 +372,15 @@ def main() -> int:
     print(f"[concept] BASE  accuracy={base_eval['accuracy']:.3f} "
           f"worst_class={base_eval['worst_class_acc']:.3f}")
 
-    opt = torch.optim.Adam(trainable_params, lr=args.lr)
+    # Separate param groups so JEPA gets a lower LR than the concept-side params.
+    param_groups = [{"params": policy_trainable_params, "lr": args.lr}]
+    if args.train_jepa and jepa_trainable_params:
+        param_groups.append({"params": jepa_trainable_params, "lr": args.jepa_lr})
+    opt = torch.optim.Adam(param_groups)
     for epoch in range(args.epochs):
         train_loss, train_acc = train_one_epoch(
-            policy, jepa, classifier, train_images, train_labels, opt, args.batch_size,
+            policy, jepa, classifier, train_images, train_labels, opt,
+            args.batch_size, jepa_trainable=args.train_jepa,
         )
         eval_result = evaluate(
             policy, jepa, classifier, eval_images, eval_labels, args.batch_size,
@@ -376,9 +415,29 @@ def main() -> int:
         "base_accuracy": base_eval["accuracy"],
         "final_accuracy": final_eval["accuracy"],
         "worst_class_acc": final_eval["worst_class_acc"],
+        "trained_jepa": args.train_jepa,
     }
     torch.save(new_ckpt, out_path)
-    print(f"[concept] saved {out_path}")
+    print(f"[concept] saved policy to {out_path}")
+
+    # Also save the fine-tuned JEPA, if applicable. Format matches the
+    # original JEPA checkpoint so the inference server's loader works
+    # unchanged (just point --jepa at the new file).
+    if args.train_jepa:
+        out_jepa_path = Path(args.out_jepa_path)
+        out_jepa_path.parent.mkdir(parents=True, exist_ok=True)
+        base_jepa_ckpt = torch.load(args.jepa, map_location=device, weights_only=False)
+        jepa_out = {
+            **base_jepa_ckpt,
+            "model": jepa.state_dict(),
+            "concept_pretrain_finetune": {
+                "n_per_class": args.n_per_class,
+                "epochs": args.epochs,
+                "jepa_lr": args.jepa_lr,
+            },
+        }
+        torch.save(jepa_out, out_jepa_path)
+        print(f"[concept] saved fine-tuned JEPA to {out_jepa_path}")
 
     print(f"\n[concept] BASE concept accuracy:  {base_eval['accuracy']:.3f}")
     print(f"[concept] FINAL concept accuracy: {final_eval['accuracy']:.3f}")
