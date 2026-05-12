@@ -66,8 +66,19 @@ else
 fi
 
 # ---- 3. Install Python deps needed by hybrid components ----
-echo "[setup] installing Python deps..."
-pip install --quiet 'requests>=2.28' 'numpy>=1.20'
+echo "[setup] installing Python deps into active venv..."
+# Use `python -m pip` so we hit the same interpreter that runs the verify step.
+python -m pip install --quiet --upgrade 'requests>=2.28' 'numpy>=1.20'
+
+# Sanity-check the install landed in the active venv.
+if ! python -c "import requests, numpy" 2>/dev/null; then
+    echo "[setup] ✗ requests/numpy not importable after install"
+    echo "[setup]   Active Python: $(which python)"
+    echo "[setup]   Active pip:    $(which pip)"
+    echo "[setup]   Try: python -m pip install requests numpy"
+    exit 1
+fi
+echo "[setup] ✓ requests + numpy importable"
 
 # ---- 4. Install Ollama for local LLM (concept naming) ----
 if ! command -v ollama &> /dev/null; then
