@@ -255,13 +255,13 @@ def build_factored_classifier(D_tok: int) -> nn.Module:
             nn.Dropout(0.1),
         ),
         "color": nn.Linear(D_tok * 2, NUM_COLORS),
-        "type": nn.Linear(D_tok * 2, NUM_TYPES),
+        "obj_type": nn.Linear(D_tok * 2, NUM_TYPES),
     })
 
 
 def _factored_logits(classifier: nn.Module, c_tok: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     h = classifier["trunk"](c_tok)
-    return classifier["color"](h), classifier["type"](h)
+    return classifier["color"](h), classifier["obj_type"](h)
 
 
 def _split_labels(labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
