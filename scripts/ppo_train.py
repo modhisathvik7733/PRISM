@@ -37,6 +37,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 from collections import deque
 from pathlib import Path
 
@@ -614,6 +615,7 @@ def main() -> int:
     ep_reward_window = deque(maxlen=200)
     ep_steps_window = deque(maxlen=200)
     total_env_steps = 0
+    metrics_log: list[dict] = []
 
     for it in range(n_iterations):
         # ===== ROLLOUT PHASE =====
@@ -803,9 +805,19 @@ def main() -> int:
                 last_kl = float(approx_kl.item())
 
         # Logging
+        mean_R = float(np.mean(ep_reward_window)) if ep_reward_window else float("nan")
+        mean_steps = float(np.mean(ep_steps_window)) if ep_steps_window else float("nan")
+        metrics_log.append({
+            "iter": it + 1,
+            "env_steps": total_env_steps,
+            "window_mean_R": mean_R,
+            "ep_steps": mean_steps,
+            "pi_loss": last_pi_loss,
+            "v_loss": last_v_loss,
+            "entropy": last_ent,
+            "kl": last_kl,
+        })
         if (it + 1) % 5 == 0 or it == 0 or it == n_iterations - 1:
-            mean_R = float(np.mean(ep_reward_window)) if ep_reward_window else float("nan")
-            mean_steps = float(np.mean(ep_steps_window)) if ep_steps_window else float("nan")
             print(
                 f"[iter {it+1:4d}/{n_iterations}] env_steps={total_env_steps:>7d} "
                 f"window_R={mean_R:.3f} ep_steps={mean_steps:.1f} "
@@ -862,6 +874,11 @@ def main() -> int:
     }, final_path)
     print(f"[done] saved {final_path}")
     print(f"[done] final window_mean_R = {float(np.mean(ep_reward_window)):.3f}")
+
+    metrics_path = out_dir / "metrics.json"
+    with metrics_path.open("w") as f:
+        json.dump({"iterations": metrics_log}, f, indent=2)
+    print(f"[done] saved {metrics_path}")
     return 0
 
 
