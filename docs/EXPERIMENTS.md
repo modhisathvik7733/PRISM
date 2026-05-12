@@ -60,6 +60,9 @@ curriculum scheduler test, real problems surfaced.
 
 | Version | Tag | Result | Notes |
 |---------|-----|--------|-------|
+| **v6.0-e1-reverse-beats-forward** | `v6.0-e1-cross-env-eval` | **E1 cross-env evaluation FALSIFIES the developmental-ordering hypothesis. 3-stage BabyAI curriculum (GoToObj → GoToLocal → PickupLoc), 500k env steps per arm, evaluated at 100 greedy episodes per (arm, env) cell. Forward order: 97% / 31% / 9% (mean 45.67%). Reverse order: 98% / 55% / 15% (mean 56.00%). Reverse wins on every env, +24pp on the middle stage (GoToLocal). v6 plan's E1 falsifier — "if non-forward arms ≥ forward, drop developmental framing" — is met decisively. Hard-first ordering retains the difficult capability better (PickupLoc 15% vs 9%) AND transfers downward to intermediate tasks better than easy-first transfers upward. Substrate framing should retract "developmental cognition" and become "scalable continual-learning architecture with Hopfield-augmented PPO and curriculum freeze." Caveats: single seed per arm, n=100 per cell (95% CI ±10pp; 24pp GoToLocal gap is well above noise but mean 10.3pp is at the noise floor). Shuffled arm not run.** |
+| **v6.0-phase-b-passed** | `v6.0-substrate-validated` | **Phase B substrate-validation gate PASSES on both BabyAI envs at 500k env steps with curriculum-disabled training. GoToLocal: 0.536 ≥ 0.50 (v5−5pp gate). GoToObj: **0.929 ≥ 0.85 (absolute floor) — and 3pp above v5's docs-derived 0.90 baseline**. Run with `--policy-type universal --trunk transformer --amp --n-envs 32 --ppo-epochs 3`. The v6 substrate (BabyAIAdapter + UniversalPolicy + UniversalTrunk with two-tensor rolling buffer + RetrievalBlock over Concept/Operator MemoryBanks) is empirically validated as a v5 replacement. Wall-clock ~45-65 min per 500k run after the AMP+32envs speedup stack. Curriculum integration (PR-6) and continual-learning primitives (PR-5: frozen mask + Adam-state zeroing, growable capacity, masked-softmax warmup, activation-tracking, probe-set lifecycle) all in place and exercised. Phase C / E1 unblocked.** |
+| **v6.0-substrate** | `v6.0-PR1-through-PR6` | **PRISM v6.0 substrate ships. Major architectural commits: PR-1 substrate-package skeleton (cognition/adapters/curriculum), PR-2 BabyAIAdapter + UniversalPolicy thin wrapper (bit-exact parity with v5 confirmed via E0 reward gate, relative_diff=0.0 at 50k steps), PR-3 Phase A structural validation (--check-replay-equality gate: fp32 rollout/replay log_probs agree to ~1.2e-7, AMP path to ~5e-4, both within tolerance), PR-4 UniversalTrunk + two-tensor (buf_tokens, buf_valid_len) rolling state + RetrievalBlock with 2 query tokens over Hopfield MemoryBanks, PR-5 continual-learning primitives (freeze_slots_with_optimizer atomic w/ Adam-state zeroing closing audit 3a; activation-mask + Hopfield association_mask closing audit 3b cold-slot leakage; ProbeSet artifact w/ tamper-detecting SHA256 hash; correlation-based E4 stability gate replacing top-K-Jaccard which was found to be noise-dominated on flat distributions), PR-6 ppo_train ↔ CurriculumEngine integration with per-bank thresholds, --log-bank-stats diagnostics, --diagnose mode on E4. Total architectural change: 1.65M params (vs v5's 985k); same JEPA encoder reused (frozen, owned by adapter per Resolution 1). Every audit-pass-2 item flagged as "must resolve before Phase C" is closed in code with verified smoke tests on Vast.ai.** |
 | **v5.0-jepa-ablation** | `jepa_single_env_v1` | **Curriculum ablation (negative control). Single-env JEPA (GoToLocal only, 200k steps, 950k params) vs dev-curriculum JEPA (80k steps, 749k params). Skill ratio: single-env 1.22× vs dev 1.65×. Predicate readout held-out joint on single-env latent: 5.6% (random=4.2%) — entangled, same as dev JEPA before factored-aux. Confirms: developmental curriculum produces richer representation (2× state variability, better relative prediction quality) with fewer steps and smaller model. Dev-curriculum JEPA confirmed as the correct encoder for v5.0 PPO.** |
 | **v5.0** | `v5.0-hybrid-hopfield-transformer` | **PRISM-Hybrid architectural redesign. Replaces hardcoded predicates (96 fixed) and operators (12 fixed) with growable Hopfield memories (ConceptMemory: 1024 slots; OperatorMemory: 64 slots) built on the BSD-3 `hflayers` library. Replaces RecurrentPolicy's GRU trunk with TransformerDynamics (4× HopfieldEncoderLayer) for world model + reward + value + policy in one stack. Adds first language generation head (ConceptToText, ~3M params transformer decoder) with cycle consistency loss. Adds async ConceptManager that uses local Ollama (phi3:mini) to name novel slots via JSON-validated proposals. Adds SparseHopfieldOptimizer (Lin 2025) for slot-localized updates that prevent catastrophic forgetting in continual learning. Adds ContinualBackpropManager (Sutton 2024 Nature) for plasticity preservation. Total ~30M trainable params + ~2GB local LLM. Components are drop-in via `HybridPolicy` (same step_with_value interface as RecurrentPolicy for ppo_train.py compatibility).** |
 | **v4.1.7** | `v4.1.7-stage1.5-bfull` | **Stage 1.5 B-full — the headline benchmark: BC warm-start + multi-env (GoToLocal + GoTo + GoToObj) + language goals + 4 held-out combos + 2M steps. GoTo: **18.0%** ≈ v2.0 18.9% (MATCH). GoToObj: **94.5%** ≈ v2.0 100% (NEAR MATCH, -5.5pp). GoToLocal: **43.0%** vs v2.0 94.6% (gap persists). Key anomaly: on GoToLocal, held-out combos (55.8%, n=52) beat ID combos (38.5%, n=148) by 17.3pp — opposite of expected. GoTo and GoToObj results confirm the architecture is competitive at matched setup; the GoToLocal gap is real and attributable to multi-env capacity spreading + held-out training reduction, not the language mechanism.** |
@@ -74,13 +77,148 @@ curriculum scheduler test, real problems surfaced.
 
 ---
 
-## v5.0 — PRISM-Hybrid: Hopfield + Transformer Dynamics + Language Generation + Continual Learning
+## v6.0 — Universal Cognition Substrate + E1 falsifier
 
 **Date:** 2026-05-12
-**Tag:** `v5.0-hybrid-hopfield-transformer`
-**Setup script:** `scripts/setup_hybrid.sh`
+**Tags:**
+- `v6.0-PR1-through-PR6` — substrate ships, all "must resolve before Phase C" audit items closed.
+- `v6.0-substrate-validated` — Phase B 500k success-rate gate passed on BabyAI-GoToLocal and BabyAI-GoToObj.
+- `v6.0-e1-cross-env-eval` — E1 ordering ablation: reverse beats forward by 10.3pp; developmental hypothesis falsified.
 
-### Architectural motivation
+### Headline finding (E1)
+
+**The "easy-to-hard developmental ordering matters" hypothesis is empirically refuted in PRISM v6 on BabyAI.** Running the v6 plan's pre-registered E1 ablation:
+
+| Arm | GoToObj | GoToLocal | PickupLoc | Mean | Stage order |
+|-----|--------:|----------:|----------:|-----:|-------------|
+| forward | 97% | 31% | 9% | 45.67% | sensorimotor (GoToObj) → object recognition (GoToLocal) → action composition (PickupLoc) |
+| reverse | 98% | 55% | **15%** | **56.00%** | action composition → object recognition → sensorimotor |
+
+Reverse wins on every env. The 24pp gap on GoToLocal (the middle stage, matched compute budget, same probe set) is the load-bearing signal — well above the n=100 sampling noise (~10pp 95% CI on a 50% Bernoulli). The v6 plan called out exactly this falsifier:
+
+> "if shuffled ≈ forward at matched per-stage budgets, 'developmental' is not load-bearing — drop the developmental framing."
+
+We got a stronger version: reverse > forward. Two interpretations the data supports:
+
+1. **Hard-first protects the difficult capability.** Reverse trained PickupLoc *first* with full plasticity, then froze, then trained easier tasks on top. Forward trained PickupLoc *last* under frozen-slot constraints from GoToObj+GoToLocal. PickupLoc retention: 15% (reverse) vs 9% (forward).
+
+2. **Harder priors transfer downward better than easier priors transfer upward.** PickupLoc-trained policy entering GoToLocal had more general capabilities (55%) than GoToObj-trained policy entering GoToLocal (31%). "Pick up colored object" subsumes "go to colored object"; the reverse direction does not.
+
+**Implication for PRISM positioning:** the substrate's claim should not be "developmental cognition." It is **a scalable continual-learning architecture with Hopfield-augmented PPO and curriculum freeze**. The mechanism works — both arms produced stable plateau-reaching policies and curriculum freeze never broke training — but the *specific* "developmental order matters" framing is not supported.
+
+**Caveats (load-bearing):** single seed per arm; n=100 episodes per cell (95% CI ±10pp); shuffled arm not run; single domain (BabyAI). The 24pp GoToLocal gap is robust; the 10.3pp mean gap is at the single-seed noise floor and would need 3-5 seeds to lock in.
+
+### Phase B (substrate-validation gate)
+
+Both arms of the plan's Phase B exit criterion passed:
+
+| Env | v6 final window_R | v5 baseline | Gate | Result |
+|---|---:|---:|---|---|
+| BabyAI-GoToLocal | 0.536 | 0.55 (docs) | ≥ 0.50 (v5−5pp) | PASS |
+| BabyAI-GoToObj | **0.929** | 0.90 (docs) | ≥ 0.85 (absolute floor) | **PASS, +3pp above v5** |
+
+Run config: `--policy-type universal --trunk transformer --amp --n-envs 32 --ppo-epochs 3 --total-steps 500000`. Wall-clock ~45-65 min per 500k run after the AMP+32envs speedup stack landed.
+
+### What ships in v6.0
+
+The substrate is a structural redesign of v5.0 around three principles:
+
+1. **Encoder is adapter-owned** (Resolution 1). JEPA encoder moves out of the substrate into `BabyAIAdapter`; substrate operates only on post-encoder latents. No JEPA reference in `prism.cognition.*`.
+2. **Substrate hyperparameters are checkpoint-locked** (Resolution 3). `D_tok=128, L=16, n_trunk_layers=4, n_trunk_heads=4, concept_n_slots=1024, operator_n_slots=64` are not exposed as CLI overrides — they cannot vary across stages or domains.
+3. **Two-tensor rolling state, paired reset** (Resolution 7g). The trunk's recurrent state is `(buf_tokens: (B, L, D_tok), buf_valid_len: (B,) long)` and is ONLY reset via `policy.reset_buffer(done, h)` — single API prevents the failure mode where one tensor resets while the other persists.
+
+Major modules:
+
+- `prism/cognition/policy.py`: `UniversalPolicy.from_adapter(...)`. Substrate-side action-distribution construction goes through `policy.action_dist(logits, env_state)` which always calls `adapter.mask_logits()` first (Resolution 7 / audit 7b — adapter-routed action masking).
+- `prism/cognition/trunk.py`: `UniversalTrunk` (4× HopfieldEncoderLayer over the rolling buffer). Supports per-step `prefix_tokens` for RetrievalBlock cross-attention.
+- `prism/cognition/memory_bank.py`: `MemoryBank` (Hopfield K/V store). Carries `frozen_mask` and `active_mask` as buffers (in state_dict). `freeze_slots_with_optimizer(idx, opt)` is atomic: zeroes K/V grad via hook AND zeroes Adam exp_avg/exp_avg_sq for the frozen rows (audit 3a). `retrieve(query)` uses Hopfield's `association_mask` to exclude inactive slots from softmax denominator (audit 3b — 0% cold-slot leakage measured).
+- `prism/cognition/retrieval_block.py`: 2-query cross-attention into Concept (β=1) + Operator (β=4, 3 iterative Hopfield steps) banks.
+- `prism/curriculum/engine.py`: `CurriculumEngine.advance_stage(opt)` is synchronous. Computes freeze set per-bank via `bank.slot_activation_fraction() > per_bank_threshold`, freezes atomically, then `bank.expand(n_new)` for the next stage. Audit 7a warmup check raises if a stage advances before its newly-activated slots have run for `warmup_steps`.
+- `prism/curriculum/probe_set.py`: `collect_probe_set` runs random-policy rollouts on a fixed seed; persists `(obs, missions, env_id, seed, n_frames, hash)` as a single artifact. `load_probe_set` hash-verifies on disk read — tamper detection. Resolution 6 closed.
+- `prism/curriculum/probe_eval.py`: top-K Jaccard, JS divergence, per-slot correlation. E4 metric primitives.
+- `prism/curriculum/babyai_curriculum.py`: 3-stage developmental curriculum + `reorder_curriculum(stages, order ∈ {forward, reverse, shuffled})`. Canonical probe env (`BabyAI-GoToLocal-v0`) used across all arms.
+- `scripts/ppo_train.py`: `--curriculum {name} --curriculum-order {forward,reverse,shuffled} --concept-freeze-threshold --operator-freeze-threshold --log-bank-stats --amp --check-replay-equality`. Env workers hot-swap at stage transitions (`_build_workers(env_id)` per stage). Auto probe-set collection at curriculum init.
+- `scripts/experiments/e4_slot_stability.py`: correlation-based stability gate with `--diagnose` mode (per-frozen-slot mean/max attention, cond-MLP weight delta, top-10 dominance overlap). The corrected metric replaces the Jaccard-only gate which was found noise-dominated on near-uniform Hopfield distributions.
+- `scripts/experiments/e1_cross_env_eval.py`: the actual scientific gate for E1 — evaluates one or more policy checkpoints on the full {GoToObj, GoToLocal, PickupLoc} suite, produces the comparison table.
+- `scripts/experiments/checks/phase_b_success_gate.py`: auto-evaluable Phase B exit gate.
+
+Total architectural change: **1,650,440 trainable params** (vs v5's 984,984). Same JEPA encoder reused (frozen). GPU memory <1 GB.
+
+### Audit-pass-2 / resolution closure
+
+Every item the v6 plan's audit flagged as "must resolve before Phase C" is closed in code with a verified smoke test on Vast.ai:
+
+| Item | Closure |
+|---|---|
+| Resolution 1: encoder-as-adapter | `BabyAIAdapter.encode_obs` is the substrate's only encoder entry point |
+| Resolution 3: locked substrate hyperparameters | No CLI overrides on D_tok / L / n_layers / n_slots |
+| Resolution 4: activation-based freezing | `CurriculumEngine.advance_stage` reads `bank.slot_activation_fraction()`; per-bank thresholds |
+| Resolution 5: weight-stable + adaptive routing (interpretation b) | Correlation-based E4 gate confirms substrate exhibits this behavior |
+| Resolution 6: probe set is a persisted artifact | `ProbeSet` SHA256-hash-tamper-detected on load |
+| Resolution 7 / audit 4a: replay buffer corruption | `--check-replay-equality` flag; tol=1e-4 fp32, 5e-3 AMP |
+| Audit 3a: Adam moments bypass | `freeze_slots_with_optimizer` zeroes exp_avg/exp_avg_sq atomically |
+| Audit 3b: cold-slot leakage | Hopfield `association_mask` measured 0.00% leakage |
+| Audit 3c: ContinualBackprop bypass | `bank.is_writable(slot)` API + `ContinualBackpropHook.protected_mask` |
+| Audit 7a: warmup never completes | `CurriculumEngine` raises if stage advances before `warmup_steps` of new-slot training |
+| Audit 7b / Resolution 7: adapter-routed masking | `policy.action_dist()` is the only path to a Categorical |
+| Audit 7g: paired buffer reset | `policy.reset_buffer(done, h)` is the only reset API |
+
+### Important methodological lesson
+
+Two false-positive E4 results were caught and corrected this session, and both correction stories are worth recording:
+
+1. **Initial Jaccard collapse (0.04 median) on the Phase B GoToLocal 500k checkpoint was claimed as "audit 3d firing."** `--diagnose` mode (per-slot attention magnitudes, cond-MLP weight delta) showed frozen-slot attention share was actually stable (1.35% → 1.43%), cond MLP weight changed only ~10% relative, and the Jaccard collapse came from top-K being noise-dominated on near-uniform attention distributions (concept slots get ~1/1024 attention each — top-50 of 2000 is random). The correlation metric correctly SKIPS these slots rather than reporting spurious zeros.
+
+2. **The original v6 plan's V-cosine-on-frozen-rows E4 metric** would have given a tautological PASS because frozen K/V rows are bit-identical by construction. The plan correctly replaced it with activation-Jaccard ahead of time, but at first we then made the same error in the opposite direction — using a metric that fails for the *opposite* reason on this substrate. The final gate (correlation, with variance-based skipping) is the right one.
+
+**Lesson:** stability metrics must be chosen with knowledge of the bank's typical attention profile. ConceptMemory at 1024-slot scale is near-uniform; OperatorMemory has a broadcast slot; both produce uninformative top-K. Correlation respects both regimes.
+
+### Commands (reproducible)
+
+```bash
+# Phase B (substrate-validation gate).
+python -m scripts.ppo_train --no-bc \
+    --jepa-checkpoint runs/jepa_dev_v1_factored/jepa_final.pt \
+    --policy-type universal --trunk transformer \
+    --env-id BabyAI-GoToLocal-v0 \
+    --total-steps 500000 --amp --n-envs 32 --ppo-epochs 3 \
+    --run-name v6_phaseB_GoToLocal_500k --device cuda
+
+python -m scripts.experiments.checks.phase_b_success_gate \
+    --v6-gotolocal runs/v6_phaseB_GoToLocal_500k \
+    --v6-gotoobj   runs/v6_phaseB_GoToObj_500k
+
+# E1 ordering arms (forward / reverse / [shuffled]).
+python -m scripts.ppo_train --no-bc \
+    --jepa-checkpoint runs/jepa_dev_v1_factored/jepa_final.pt \
+    --policy-type universal --trunk transformer \
+    --curriculum babyai_developmental --curriculum-order forward \
+    --total-steps 500000 \
+    --concept-freeze-threshold 0.005 --operator-freeze-threshold 0.20 \
+    --save-every-iters 40 --amp --n-envs 32 --ppo-epochs 3 \
+    --run-name v6_e1_forward --device cuda
+
+# E1 cross-env evaluation (the actual scientific gate).
+python -m scripts.experiments.e1_cross_env_eval \
+    --checkpoint runs/v6_e1_forward/policy_final.pt  forward \
+    --checkpoint runs/v6_e1_reverse/policy_final.pt  reverse \
+    --jepa-checkpoint runs/jepa_dev_v1_factored/jepa_final.pt \
+    --n-episodes 100 --device cuda
+```
+
+### What's NOT yet validated (deferred)
+
+- **Shuffled arm of E1.** Skipped to save wall-clock; conclusion "reverse > forward" stands but cannot distinguish "specifically reverse wins" from "any non-forward wins."
+- **Multi-seed replication.** Single seed per arm; 95% CI bounds the 10.3pp mean gap at the noise floor. 3-5 seeds per arm would give a definitive answer.
+- **E2 (catastrophic forgetting).** Driver script not yet written; the bank-level primitives exist.
+- **E3 (cross-game transfer to MultiRoom / Crafter).** Not yet attempted.
+- **Phase E (cross-domain to code editing).** Per plan, deferred until E1-E4 pass.
+
+The substrate is structurally complete and empirically validated through Phase B. The E1 finding tells us what kind of architecture PRISM v6 actually is — and what claim it can defend.
+
+---
+
+
 
 The v4.x line validated PRISM's compositional grounding thesis (v4.1.4: 82% held-out retention) but surfaced four real limits that don't yield to incremental fixes:
 
