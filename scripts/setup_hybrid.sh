@@ -67,15 +67,34 @@ fi
 
 # ---- 3. Install Python deps needed by hybrid components ----
 echo "[setup] installing Python deps into active venv..."
-# Use `python -m pip` so we hit the same interpreter that runs the verify step.
-python -m pip install --quiet --upgrade 'requests>=2.28' 'numpy>=1.20'
+# PRISM's venv is created via uv and may not contain pip.
+# Try uv pip first (preferred — matches how PRISM was set up), then
+# bootstrap pip via ensurepip, then fall back to system pip --target.
+DEPS=("requests>=2.28" "numpy>=1.20")
+
+if command -v uv &> /dev/null; then
+    echo "[setup] using uv pip"
+    uv pip install --quiet "${DEPS[@]}"
+elif python -m pip --version &> /dev/null; then
+    echo "[setup] using python -m pip"
+    python -m pip install --quiet --upgrade "${DEPS[@]}"
+else
+    echo "[setup] bootstrapping pip via ensurepip..."
+    if python -m ensurepip --upgrade --default-pip &> /dev/null; then
+        python -m pip install --quiet --upgrade "${DEPS[@]}"
+    else
+        echo "[setup] ensurepip unavailable; installing uv to fix..."
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        export PATH="$HOME/.local/bin:$PATH"
+        uv pip install --quiet "${DEPS[@]}"
+    fi
+fi
 
 # Sanity-check the install landed in the active venv.
 if ! python -c "import requests, numpy" 2>/dev/null; then
     echo "[setup] ✗ requests/numpy not importable after install"
     echo "[setup]   Active Python: $(which python)"
-    echo "[setup]   Active pip:    $(which pip)"
-    echo "[setup]   Try: python -m pip install requests numpy"
+    echo "[setup]   Try: uv pip install requests numpy"
     exit 1
 fi
 echo "[setup] ✓ requests + numpy importable"
