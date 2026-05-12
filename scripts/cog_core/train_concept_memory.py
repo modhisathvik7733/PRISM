@@ -148,8 +148,17 @@ def main() -> int:
     p.add_argument("--scaling", type=float, default=1.0)
     p.add_argument("--update-steps", type=int, default=0)
     p.add_argument("--epochs", type=int, default=20)
-    p.add_argument("--batch-size", type=int, default=512)
+    # Default batch=128 is safe for 16 GB GPUs. The Hopfield attention
+    # matrix scales as O(batch * n_slots * working_dim) so larger batches
+    # need more VRAM linearly.
+    p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--lr", type=float, default=1e-3)
+    # JEPA's flattened latent is 64*7*7=3136 — too large to use directly
+    # as the K-bank dim (would OOM at moderate batch size). Project to
+    # this smaller working dim first, exactly like HybridPolicy.latent_proj
+    # does in the production policy.
+    p.add_argument("--working-dim", type=int, default=128,
+                   help="latent projection dim before ConceptMemory")
     p.add_argument("--run-name", required=True)
     p.add_argument(
         "--holdout-combos",
@@ -221,8 +230,18 @@ def main() -> int:
     )
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
 
+    # Learnable projection from raw JEPA latent → working_dim.
+    # Mirrors HybridPolicy.latent_proj for production parity.
+    latent_proj = nn.Sequential(
+        nn.Linear(latent_dim, args.working_dim),
+        nn.GELU(),
+    ).to(device)
+    print(
+        f"[train_concept_memory] latent_proj: {latent_dim} → {args.working_dim}"
+    )
+
     memory = ConceptMemory(
-        latent_dim=latent_dim,
+        latent_dim=args.working_dim,
         n_slots=args.n_slots,
         slot_dim=args.slot_dim,
         n_heads=args.n_heads,
@@ -232,19 +251,26 @@ def main() -> int:
     color_head = nn.Linear(args.slot_dim, NUM_COLORS).to(device)
     type_head = nn.Linear(args.slot_dim, NUM_TYPES).to(device)
 
-    params = list(memory.parameters()) + list(color_head.parameters()) + list(type_head.parameters())
+    params = (
+        list(latent_proj.parameters())
+        + list(memory.parameters())
+        + list(color_head.parameters())
+        + list(type_head.parameters())
+    )
     opt = torch.optim.Adam(params, lr=args.lr)
     sparse_opt = SparseHopfieldOptimizer(memory, opt) if args.use_sparse_opt else None
 
     @torch.no_grad()
     def evaluate(loader) -> dict:
+        latent_proj.eval()
         memory.eval()
         color_head.eval()
         type_head.eval()
         c_correct = t_correct = joint_correct = total = 0
         for z, c, t in loader:
             z, c, t = z.to(device), c.to(device), t.to(device)
-            concept = memory(z)
+            z_proj = latent_proj(z)
+            concept = memory(z_proj)
             cl = color_head(concept).argmax(-1)
             tl = type_head(concept).argmax(-1)
             c_correct += int((cl == c).sum())
@@ -260,12 +286,13 @@ def main() -> int:
 
     best_joint = 0.0
     for epoch in range(args.epochs):
-        memory.train(); color_head.train(); type_head.train()
+        latent_proj.train(); memory.train(); color_head.train(); type_head.train()
         running = 0.0
         n_batches = 0
         for z, c, t in train_loader:
             z, c, t = z.to(device), c.to(device), t.to(device)
-            concept, attn = memory(z, return_attention=True)
+            z_proj = latent_proj(z)
+            concept, attn = memory(z_proj, return_attention=True)
             c_logits = color_head(concept)
             t_logits = type_head(concept)
             loss_c = F.cross_entropy(c_logits, c)
@@ -304,8 +331,11 @@ def main() -> int:
             memory.save(str(run_dir / "concept_memory_best.pt"))
             torch.save(
                 {
+                    "latent_proj": latent_proj.state_dict(),
                     "color_head": color_head.state_dict(),
                     "type_head": type_head.state_dict(),
+                    "latent_dim": latent_dim,
+                    "working_dim": args.working_dim,
                     "epoch": epoch + 1,
                     "test_joint": best_joint,
                 },
@@ -315,8 +345,11 @@ def main() -> int:
     memory.save(str(run_dir / "concept_memory_final.pt"))
     torch.save(
         {
+            "latent_proj": latent_proj.state_dict(),
             "color_head": color_head.state_dict(),
             "type_head": type_head.state_dict(),
+            "latent_dim": latent_dim,
+            "working_dim": args.working_dim,
             "best_test_joint": best_joint,
         },
         str(run_dir / "heads_final.pt"),
