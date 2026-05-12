@@ -243,6 +243,35 @@ def concept_token_forward(
 
 
 # ===========================================================================
+# Factored classifier — shared trunk + per-axis (color, type) heads.
+# Routes gradient through TWO independent heads, avoiding the joint-CE
+# degenerate basin where ~half the (type, color) classes collapse to 0%.
+# ===========================================================================
+def build_factored_classifier(D_tok: int) -> nn.Module:
+    return nn.ModuleDict({
+        "trunk": nn.Sequential(
+            nn.Linear(D_tok, D_tok * 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+        ),
+        "color": nn.Linear(D_tok * 2, NUM_COLORS),
+        "type": nn.Linear(D_tok * 2, NUM_TYPES),
+    })
+
+
+def _factored_logits(classifier: nn.Module, c_tok: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    h = classifier["trunk"](c_tok)
+    return classifier["color"](h), classifier["type"](h)
+
+
+def _split_labels(labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Joint label -> (color_label, type_axis_label).
+    Mirrors `type_color_index` semantics: idx = type_axis * NUM_COLORS + color.
+    """
+    return labels % NUM_COLORS, labels // NUM_COLORS
+
+
+# ===========================================================================
 # Train / eval loops
 # ===========================================================================
 def train_one_epoch(
@@ -254,19 +283,22 @@ def train_one_epoch(
     opt: torch.optim.Optimizer,
     batch_size: int,
     jepa_trainable: bool = False,
-) -> tuple[float, float]:
+) -> tuple[float, float, float]:
+    """Returns (mean_loss, color_acc, type_acc) over the epoch."""
     N = images.size(0)
     perm = torch.randperm(N, device=images.device)
     total_loss = 0.0
-    n_correct = 0
+    n_color_correct = 0
+    n_type_correct = 0
     n_batches = 0
     for i in range(0, N, batch_size):
         idx = perm[i:i + batch_size]
         imgs = images[idx]
         labs = labels[idx]
+        color_labs, type_labs = _split_labels(labs)
         c_tok = concept_token_forward(policy, jepa, imgs, jepa_trainable=jepa_trainable)
-        logits = classifier(c_tok)
-        loss = F.cross_entropy(logits, labs)
+        color_logits, type_logits = _factored_logits(classifier, c_tok)
+        loss = F.cross_entropy(color_logits, color_labs) + F.cross_entropy(type_logits, type_labs)
         opt.zero_grad()
         loss.backward()
         all_params = []
@@ -275,9 +307,14 @@ def train_one_epoch(
         torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
         opt.step()
         total_loss += float(loss.item())
-        n_correct += int((logits.argmax(-1) == labs).sum().item())
+        n_color_correct += int((color_logits.argmax(-1) == color_labs).sum().item())
+        n_type_correct += int((type_logits.argmax(-1) == type_labs).sum().item())
         n_batches += 1
-    return total_loss / max(1, n_batches), n_correct / N
+    return (
+        total_loss / max(1, n_batches),
+        n_color_correct / N,
+        n_type_correct / N,
+    )
 
 
 @torch.no_grad()
@@ -290,24 +327,34 @@ def evaluate(
     batch_size: int,
 ) -> dict:
     N = images.size(0)
-    n_correct = 0
-    # Per-class accuracy.
+    n_color_correct = 0
+    n_type_correct = 0
+    n_joint_correct = 0
+    # Per-(type, color) joint accuracy table, 24 entries.
     per_class_correct = np.zeros(NUM_CLASSES, dtype=np.int64)
     per_class_total = np.zeros(NUM_CLASSES, dtype=np.int64)
     for i in range(0, N, batch_size):
         imgs = images[i:i + batch_size]
         labs = labels[i:i + batch_size]
+        color_labs, type_labs = _split_labels(labs)
         c_tok = concept_token_forward(policy, jepa, imgs)
-        preds = classifier(c_tok).argmax(-1)
-        correct = (preds == labs)
-        n_correct += int(correct.sum().item())
-        for lab, ok in zip(labs.cpu().numpy(), correct.cpu().numpy()):
+        color_logits, type_logits = _factored_logits(classifier, c_tok)
+        color_pred = color_logits.argmax(-1)
+        type_pred = type_logits.argmax(-1)
+        color_ok = (color_pred == color_labs)
+        type_ok = (type_pred == type_labs)
+        joint_ok = color_ok & type_ok
+        n_color_correct += int(color_ok.sum().item())
+        n_type_correct += int(type_ok.sum().item())
+        n_joint_correct += int(joint_ok.sum().item())
+        for lab, ok in zip(labs.cpu().numpy(), joint_ok.cpu().numpy()):
             per_class_total[lab] += 1
             per_class_correct[lab] += int(ok)
-    overall = n_correct / N
     per_class_acc = np.where(per_class_total > 0, per_class_correct / np.maximum(1, per_class_total), 0.0)
     return {
-        "accuracy": overall,
+        "color_acc": n_color_correct / N,
+        "type_acc": n_type_correct / N,
+        "joint_acc": n_joint_correct / N,
         "per_class_acc": per_class_acc,
         "worst_class_acc": float(per_class_acc.min()),
         "n": N,
@@ -393,16 +440,11 @@ def main() -> int:
     retrieval.concept_cond.bias.requires_grad_(True)
     retrieval.concept_base.requires_grad_(True)
 
-    # Classification head — scaffolding, discarded at save time.
-    # 2-layer MLP (was Linear): gives the head enough capacity to carve out
-    # 24 separable regions in concept-token space, avoiding the "always
-    # predict the dominant class" degenerate solution.
-    classifier = nn.Sequential(
-        nn.Linear(D_tok, D_tok * 2),
-        nn.ReLU(),
-        nn.Dropout(0.1),
-        nn.Linear(D_tok * 2, NUM_CLASSES),
-    ).to(device)
+    # Factored classifier head — scaffolding, discarded at save time.
+    # Shared trunk + per-axis (color, type) heads. Routes gradient through
+    # TWO independent CE losses, avoiding the joint 24-way degenerate
+    # basin where ~half the classes collapsed to 0% accuracy.
+    classifier = build_factored_classifier(D_tok).to(device)
 
     policy_trainable_params = [p_ for p_ in policy.parameters() if p_.requires_grad] + list(classifier.parameters())
     jepa_trainable_params = [p_ for p_ in jepa.parameters() if p_.requires_grad]
@@ -434,7 +476,8 @@ def main() -> int:
     # Baseline eval: how good is the BASE policy's concept discrimination?
     print("[concept] evaluating BASE concept discrimination...")
     base_eval = evaluate(policy, jepa, classifier, eval_images, eval_labels, args.batch_size)
-    print(f"[concept] BASE  accuracy={base_eval['accuracy']:.3f} "
+    print(f"[concept] BASE  joint={base_eval['joint_acc']:.3f} "
+          f"color={base_eval['color_acc']:.3f} type={base_eval['type_acc']:.3f} "
           f"worst_class={base_eval['worst_class_acc']:.3f}")
 
     # Separate param groups so JEPA gets a lower LR than the concept-side params.
@@ -443,7 +486,7 @@ def main() -> int:
         param_groups.append({"params": jepa_trainable_params, "lr": args.jepa_lr})
     opt = torch.optim.Adam(param_groups)
     for epoch in range(args.epochs):
-        train_loss, train_acc = train_one_epoch(
+        train_loss, train_color_acc, train_type_acc = train_one_epoch(
             policy, jepa, classifier, train_images, train_labels, opt,
             args.batch_size, jepa_trainable=args.train_jepa,
         )
@@ -451,13 +494,16 @@ def main() -> int:
             policy, jepa, classifier, eval_images, eval_labels, args.batch_size,
         )
         print(f"[concept] epoch {epoch+1}/{args.epochs} "
-              f"train_loss={train_loss:.4f} train_acc={train_acc:.3f} "
-              f"eval_acc={eval_result['accuracy']:.3f} "
-              f"worst_class={eval_result['worst_class_acc']:.3f}")
+              f"loss={train_loss:.4f} "
+              f"train_color={train_color_acc:.3f} train_type={train_type_acc:.3f} "
+              f"eval_joint={eval_result['joint_acc']:.3f} "
+              f"color={eval_result['color_acc']:.3f} type={eval_result['type_acc']:.3f} "
+              f"worst={eval_result['worst_class_acc']:.3f}")
 
     print("[concept] evaluating FINAL concept discrimination...")
     final_eval = evaluate(policy, jepa, classifier, eval_images, eval_labels, args.batch_size)
-    print(f"[concept] FINAL accuracy={final_eval['accuracy']:.3f} "
+    print(f"[concept] FINAL joint={final_eval['joint_acc']:.3f} "
+          f"color={final_eval['color_acc']:.3f} type={final_eval['type_acc']:.3f} "
           f"worst_class={final_eval['worst_class_acc']:.3f}")
 
     # Per-class breakdown (shows which (type, color) the substrate still confuses).
@@ -477,10 +523,15 @@ def main() -> int:
     new_ckpt["concept_pretrain"] = {
         "n_per_class": args.n_per_class,
         "epochs": args.epochs,
-        "base_accuracy": base_eval["accuracy"],
-        "final_accuracy": final_eval["accuracy"],
+        "base_joint_acc": base_eval["joint_acc"],
+        "base_color_acc": base_eval["color_acc"],
+        "base_type_acc": base_eval["type_acc"],
+        "final_joint_acc": final_eval["joint_acc"],
+        "final_color_acc": final_eval["color_acc"],
+        "final_type_acc": final_eval["type_acc"],
         "worst_class_acc": final_eval["worst_class_acc"],
         "trained_jepa": args.train_jepa,
+        "factored_heads": True,
     }
     torch.save(new_ckpt, out_path)
     print(f"[concept] saved policy to {out_path}")
@@ -504,8 +555,10 @@ def main() -> int:
         torch.save(jepa_out, out_jepa_path)
         print(f"[concept] saved fine-tuned JEPA to {out_jepa_path}")
 
-    print(f"\n[concept] BASE concept accuracy:  {base_eval['accuracy']:.3f}")
-    print(f"[concept] FINAL concept accuracy: {final_eval['accuracy']:.3f}")
+    print(f"\n[concept] BASE  joint={base_eval['joint_acc']:.3f} "
+          f"color={base_eval['color_acc']:.3f} type={base_eval['type_acc']:.3f}")
+    print(f"[concept] FINAL joint={final_eval['joint_acc']:.3f} "
+          f"color={final_eval['color_acc']:.3f} type={final_eval['type_acc']:.3f}")
     return 0
 
 

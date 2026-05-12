@@ -36,7 +36,8 @@ from prism.perception.slots import (
 )
 
 # MiniGrid OBJECT_TO_IDX (the values we need).
-_MG_EMPTY = 1
+_MG_UNSEEN = 0  # cells outside the agent's forward vision cone
+_MG_EMPTY = 1   # visible floor (inside the cone)
 _MG_AGENT = 10
 
 # Per-channel max for JEPA-normalized obs. Mirrors prism/envs/babyai.py:39
@@ -147,15 +148,37 @@ class Unity2DAdapter:
     ) -> np.ndarray:
         """Build a (3, 7, 7) float32 obs in JEPA-normalized space.
 
-        scene_objects: list of (type_id, color_id, (x, z)) entries. All
-        objects whose grid coords fall inside the 7x7 egocentric view
-        get rendered; off-view objects are silently dropped (matches
-        BabyAI partial-observability).
+        Matches BabyAI's partial-observability semantics: cells outside
+        the agent's forward vision cone are `type=0 (unseen)`; cells
+        inside the cone default to `type=1 (empty floor)`; objects that
+        fall inside the cone are rendered at their grid cell; objects
+        outside the cone are NOT rendered (the agent can't see them).
+
+        The cone geometry mirrors `_is_facing` in prism/perception/
+        predicates.py: a cell at (gx, gy) is in-cone iff
+            forward_dist = ay - gy >= 1 AND |gx - ax| <= forward_dist
+        where (ax, ay) = AGENT_POS = (3, 6). The agent cell itself is
+        always rendered (type=10).
+
+        scene_objects: list of (type_id, color_id, (x, z)) entries.
+        Returns (3, 7, 7) float32 obs in JEPA-normalized space.
         """
+        # Default to unseen (type=0). This matches JEPA's training
+        # distribution: real BabyAI obs have ~25-30% unseen cells.
         view = np.zeros((self.view_size, self.view_size, 3), dtype=np.float32)
-        view[..., 0] = _MG_EMPTY  # empty floor everywhere
 
         ax, ay = AGENT_POS
+
+        # Paint the forward vision cone as visible floor.
+        for gy in range(self.view_size):
+            forward_dist = ay - gy
+            if forward_dist < 1:
+                continue  # cells at agent's row or behind stay unseen
+            for gx in range(self.view_size):
+                if abs(gx - ax) <= forward_dist:
+                    view[gy, gx, 0] = _MG_EMPTY
+
+        # Agent cell (always visible, always at AGENT_POS regardless of cone).
         view[ay, ax] = (_MG_AGENT, 0.0, 0.0)
 
         agent_world = np.asarray(agent_pos_xz, dtype=np.float32)
@@ -170,11 +193,15 @@ class Unity2DAdapter:
             right_dist = float(delta @ right) / self.obs_scale
             gx = ax + int(round(right_dist))
             gy = ay - int(round(forward_dist))
-            if 0 <= gx < self.view_size and 0 <= gy < self.view_size:
-                # Don't overwrite the agent cell.
-                if (gx, gy) == (ax, ay):
-                    continue
-                view[gy, gx] = (float(type_id), float(color_id), 0.0)
+            if not (0 <= gx < self.view_size and 0 <= gy < self.view_size):
+                continue
+            if (gx, gy) == (ax, ay):
+                continue  # don't overwrite the agent cell
+            # Partial observability: only render objects inside the cone.
+            cell_forward = ay - gy
+            if cell_forward < 1 or abs(gx - ax) > cell_forward:
+                continue
+            view[gy, gx] = (float(type_id), float(color_id), 0.0)
 
         chw = np.transpose(view, (2, 0, 1))
         return chw / _CHANNEL_MAX
