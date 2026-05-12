@@ -469,13 +469,19 @@ def _sup_con_loss(
     same = labels.unsqueeze(0) == labels.unsqueeze(1)
     pos_mask = same & ~eye                                            # (n, n)
 
-    # Log-softmax across all non-self anchors.
+    # Log-softmax across all non-self anchors. The diagonal of sim is -inf,
+    # so log_prob[i, i] = -inf - finite = -inf.
     log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
 
-    # Average log-prob over positives per anchor; anchors with no positives
-    # contribute zero (weighted average to avoid CUDA syncs).
+    # IEEE float: -inf * 0 = NaN. The diagonal of log_prob is -inf and
+    # pos_mask is 0 there, so the elementwise product .sum() poisons the
+    # whole row with NaN. Use torch.where to zero out non-positive entries
+    # BEFORE summing — multiplication-free masking is the correct fix.
+    log_prob_pos = torch.where(
+        pos_mask, log_prob, torch.zeros_like(log_prob)
+    )
     n_pos = pos_mask.float().sum(dim=1)                               # (n,)
-    pos_log_prob = (log_prob * pos_mask.float()).sum(dim=1) / n_pos.clamp(min=1)
+    pos_log_prob = log_prob_pos.sum(dim=1) / n_pos.clamp(min=1)
     weight = (n_pos > 0).float()
     return -(pos_log_prob * weight).sum() / weight.sum().clamp(min=1)
 
