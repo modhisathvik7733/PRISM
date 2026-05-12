@@ -85,10 +85,10 @@ class UnityNavEnv(gym.Env):
 
         self._rng = np.random.default_rng(seed)
 
+        self._obs_scale = obs_scale
         # Adapter does the egocentric rendering. We rebuild it every reset
         # because target color is allowed to vary across episodes.
         self._adapter: Unity2DAdapter = self._make_adapter(target_color, target_type)
-        self._obs_scale = obs_scale
 
         self.action_space = spaces.Discrete(7)
         self.observation_space = spaces.Dict(
