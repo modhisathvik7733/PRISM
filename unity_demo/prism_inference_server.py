@@ -184,6 +184,7 @@ async def _handle_connection(websocket, *, policy, jepa, device, args):
 
             agent_pos = tuple(state.get("agent_pos", [0.0, 0.0]))
             target_pos = tuple(state.get("target_pos", [0.0, 0.0]))
+            distractor_pos = state.get("distractor_pos")  # optional
 
             # Episode start: first state of a new episode.
             if episode_start is None:
@@ -200,7 +201,17 @@ async def _handle_connection(websocket, *, policy, jepa, device, args):
             prev_pos = agent_pos
 
             # ---- adapter: render fake BabyAI obs ----
-            obs_np = adapter.render_obs(agent_pos, target_pos)  # (3, 7, 7)
+            # Target: green ball (type=BALL=6, color=GREEN=1)
+            # Distractor (if present): red ball (type=BALL=6, color=RED=0)
+            scene = [(adapter.target_type_id, adapter.target_color_id, target_pos)]
+            if distractor_pos is not None:
+                from prism.perception.slots import COLOR_NAME_TO_IDX, OBJECT_NAME_TO_TYPE
+                scene.append((
+                    OBJECT_NAME_TO_TYPE[args.distractor_type],
+                    COLOR_NAME_TO_IDX[args.distractor_color],
+                    tuple(distractor_pos),
+                ))
+            obs_np = adapter.render_obs_multi(agent_pos, scene)  # (3, 7, 7)
             obs_t = torch.from_numpy(obs_np).float().unsqueeze(0).to(device)  # (1, 3, 7, 7)
 
             # ---- substrate forward ----
@@ -285,6 +296,15 @@ def main() -> int:
     )
     p.add_argument("--target-color", default="green")
     p.add_argument("--target-type", default="ball")
+    p.add_argument(
+        "--distractor-color", default="red",
+        help="Color of the distractor object (must differ from --target-color "
+             "for a meaningful selectivity test).",
+    )
+    p.add_argument(
+        "--distractor-type", default="ball",
+        help="Object type of the distractor.",
+    )
     p.add_argument(
         "--reach-threshold", type=float, default=1.6,
         help="Touch radius (Unity units). MUST match BridgeManager.reachThreshold "

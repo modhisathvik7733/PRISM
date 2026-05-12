@@ -127,13 +127,23 @@ class Unity2DAdapter:
         agent_pos_xz: tuple[float, float],
         target_pos_xz: tuple[float, float],
     ) -> np.ndarray:
+        """Single-object obs (backward-compatible wrapper)."""
+        return self.render_obs_multi(
+            agent_pos_xz,
+            [(self.target_type_id, self.target_color_id, target_pos_xz)],
+        )
+
+    def render_obs_multi(
+        self,
+        agent_pos_xz: tuple[float, float],
+        scene_objects: list[tuple[int, int, tuple[float, float]]],
+    ) -> np.ndarray:
         """Build a (3, 7, 7) float32 obs in JEPA-normalized space.
 
-        The agent sits at (3, 6) in the partial view, facing "up" in the
-        image. The target is placed in the cell corresponding to its
-        position relative to the agent under the current virtual heading.
-        Cells outside the 7x7 window simply don't render (matches BabyAI
-        when the target is occluded / out of view).
+        scene_objects: list of (type_id, color_id, (x, z)) entries. All
+        objects whose grid coords fall inside the 7x7 egocentric view
+        get rendered; off-view objects are silently dropped (matches
+        BabyAI partial-observability).
         """
         view = np.zeros((self.view_size, self.view_size, 3), dtype=np.float32)
         view[..., 0] = _MG_EMPTY  # empty floor everywhere
@@ -141,21 +151,21 @@ class Unity2DAdapter:
         ax, ay = AGENT_POS
         view[ay, ax] = (_MG_AGENT, 0.0, 0.0)
 
-        delta = (
-            np.asarray(target_pos_xz, dtype=np.float32)
-            - np.asarray(agent_pos_xz, dtype=np.float32)
-        )
-        forward_dist = float(delta @ _FORWARD_VEC[self.heading])
-        right_dist = float(delta @ _RIGHT_VEC[self.heading])
+        agent_world = np.asarray(agent_pos_xz, dtype=np.float32)
+        fwd = _FORWARD_VEC[self.heading]
+        right = _RIGHT_VEC[self.heading]
 
-        gx_t = ax + int(round(right_dist))
-        gy_t = ay - int(round(forward_dist))
-        if 0 <= gx_t < self.view_size and 0 <= gy_t < self.view_size:
-            view[gy_t, gx_t] = (
-                float(self.target_type_id),
-                float(self.target_color_id),
-                0.0,
-            )
+        for type_id, color_id, pos in scene_objects:
+            delta = np.asarray(pos, dtype=np.float32) - agent_world
+            forward_dist = float(delta @ fwd)
+            right_dist = float(delta @ right)
+            gx = ax + int(round(right_dist))
+            gy = ay - int(round(forward_dist))
+            if 0 <= gx < self.view_size and 0 <= gy < self.view_size:
+                # Don't overwrite the agent cell.
+                if (gx, gy) == (ax, ay):
+                    continue
+                view[gy, gx] = (float(type_id), float(color_id), 0.0)
 
         chw = np.transpose(view, (2, 0, 1))
         return chw / _CHANNEL_MAX
