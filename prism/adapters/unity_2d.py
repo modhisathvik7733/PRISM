@@ -97,6 +97,7 @@ class Unity2DAdapter:
         target_type: str = "ball",
         n_actions: int = 7,
         view_size: int = AGENT_VIEW_SIZE,
+        obs_scale: float = 2.0,
     ) -> None:
         if target_color not in COLOR_NAME_TO_IDX:
             raise ValueError(
@@ -108,11 +109,17 @@ class Unity2DAdapter:
                 f"unknown target_type={target_type!r}; expected one of "
                 f"{sorted(OBJECT_NAME_TO_TYPE)}"
             )
+        if obs_scale <= 0:
+            raise ValueError(f"obs_scale must be > 0; got {obs_scale}")
         self.target_color_id = COLOR_NAME_TO_IDX[target_color]
         self.target_type_id = OBJECT_NAME_TO_TYPE[target_type]
         self.n_actions = n_actions
         self.mission_dim = NUM_TYPES * NUM_COLORS  # 24
         self.view_size = view_size
+        # Unity units per BabyAI grid cell. >1 = compressed view (target
+        # stays in 7x7 window even at long distances; cost: lower spatial
+        # resolution per cell).
+        self.obs_scale = float(obs_scale)
         self.heading: int = 0
 
     def reset(self) -> None:
@@ -157,8 +164,10 @@ class Unity2DAdapter:
 
         for type_id, color_id, pos in scene_objects:
             delta = np.asarray(pos, dtype=np.float32) - agent_world
-            forward_dist = float(delta @ fwd)
-            right_dist = float(delta @ right)
+            # Compress world distance into grid cells via obs_scale so the
+            # target stays in the 7x7 window even at long Unity distances.
+            forward_dist = float(delta @ fwd) / self.obs_scale
+            right_dist = float(delta @ right) / self.obs_scale
             gx = ax + int(round(right_dist))
             gy = ay - int(round(forward_dist))
             if 0 <= gx < self.view_size and 0 <= gy < self.view_size:

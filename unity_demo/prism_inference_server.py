@@ -117,6 +117,7 @@ async def _handle_connection(websocket, *, policy, jepa, device, args):
         target_color=args.target_color,
         target_type=args.target_type,
         n_actions=policy.n_actions if hasattr(policy, "n_actions") else 7,
+        obs_scale=args.obs_scale,
     )
     h = policy.init_hidden(1, device)
     prev_action = torch.tensor([-1], device=device, dtype=torch.long)
@@ -343,6 +344,13 @@ def main() -> int:
         "--reach-threshold", type=float, default=1.6,
         help="Touch radius (Unity units). MUST match BridgeManager.reachThreshold "
              "or the efficiency metric will be biased.",
+    )
+    p.add_argument(
+        "--obs-scale", type=float, default=2.0,
+        help="Unity units per BabyAI grid cell when rendering the egocentric "
+             "obs. >1 compresses the view so the target stays in the 7x7 "
+             "window even when far away in Unity world space. Default 2.0 "
+             "fits a 10x10 plane comfortably.",
     )
     p.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu",
