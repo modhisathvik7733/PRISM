@@ -376,6 +376,18 @@ def main() -> int:
              "delegates to. PR-4 removes this flag when transformer trunk "
              "becomes the only path.",
     )
+    # v6.0 Phase B pre-condition (resolution-7 / audit pass-2 issue 4a):
+    # one-shot check that the replay path produces bit-identical log_probs
+    # to the rollout path on the first mini-batch of the first iteration.
+    # Exits non-zero on mismatch; exits 0 with a PASS line otherwise. The
+    # check uses the production rollout/replay code, so it cannot drift
+    # from a parallel test rig.
+    parser.add_argument(
+        "--check-replay-equality", action="store_true",
+        help="Assert log_prob(rollout) == log_prob(replay) bit-exactly on "
+             "the first PPO mini-batch, then exit. Gates PR-4: the two-tensor "
+             "buffer must preserve this invariant.",
+    )
     parser.add_argument("--concept-n-slots", type=int, default=1024)
     parser.add_argument("--concept-slot-dim", type=int, default=64)
     parser.add_argument("--concept-scaling", type=float, default=1.0)
@@ -787,6 +799,28 @@ def main() -> int:
                     dist = torch.distributions.Categorical(logits=logits_all + mb_mask)
                 new_logp = dist.log_prob(mb_actions)
                 entropy = dist.entropy()
+
+                # Resolution-7 / audit issue 4a: replay path must produce
+                # bit-identical log_probs to the rollout path on the very
+                # first replay mini-batch (no gradient steps have happened
+                # yet, so the policy is identical to its rollout state).
+                # If this fails, the rollout buffer is desynced from the
+                # state the replay re-derives, and PPO's KL clip is biased
+                # in a way that's invisible in headline metrics.
+                if args.check_replay_equality and it == 0 and epoch == 0 and mb_start == 0:
+                    max_abs_diff = float((new_logp - mb_old_logp).abs().max().item())
+                    bit_equal = torch.equal(new_logp, mb_old_logp)
+                    print(f"[E0b] replay log_prob max_abs_diff={max_abs_diff:.3e} bit_equal={bit_equal}")
+                    if not bit_equal:
+                        print(
+                            "[E0b] FAIL: rollout/replay log_prob mismatch — "
+                            "the replay path is not re-deriving the same "
+                            "state as the rollout. See ppo_train.py:783 "
+                            "(replay) vs :666 (rollout)."
+                        )
+                        return 5
+                    print("[E0b] PASS: rollout/replay log_prob bit-equality")
+                    return 0
 
                 ratio = torch.exp(new_logp - mb_old_logp)
                 surr1 = ratio * mb_adv
