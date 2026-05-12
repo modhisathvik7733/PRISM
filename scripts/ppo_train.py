@@ -348,10 +348,32 @@ def main() -> int:
     # ConceptMemory + OperatorMemory replace the raw JEPA latent on the
     # GRU input. Same step_with_value contract as RecurrentPolicy.
     parser.add_argument(
-        "--policy-type", choices=["recurrent", "hybrid"], default="recurrent",
+        "--policy-type", choices=["recurrent", "hybrid", "universal"],
+        default="recurrent",
         help="recurrent = original RecurrentPolicy (GRU on JEPA latent). "
              "hybrid = HybridPolicy (Hopfield ConceptMemory + OperatorMemory "
-             "in front of the same GRU trunk). Use 'hybrid' for v5.0.",
+             "in front of the same GRU trunk). Use 'hybrid' for v5.0. "
+             "universal = v6.0 UniversalPolicy with explicit DomainAdapter; "
+             "in Phase A this delegates to HybridPolicy internally for "
+             "behavior parity. Use 'universal' for v6.0 substrate refactor.",
+    )
+    # v6.0 PR-2: trunk selector for `--policy-type universal`. Phase A
+    # uses 'gru' (delegates to existing HybridPolicy/RecurrentPolicy
+    # internals). Phase B switches to 'transformer' (live UniversalTrunk
+    # with two-tensor buffer). Ignored when --policy-type is not 'universal'.
+    parser.add_argument(
+        "--trunk", choices=["gru", "transformer"], default="gru",
+        help="Trunk variant for --policy-type universal. 'gru' = Phase A "
+             "behavior-parity wrapper; 'transformer' = Phase B live "
+             "UniversalTrunk (PR-4+).",
+    )
+    # v6.0 PR-2: which inner policy class the universal trunk delegates to
+    # in Phase A. Defaults to 'hybrid' (Hopfield-augmented), matching v5.
+    parser.add_argument(
+        "--universal-inner", choices=["hybrid", "recurrent"], default="hybrid",
+        help="Inner v5 policy that --policy-type universal --trunk gru "
+             "delegates to. PR-4 removes this flag when transformer trunk "
+             "becomes the only path.",
     )
     parser.add_argument("--concept-n-slots", type=int, default=1024)
     parser.add_argument("--concept-slot-dim", type=int, default=64)
@@ -433,11 +455,44 @@ def main() -> int:
     mission_dim = len(OBJECT_TYPES) * NUM_COLORS
     print(f"[ppo] frozen JEPA: encoder={cfg.encoder_type} latent_dim={latent_dim} n_actions={n_actions}")
 
-    # ---------- recurrent / hybrid policy ----------
+    # ---------- recurrent / hybrid / universal policy ----------
     def _build_policy(**kwargs):
-        """Construct either RecurrentPolicy or HybridPolicy with the same
-        shared kwargs. HybridPolicy also takes the Hopfield-config kwargs
-        which are silently ignored by RecurrentPolicy."""
+        """Construct one of: RecurrentPolicy, HybridPolicy, or
+        UniversalPolicy (v6.0 PR-2).
+
+        For --policy-type universal --trunk gru, the UniversalPolicy
+        delegates to the inner v5 class selected by --universal-inner.
+        This is the Phase A behavior-parity path: no math changes; we
+        only add the substrate-side API surface (adapter ownership,
+        action-mask routing, future buffer reshape).
+        """
+        if args.policy_type == "universal":
+            # v6.0 substrate path. Encoder ownership lives in the adapter
+            # (resolution 1). The adapter wraps the already-loaded
+            # frozen JEPA without re-reading the checkpoint.
+            from prism.adapters.babyai_adapter import BabyAIAdapter
+            from prism.cognition.policy import UniversalPolicy
+            if args.trunk != "gru":
+                raise NotImplementedError(
+                    f"--trunk={args.trunk!r} is implemented in PR-4 "
+                    f"(Phase B). PR-2 supports --trunk gru only."
+                )
+            adapter = BabyAIAdapter(jepa=jepa, cfg=cfg, device=device)
+            return UniversalPolicy.from_adapter(
+                adapter,
+                hidden_dim=kwargs["hidden_dim"],
+                latent_proj_dim=kwargs["latent_proj_dim"],
+                action_emb_dim=kwargs.get("action_emb_dim", 16),
+                mem_feat_dim=kwargs.get("mem_feat_dim", 0),
+                policy_type=args.universal_inner,
+                concept_n_slots=args.concept_n_slots,
+                concept_slot_dim=args.concept_slot_dim,
+                concept_scaling=args.concept_scaling,
+                operator_n_slots=args.operator_n_slots,
+                operator_slot_dim=args.operator_slot_dim,
+                operator_scaling=args.operator_scaling,
+                use_operator_memory=not args.no_operator_memory,
+            ).to(device)
         if args.policy_type == "hybrid":
             return HybridPolicy(
                 **kwargs,
