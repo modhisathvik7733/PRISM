@@ -228,6 +228,15 @@ def main():
     p.add_argument("--probe-seed", type=int, default=0)
     p.add_argument("--top-k", type=int, default=50,
                    help="Top-K activating frames per slot for Jaccard.")
+    p.add_argument("--frozen-only", action="store_true",
+                   help="Restrict Jaccard to slots that are FROZEN in "
+                        "snapshot A's bank.frozen_mask. This is the "
+                        "audit-3d-specific gate: weights are bit-equal "
+                        "(checked separately); does routing stay too? "
+                        "Without --frozen-only, Jaccard is computed over "
+                        "every slot — meaningful only when comparing "
+                        "two snapshots of the SAME stage (no training "
+                        "between them changes routing).")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--batch-size", type=int, default=128)
     args = p.parse_args()
@@ -345,6 +354,35 @@ def main():
         b = attn_b[bank_name]
         top_a = top_k_frames_per_slot(a, k=args.top_k)
         top_b = top_k_frames_per_slot(b, k=args.top_k)
+        # --frozen-only: filter Jaccard to slots frozen in snapshot A.
+        # This is the audit-3d-specific gate. Without filtering, Jaccard
+        # rotates wildly under normal training because every slot's
+        # weights changed — there's no "stable abstraction" claim to
+        # falsify in the first place.
+        scope_note = "all slots"
+        if args.frozen_only:
+            frozen = bank_a_frozen[bank_name]
+            n_frozen = int(frozen.sum().item())
+            if n_frozen == 0:
+                reports[bank_name] = {
+                    "scope": "frozen-only (skipped)",
+                    "jaccard": None,
+                    "js_divergence_avg_attn": None,
+                    "weight_checksum_a": bank_a_checksums[bank_name],
+                    "weight_checksum_b": bank_b_checksums[bank_name],
+                    "frozen_rows_violated": False,
+                    "frozen_rows_info": {"n_frozen": 0, "k_diffs": 0, "v_diffs": 0},
+                    "skip_reason": (
+                        "no slots frozen in snapshot A — --frozen-only is "
+                        "not applicable. Re-train with --n-stages > 1 to "
+                        "produce a curriculum checkpoint with frozen slots."
+                    ),
+                }
+                continue
+            frz_idx = torch.nonzero(frozen, as_tuple=False).flatten()
+            top_a = top_a[frz_idx]
+            top_b = top_b[frz_idx]
+            scope_note = f"frozen-only ({n_frozen} slots)"
         jacc = per_slot_jaccard(top_a, top_b)
 
         # Average attention distribution over the probe set per slot.
@@ -360,6 +398,7 @@ def main():
         )
 
         reports[bank_name] = {
+            "scope": scope_note,
             "jaccard": _summarize_jaccard(jacc, bank_name),
             "js_divergence_avg_attn": js,
             "weight_checksum_a": bank_a_checksums[bank_name],
@@ -373,7 +412,12 @@ def main():
     print("E4 — slot stability between snapshots")
     print("=" * 70)
     all_pass = True
+    any_evaluated = False
     for bank_name, r in reports.items():
+        if r["jaccard"] is None:
+            print(f"\n[{bank_name}] SKIPPED — {r['skip_reason']}")
+            continue
+        any_evaluated = True
         jacc_med = r["jaccard"]["median"]
         js = r["js_divergence_avg_attn"]
         jacc_pass = jacc_med >= JACCARD_PASS_THRESHOLD
@@ -382,7 +426,7 @@ def main():
         bank_pass = jacc_pass and js_pass and frz_pass
         all_pass = all_pass and bank_pass
         status = "PASS" if bank_pass else "FAIL"
-        print(f"\n[{bank_name}] {status}")
+        print(f"\n[{bank_name}] {status}  (scope: {r['scope']})")
         print(f"  jaccard.median = {jacc_med:.3f} (gate ≥ {JACCARD_PASS_THRESHOLD})  "
               f"→ {'PASS' if jacc_pass else 'FAIL'}")
         print(f"  jaccard.mean   = {r['jaccard']['mean']:.3f}")
@@ -399,6 +443,9 @@ def main():
         wb_k = r["weight_checksum_b"]["K"][:12]
         print(f"  weight K hash A={wa_k}… B={wb_k}… "
               f"({'identical' if wa_k == wb_k else 'differ — expected if not all rows frozen'})")
+    if not any_evaluated:
+        print("\n[E4] All banks skipped — no meaningful metrics computed.")
+        sys.exit(0)
 
     if all_pass:
         print("\n[E4] PASS — substrate slot stability holds across both snapshots.")
