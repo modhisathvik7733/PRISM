@@ -49,9 +49,24 @@ class HybridPolicy(nn.Module):
         dynamics_buffer: int = 16,
         vocab_size: int = 2048,
         lang_hidden_dim: int = 192,
+        lang_n_heads: int = 4,
+        lang_n_layers: int = 3,
         latent_proj_dim: int = 128,
         enable_language: bool = True,
     ):
+        # Validate head/dim constraints up front with clear messages.
+        if lang_hidden_dim % lang_n_heads != 0:
+            valid = [n for n in (1, 2, 4, 6, 8, 12, 16) if lang_hidden_dim % n == 0]
+            raise ValueError(
+                f"lang_hidden_dim ({lang_hidden_dim}) must be divisible by "
+                f"lang_n_heads ({lang_n_heads}). Valid n_heads for this dim: {valid}"
+            )
+        if dynamics_token_dim % dynamics_heads != 0:
+            valid = [n for n in (1, 2, 4, 6, 8, 12, 16) if dynamics_token_dim % n == 0]
+            raise ValueError(
+                f"dynamics_token_dim ({dynamics_token_dim}) must be divisible by "
+                f"dynamics_heads ({dynamics_heads}). Valid n_heads for this dim: {valid}"
+            )
         super().__init__()
         self.n_actions = n_actions
         self.latent_in_dim = latent_in_dim
@@ -117,13 +132,15 @@ class HybridPolicy(nn.Module):
                 vocab_size=vocab_size,
                 concept_dim=concept_slot_dim,
                 hidden_dim=lang_hidden_dim,
-                n_layers=3,
-                n_heads=6,
+                n_layers=lang_n_layers,
+                n_heads=lang_n_heads,
                 ffn_dim=lang_hidden_dim * 2,
                 max_len=48,
             )
         else:
             self.language_head = None
+        self.lang_n_heads = lang_n_heads
+        self.lang_n_layers = lang_n_layers
 
     def init_hidden(self, batch_size: int, device: torch.device) -> dict:
         """Returns the buffer used as recurrent state."""
@@ -302,6 +319,8 @@ def build_hybrid_from_checkpoint_args(args_dict: dict) -> HybridPolicy:
         dynamics_buffer=args_dict.get("dynamics_buffer", 16),
         vocab_size=args_dict.get("vocab_size", 2048),
         lang_hidden_dim=args_dict.get("lang_hidden_dim", 192),
+        lang_n_heads=args_dict.get("lang_n_heads", 4),
+        lang_n_layers=args_dict.get("lang_n_layers", 3),
         latent_proj_dim=args_dict.get("latent_proj_dim", 128),
         enable_language=args_dict.get("enable_language", True),
     )

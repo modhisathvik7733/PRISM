@@ -49,6 +49,13 @@ class CycleConsistencyLoss(nn.Module):
         super().__init__()
         self.pad_idx = pad_idx
 
+        if text_emb_dim % n_heads != 0:
+            valid = [n for n in (1, 2, 4, 6, 8, 12, 16) if text_emb_dim % n == 0]
+            raise ValueError(
+                f"CycleConsistencyLoss: text_emb_dim ({text_emb_dim}) must be "
+                f"divisible by n_heads ({n_heads}). Valid n_heads: {valid}"
+            )
+
         # Small bidirectional encoder for text → vector.
         self.token_embed = nn.Embedding(vocab_size, text_emb_dim, padding_idx=pad_idx)
         encoder_layer = nn.TransformerEncoderLayer(
@@ -59,7 +66,13 @@ class CycleConsistencyLoss(nn.Module):
             norm_first=True,
             dropout=0.1,
         )
-        self.text_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        # enable_nested_tensor=False silences the warning that fires when
+        # norm_first=True (nested tensors aren't compatible with pre-norm).
+        self.text_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=n_layers,
+            enable_nested_tensor=False,
+        )
         self.query_proj = nn.Linear(text_emb_dim, latent_dim)
 
     def encode_text(self, text_tokens: torch.Tensor) -> torch.Tensor:

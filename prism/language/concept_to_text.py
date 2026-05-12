@@ -43,9 +43,19 @@ class ConceptToText(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
+        # nn.MultiheadAttention requires embed_dim % num_heads == 0. Validate
+        # at construction time with a clear, actionable error message.
+        if hidden_dim % n_heads != 0:
+            valid = [n for n in (1, 2, 4, 6, 8, 12, 16) if hidden_dim % n == 0]
+            raise ValueError(
+                f"ConceptToText: hidden_dim ({hidden_dim}) must be divisible "
+                f"by n_heads ({n_heads}). Valid n_heads for this hidden_dim: {valid}"
+            )
         self.vocab_size = vocab_size
         self.concept_dim = concept_dim
         self.hidden_dim = hidden_dim
+        self.n_heads = n_heads
+        self.n_layers = n_layers
         self.max_len = max_len
         self.pad_idx = pad_idx
         self.bos_idx = bos_idx
@@ -113,10 +123,13 @@ class ConceptToText(nn.Module):
         pos = self.pos_embed(torch.arange(T, device=device)).unsqueeze(0)
         tgt = tok + pos
 
-        # Causal mask for autoregressive decoder self-attention.
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(T).to(device)
-
-        # Padding mask (True at padded positions).
+        # Causal + padding masks. PyTorch deprecates mixing bool and float
+        # masks (UserWarning: "Support for mismatched key_padding_mask and
+        # attn_mask is deprecated"). Use bool for both: True means "masked".
+        causal_mask = torch.triu(
+            torch.ones(T, T, dtype=torch.bool, device=device),
+            diagonal=1,
+        )
         tgt_key_padding_mask = (text_tokens == self.pad_idx)
 
         h = self.decoder(
@@ -154,7 +167,10 @@ class ConceptToText(nn.Module):
             tok = self.token_embed(tokens)
             pos = self.pos_embed(torch.arange(T, device=device)).unsqueeze(0)
             tgt = tok + pos
-            causal_mask = nn.Transformer.generate_square_subsequent_mask(T).to(device)
+            causal_mask = torch.triu(
+                torch.ones(T, T, dtype=torch.bool, device=device),
+                diagonal=1,
+            )
             h = self.decoder(tgt=tgt, memory=memory, tgt_mask=causal_mask)
             last_logits = self.output_head(h[:, -1, :])  # (B, vocab)
 
