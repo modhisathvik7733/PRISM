@@ -41,6 +41,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from prism.cog_core.concept_memory import ConceptMemory
+from prism.cog_core.factored_concept_memory import FactoredConceptMemory
 from prism.perception.slots import (
     AGENT_POS,
     NUM_COLORS,
@@ -174,6 +175,18 @@ def main() -> int:
         action="store_true",
         help="use SparseHopfieldOptimizer for slot-localized updates",
     )
+    # FactoredConceptMemory: separate Hopfield memories for color and type.
+    # Use this mode if held-out compositional generalization is the goal.
+    # The default single-memory mode memorizes joint combos at high n_slots.
+    p.add_argument(
+        "--factored",
+        action="store_true",
+        help="use FactoredConceptMemory (separate Hopfield per attribute)",
+    )
+    p.add_argument("--color-slots", type=int, default=24)
+    p.add_argument("--color-slot-dim", type=int, default=16)
+    p.add_argument("--type-slots", type=int, default=16)
+    p.add_argument("--type-slot-dim", type=int, default=16)
     args = p.parse_args()
 
     set_global_seed(42)
@@ -240,16 +253,39 @@ def main() -> int:
         f"[train_concept_memory] latent_proj: {latent_dim} → {args.working_dim}"
     )
 
-    memory = ConceptMemory(
-        latent_dim=args.working_dim,
-        n_slots=args.n_slots,
-        slot_dim=args.slot_dim,
-        n_heads=args.n_heads,
-        scaling=args.scaling,
-        update_steps=args.update_steps,
-    ).to(device)
-    color_head = nn.Linear(args.slot_dim, NUM_COLORS).to(device)
-    type_head = nn.Linear(args.slot_dim, NUM_TYPES).to(device)
+    if args.factored:
+        print(
+            f"[train_concept_memory] mode=factored: "
+            f"color({args.color_slots}x{args.color_slot_dim}) + "
+            f"type({args.type_slots}x{args.type_slot_dim})"
+        )
+        memory = FactoredConceptMemory(
+            latent_dim=args.working_dim,
+            color_n_slots=args.color_slots,
+            color_slot_dim=args.color_slot_dim,
+            type_n_slots=args.type_slots,
+            type_slot_dim=args.type_slot_dim,
+            n_heads=args.n_heads,
+            scaling=args.scaling,
+            update_steps=args.update_steps,
+        ).to(device)
+        color_head = nn.Linear(args.color_slot_dim, NUM_COLORS).to(device)
+        type_head = nn.Linear(args.type_slot_dim, NUM_TYPES).to(device)
+    else:
+        print(
+            f"[train_concept_memory] mode=joint: "
+            f"n_slots={args.n_slots} slot_dim={args.slot_dim}"
+        )
+        memory = ConceptMemory(
+            latent_dim=args.working_dim,
+            n_slots=args.n_slots,
+            slot_dim=args.slot_dim,
+            n_heads=args.n_heads,
+            scaling=args.scaling,
+            update_steps=args.update_steps,
+        ).to(device)
+        color_head = nn.Linear(args.slot_dim, NUM_COLORS).to(device)
+        type_head = nn.Linear(args.slot_dim, NUM_TYPES).to(device)
 
     params = (
         list(latent_proj.parameters())
@@ -258,7 +294,12 @@ def main() -> int:
         + list(type_head.parameters())
     )
     opt = torch.optim.Adam(params, lr=args.lr)
-    sparse_opt = SparseHopfieldOptimizer(memory, opt) if args.use_sparse_opt else None
+    # SparseHopfieldOptimizer only meaningful for single-memory mode.
+    sparse_opt = (
+        SparseHopfieldOptimizer(memory, opt)
+        if args.use_sparse_opt and not args.factored
+        else None
+    )
 
     @torch.no_grad()
     def evaluate(loader) -> dict:
@@ -270,9 +311,14 @@ def main() -> int:
         for z, c, t in loader:
             z, c, t = z.to(device), c.to(device), t.to(device)
             z_proj = latent_proj(z)
-            concept = memory(z_proj)
-            cl = color_head(concept).argmax(-1)
-            tl = type_head(concept).argmax(-1)
+            if args.factored:
+                color_concept, type_concept = memory(z_proj)
+                cl = color_head(color_concept).argmax(-1)
+                tl = type_head(type_concept).argmax(-1)
+            else:
+                concept = memory(z_proj)
+                cl = color_head(concept).argmax(-1)
+                tl = type_head(concept).argmax(-1)
             c_correct += int((cl == c).sum())
             t_correct += int((tl == t).sum())
             joint_correct += int(((cl == c) & (tl == t)).sum())
@@ -292,9 +338,18 @@ def main() -> int:
         for z, c, t in train_loader:
             z, c, t = z.to(device), c.to(device), t.to(device)
             z_proj = latent_proj(z)
-            concept, attn = memory(z_proj, return_attention=True)
-            c_logits = color_head(concept)
-            t_logits = type_head(concept)
+
+            if args.factored:
+                (color_concept, type_concept), _ = memory(
+                    z_proj, return_attention=True
+                )
+                c_logits = color_head(color_concept)
+                t_logits = type_head(type_concept)
+            else:
+                concept, attn = memory(z_proj, return_attention=True)
+                c_logits = color_head(concept)
+                t_logits = type_head(concept)
+
             loss_c = F.cross_entropy(c_logits, c)
             loss_t = F.cross_entropy(t_logits, t)
             loss = loss_c + loss_t
@@ -309,7 +364,7 @@ def main() -> int:
                 loss.backward()
                 opt.step()
 
-            running += float(loss)
+            running += loss.item()
             n_batches += 1
 
         avg = running / max(1, n_batches)
