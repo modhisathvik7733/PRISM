@@ -186,19 +186,21 @@ async def _handle_connection(websocket, *, policy, jepa, device, args):
             target_pos = tuple(state.get("target_pos", [0.0, 0.0]))
             distractor_pos = state.get("distractor_pos")  # optional
 
-            # Episode start: first state of a new episode.
-            if episode_start is None:
-                episode_start = agent_pos
-                episode_target = target_pos
+            # Skip episode-tracking on the done-state (which holds the
+            # pre-reset agent position) and on the immediately-next state
+            # (Unity might still be settling). We initialize ep tracking
+            # from the first NON-done state after a reset.
+            if not this_done:
+                if episode_start is None:
+                    episode_start = agent_pos
+                    episode_target = target_pos
+                    prev_pos = agent_pos
+                if prev_pos is not None:
+                    episode_path_len += (
+                        (agent_pos[0] - prev_pos[0]) ** 2
+                        + (agent_pos[1] - prev_pos[1]) ** 2
+                    ) ** 0.5
                 prev_pos = agent_pos
-
-            # Accumulate path length.
-            if prev_pos is not None:
-                episode_path_len += (
-                    (agent_pos[0] - prev_pos[0]) ** 2
-                    + (agent_pos[1] - prev_pos[1]) ** 2
-                ) ** 0.5
-            prev_pos = agent_pos
 
             # ---- adapter: render fake BabyAI obs ----
             # Target: green ball (type=BALL=6, color=GREEN=1)
