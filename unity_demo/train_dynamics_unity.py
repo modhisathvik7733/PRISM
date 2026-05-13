@@ -39,7 +39,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from prism.adapters.babyai_adapter import BabyAIAdapter
+from prism.cognition.policy import UniversalPolicy
 from prism.models.jepa import JepaWorldModel, upgrade_config
+from prism.perception.predicates import type_color_index
+from prism.perception.slots import NUM_COLORS, NUM_TYPES, OBJECT_NAME_TO_TYPE, COLOR_NAME_TO_IDX
 from unity_demo.unity_nav_env import UnityNavEnv
 
 
@@ -54,20 +58,62 @@ def load_jepa(path: Path, device: torch.device):
     return jepa, cfg, ckpt
 
 
+def load_policy(policy_path: Path, jepa: JepaWorldModel, cfg, device: torch.device,
+                trunk: str = "transformer") -> UniversalPolicy:
+    """Load a concept-pretrained policy for directed data collection."""
+    ckpt = torch.load(policy_path, map_location=device, weights_only=False)
+    adapter = BabyAIAdapter(jepa=jepa, cfg=cfg, device=device)
+    policy = UniversalPolicy.from_adapter(
+        adapter,
+        trunk=trunk,
+        hidden_dim=ckpt["hidden_dim"],
+        latent_proj_dim=ckpt["latent_proj_dim"],
+        mem_feat_dim=ckpt.get("mem_feat_dim", 0),
+        concept_n_slots=ckpt.get("concept_n_slots", 1024),
+        operator_n_slots=ckpt.get("operator_n_slots", 64),
+        concept_scaling=ckpt.get("concept_scaling", 1.0),
+        operator_scaling=ckpt.get("operator_scaling", 4.0),
+        use_operator_memory=ckpt.get("use_operator_memory", True),
+    ).to(device)
+    policy.load_state_dict(ckpt["policy_state_dict"])
+    policy.eval()
+    return policy
+
+
+def _mission_onehot(mission_str: str, device: torch.device) -> torch.Tensor:
+    """One-hot 24-d mission encoding from a 'go to <color> <type>' string."""
+    from prism.language.mission_parser import parse_mission
+    v = torch.zeros(1, NUM_TYPES * NUM_COLORS, device=device)
+    spec = parse_mission(mission_str)
+    if spec is not None and spec.color_id is not None:
+        v[0, type_color_index(spec.type_id, spec.color_id)] = 1.0
+    return v
+
+
 # ===========================================================================
 # Data collection: random-action rollouts
 # ===========================================================================
+@torch.no_grad()
 def collect_transitions(
     env: UnityNavEnv,
     n_episodes: int,
     device: torch.device,
     rng: np.random.Generator,
+    policy: UniversalPolicy | None = None,
+    jepa: JepaWorldModel | None = None,
+    epsilon: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Run `n_episodes` random-action episodes; return (obs_t, action_t, obs_{t+1}) arrays.
+    """Collect (obs_t, action_t, obs_{t+1}) tuples.
 
-    We only emit allowed actions {0, 1, 2} = {turn_L, turn_R, forward} to
-    match the inference-time mask.
+    If `policy` and `jepa` are provided, uses ε-greedy: with prob ε take a
+    random action, otherwise sample the masked action from the policy. With
+    ε=1.0 (default), reduces to fully random collection (the original
+    behavior). Lower ε produces trajectories with more 'directed' behavior
+    that cover near-target states better.
+
+    Allowed actions are {0, 1, 2} = {turn_L, turn_R, forward}.
     """
+    use_policy = policy is not None and jepa is not None and epsilon < 1.0
     obs_buf: list[np.ndarray] = []
     next_obs_buf: list[np.ndarray] = []
     action_buf: list[int] = []
@@ -75,9 +121,23 @@ def collect_transitions(
     t0 = time.time()
     for ep in range(n_episodes):
         obs, _info = env.reset()
+        if use_policy:
+            mission = _mission_onehot(obs["mission"], device)
+            h = policy.init_hidden(1, device)
+            prev_a = torch.tensor([-1], device=device, dtype=torch.long)
         terminated = truncated = False
         while not (terminated or truncated):
-            a = int(rng.integers(0, 3))  # uniform over allowed actions
+            # ε-greedy.
+            if not use_policy or rng.random() < epsilon:
+                a = int(rng.integers(0, 3))
+            else:
+                img = torch.from_numpy(obs["image"]).float().unsqueeze(0).to(device)
+                z = jepa.encode(img)
+                logits, h_next = policy.step(z, prev_a, mission, h)
+                mask = torch.full_like(logits, float("-inf"))
+                mask[..., :3] = 0.0
+                a = int((logits + mask).argmax(dim=-1).item())
+                h = h_next
             cur_img = obs["image"].copy()
             obs, _r, terminated, truncated, _info = env.step(a)
             next_img = obs["image"].copy()
@@ -85,10 +145,13 @@ def collect_transitions(
             next_obs_buf.append(next_img)
             action_buf.append(a)
             n_steps_total += 1
+            if use_policy:
+                prev_a = torch.tensor([a], device=device, dtype=torch.long)
         if (ep + 1) % 500 == 0:
             elapsed = time.time() - t0
             print(f"[collect] {ep+1}/{n_episodes} eps, {n_steps_total} transitions, "
-                  f"{n_steps_total/elapsed:.0f} steps/s")
+                  f"{n_steps_total/elapsed:.0f} steps/s "
+                  f"{'(policy ε=' + str(epsilon) + ')' if use_policy else '(random)'}")
     obs_arr = np.stack(obs_buf, axis=0)
     next_arr = np.stack(next_obs_buf, axis=0)
     act_arr = np.asarray(action_buf, dtype=np.int64)
@@ -193,6 +256,17 @@ def main() -> int:
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-4)
+    # Directed data collection (recommended over pure random for better
+    # state coverage near targets). Pass --policy to enable; ε ∈ [0, 1]
+    # controls exploration: 1.0 = pure random, 0.0 = pure policy argmax.
+    # 0.3 is a good default: 70% policy-driven, 30% random exploration.
+    p.add_argument("--policy", default=None,
+                   help="Policy .pt for directed data collection. "
+                        "If omitted, uses fully random actions.")
+    p.add_argument("--trunk", default="transformer", choices=["transformer", "gru"],
+                   help="Trunk type when loading --policy")
+    p.add_argument("--epsilon", type=float, default=0.3,
+                   help="Exploration rate when --policy is set (1.0 = random, 0.0 = greedy)")
     p.add_argument(
         "--device",
         default=("cuda" if torch.cuda.is_available()
@@ -244,14 +318,29 @@ def main() -> int:
         randomize_target_color=True,
         seed=8888,
     )
+    # Optional: load a policy for directed data collection.
+    collection_policy: UniversalPolicy | None = None
+    if args.policy is not None:
+        print(f"[dyn] loading policy for directed collection: {args.policy}")
+        collection_policy = load_policy(Path(args.policy), jepa, cfg, device, trunk=args.trunk)
+        print(f"[dyn]   ε-greedy collection: ε={args.epsilon}")
+    else:
+        print("[dyn] no --policy provided; using fully random actions")
+
     rng = np.random.default_rng(0)
-    print(f"[dyn] collecting transitions from {args.n_episodes} episodes "
-          f"(random actions)...")
-    obs_np, act_np, next_np = collect_transitions(env, args.n_episodes, device, rng)
-    # Also collect a smaller held-out set for verification.
+    print(f"[dyn] collecting transitions from {args.n_episodes} episodes...")
+    obs_np, act_np, next_np = collect_transitions(
+        env, args.n_episodes, device, rng,
+        policy=collection_policy, jepa=jepa if collection_policy else None,
+        epsilon=args.epsilon if collection_policy else 1.0,
+    )
     rng_eval = np.random.default_rng(42)
     print("[dyn] collecting held-out transitions (200 eps) for verification...")
-    eobs_np, eact_np, enext_np = collect_transitions(eval_env, 200, device, rng_eval)
+    eobs_np, eact_np, enext_np = collect_transitions(
+        eval_env, 200, device, rng_eval,
+        policy=collection_policy, jepa=jepa if collection_policy else None,
+        epsilon=args.epsilon if collection_policy else 1.0,
+    )
 
     # Tensors.
     obs_t = torch.from_numpy(obs_np).float().to(device)
