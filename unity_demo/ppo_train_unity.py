@@ -462,6 +462,12 @@ def main() -> int:
     p.add_argument("--forward-step", type=float, default=0.07)
     p.add_argument("--obs-scale", type=float, default=2.0)
     p.add_argument("--randomize-target-color", action="store_true")
+    # Dense distance-progress reward shaping (Ng et al. 1999 potential-based).
+    # 0.0 keeps the sparse +1-on-reach baseline; >0 adds γ·Φ(s')−Φ(s) where
+    # Φ = -dist_to_target. Provably preserves the optimal policy but
+    # dramatically accelerates credit assignment.
+    p.add_argument("--shaping-weight", type=float, default=0.5)
+    p.add_argument("--shaping-gamma", type=float, default=0.99)
     # PPO hyperparameters.
     p.add_argument("--total-steps", type=int, default=200000)
     p.add_argument("--rollout-len", type=int, default=512)
@@ -502,9 +508,15 @@ def main() -> int:
         forward_step=args.forward_step,
         obs_scale=args.obs_scale,
         randomize_target_color=args.randomize_target_color,
+        shaping_weight=args.shaping_weight,
+        shaping_gamma=args.shaping_gamma,
     )
     train_env = UnityNavEnv(**env_kwargs, seed=0)
-    eval_env = UnityNavEnv(**env_kwargs, seed=999)
+    # Eval env uses sparse reward (shaping_weight=0) so the metric we report
+    # is the true sparse success rate, not the shaped surrogate.
+    eval_kwargs = dict(env_kwargs)
+    eval_kwargs["shaping_weight"] = 0.0
+    eval_env = UnityNavEnv(**eval_kwargs, seed=999)
 
     print(f"[ppo] BASE eval (pre-PPO):")
     base_eval = evaluate_policy(policy, jepa, eval_env, args.eval_episodes, device)

@@ -65,6 +65,14 @@ class UnityNavEnv(gym.Env):
         plane_extent: float = 4.5,
         obs_scale: float = 2.0,
         step_penalty: float = 0.005,
+        # Potential-based dense reward shaping (Ng et al. 1999). When >0,
+        # adds γ·Φ(s') − Φ(s) where Φ(s) = -distance_to_target. Provably
+        # leaves the optimal policy unchanged but accelerates credit
+        # assignment dramatically when the only sparse reward is +1 on
+        # reach. Used as the fallback when imagination training is not
+        # viable (JEPA dynamics fidelity too low for our obs distribution).
+        shaping_weight: float = 0.0,
+        shaping_gamma: float = 0.99,
         randomize_target_color: bool = False,
         seed: int | None = None,
     ) -> None:
@@ -84,9 +92,14 @@ class UnityNavEnv(gym.Env):
         self._reach_threshold = reach_threshold
         self._plane_extent = plane_extent
         self._step_penalty = step_penalty
+        self._shaping_weight = float(shaping_weight)
+        self._shaping_gamma = float(shaping_gamma)
         self._randomize_target_color = randomize_target_color
         self._target_color = target_color
         self._target_type = target_type
+        # Prev-step distance for potential-based shaping (Φ(s) = -dist).
+        # Re-initialized in reset(); see step() for the shaping formula.
+        self._prev_dist_to_target: float = 0.0
 
         self._rng = np.random.default_rng(seed)
 
@@ -165,6 +178,9 @@ class UnityNavEnv(gym.Env):
             forbidden.append(pos)
 
         self._step_count = 0
+        self._prev_dist_to_target = float(
+            np.linalg.norm(self._agent_pos - self._target_pos)
+        )
         return self._obs(), self._info()
 
     def step(self, action: int) -> tuple[dict, float, bool, bool, dict]:
@@ -204,6 +220,17 @@ class UnityNavEnv(gym.Env):
             reward = -self._step_penalty + distractor_penalty
             terminated = False
         truncated = self._step_count >= self._max_steps
+
+        # Potential-based shaping: γ·Φ(s') − Φ(s) where Φ(s) = -dist.
+        # Provably preserves the optimal policy (Ng et al. 1999). Pushes
+        # positive reward when the agent moves closer to the target,
+        # negative when it moves away. Active only if shaping_weight > 0.
+        if self._shaping_weight > 0.0:
+            phi_curr = -dist_to_target
+            phi_prev = -self._prev_dist_to_target
+            shaping = self._shaping_gamma * phi_curr - phi_prev
+            reward += self._shaping_weight * shaping
+        self._prev_dist_to_target = dist_to_target
 
         info = self._info()
         info["reached_target"] = reached_target
